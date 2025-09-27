@@ -23,7 +23,7 @@
         ./nix/modules/common.nix
         ./nix/modules/private-restore.nix
         home-manager.darwinModules.home-manager
-        {
+        ({ config, pkgs, lib, ... }: {
           networking.hostName = hostName;
           security.pam.services.sudo_local.touchIdAuth = true;
           system.defaults.NSGlobalDomain = {
@@ -41,7 +41,7 @@
             home.username = "${user}";
             home.homeDirectory = "/Users/${user}";
           };
-        }
+        })
       ];
     };
 

@@ -1,6 +1,6 @@
-{ config, pkgs, lib, ... }:
+{ config, pkgs, lib, inputs, ... }:
 {
-  imports = [ (builtins.getFlake (toString ../../.).inputs.nix-homebrew.darwinModules.nix-homebrew) ];
+  imports = [ inputs.nix-homebrew.darwinModules.nix-homebrew ];
 
   nix-homebrew = {
     enable = true;
@@ -23,7 +23,7 @@
       "qmk/qmk"
 
       # Graphite
-      withgraphite/tap
+      "withgraphite/tap"
 
       # Others
       "koekeishiya/formulae"

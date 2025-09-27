@@ -1,6 +1,7 @@
 { config, pkgs, lib, ... }:
 let
   devPkgs = import ../lib/devtoolchain.nix { inherit pkgs; };
+  jdk = if pkgs ? jdk21 then pkgs.jdk21 else pkgs.jdk;
 in {
   home.stateVersion = "24.05";
   programs.home-manager.enable = true;
@@ -34,7 +35,7 @@ in {
   home.packages = devPkgs ++ (with pkgs; [
     # Essentials
     _1password-cli chezmoi gnupg openssl wget curl
-    coreutils findutils gnused gnugrep gawk gpatch yq-go jq
+    coreutils findutils gnused gnugrep gawk patch yq-go jq
 
     # Shell
     fish zsh starship zellij tmux
@@ -42,19 +43,23 @@ in {
     # Developer quality-of-life
     neovim ripgrep fd bat fzf delta eza
     jq yq-go tealdeer tree vbindiff rename lsof
-    prettier lazygit claude-code
+    nodePackages.prettier lazygit claude-code
 
     # Various tools
-    lesspipe openssh pinentry imagemagick graphviz
+    lesspipe openssh imagemagick graphviz
     tesseract
 
     # Network
-    nmap socat tcpdump netcat-openbsd
+    nmap socat tcpdump netcat-gnu
 
     # k8s / devops
-    kubectl helm kustomize terraform awscli2 k9s
+    kubectl kubernetes-helm kustomize terraform awscli2 k9s
+  ] ++ lib.optionals pkgs.stdenv.isDarwin [
+    pinentry_mac
+  ] ++ lib.optionals pkgs.stdenv.isLinux [
+    pinentry
   ]);
 
-  home.sessionVariables.JAVA_HOME = "${pkgs.temurin-jdk-21}/lib/openjdk";
+  home.sessionVariables.JAVA_HOME = "${jdk}/lib/openjdk";
   home.sessionPath = [ "$HOME/.local/bin" ];
 }

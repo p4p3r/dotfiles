@@ -2,42 +2,55 @@
   description = "Hybrid Nix (nix-darwin + nix-homebrew + Home Manager) + chezmoi + private overlay";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.05";
-    home-manager.url = "github:nix-community/home-manager/release-24.05";
+    # Linux & general packages (25.11 stable)
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+
+    # macOS-specific nixpkgs branch that matches nix-darwin 25.11
+    nixpkgs-darwin.url = "github:NixOS/nixpkgs/nixpkgs-25.05-darwin";
+
+    # nix-darwin must follow the darwin branch of nixpkgs
+    darwin.url = "github:nix-darwin/nix-darwin/nix-darwin-25.05";
+    darwin.inputs.nixpkgs.follows = "nixpkgs-darwin";
+
+    # Home Manager release matching 25.11, follow the Linux/general nixpkgs
+    home-manager.url = "github:nix-community/home-manager/release-25.05";
     home-manager.inputs.nixpkgs.follows = "nixpkgs";
-    darwin.url = "github:LnL7/nix-darwin";
-    darwin.inputs.nixpkgs.follows = "nixpkgs";
+
+    # nix-homebrew (no special follows needed)
     nix-homebrew.url = "github:zhaofengli/nix-homebrew";
-    nix-homebrew.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs = inputs@{ self, nixpkgs, home-manager, darwin, nix-homebrew, ... }:
   let
-    username = builtins.getEnv "USER";
+    username = let u = builtins.getEnv "USER"; in if u == "" then "paper" else u;
     hostName = let h = builtins.getEnv "HOST_NAME"; in if h == "" then "paperware" else h;
 
     mkDarwin = { user ? username, }: darwin.lib.darwinSystem {
       system = "aarch64-darwin";
+      specialArgs = { inherit inputs; };
       modules = [
+        { nixpkgs.config.allowUnfree = true; }
         ./nix/modules/darwin-homebrew.nix
-        ./nix/modules/common.nix
-        ./nix/modules/private-restore.nix
         home-manager.darwinModules.home-manager
         ({ config, pkgs, lib, ... }: {
+          system.stateVersion = 6;
+          system.primaryUser = user;
           networking.hostName = hostName;
           security.pam.services.sudo_local.touchIdAuth = true;
           system.defaults.NSGlobalDomain = {
             KeyRepeat = 2;
             InitialKeyRepeat = 15;
           };
-          users.users.${user}.home = "/Users/${user}";
+          users.users.${user} = {
+            home = "/Users/${user}";
+            shell = pkgs.fish;
+          };
           programs.fish.enable = true;
           environment.shells = [ pkgs.fish ];
-          users.users.${user}.shell = pkgs.fish;
           home-manager.useGlobalPkgs = true;
           home-manager.useUserPackages = true;
           home-manager.users.${user} = { pkgs, ... }: {
-            imports = [ ./nix/modules/common.nix ];
+            imports = [ ./nix/modules/common.nix ./nix/modules/private-restore.nix ];
             home.username = "${user}";
             home.homeDirectory = "/Users/${user}";
           };
@@ -45,30 +58,34 @@
       ];
     };
 
-    mkHome = { system, user ? username, }:
-      let pkgs = import nixpkgs { inherit system; };
-      in home-manager.lib.homeManagerConfiguration {
-        inherit pkgs;
+    mkHome = { system, user ? username }:
+      home-manager.lib.homeManagerConfiguration {
+        pkgs = nixpkgs.legacyPackages.${system};
         modules = [
+          { nixpkgs.config.allowUnfree = true; }
           ./nix/modules/common.nix
           ./nix/modules/private-restore.nix
-          { home.username = "${user}"; home.homeDirectory = "/home/${user}"; }
+          { home.username = user; home.homeDirectory = "/home/${user}"; }
         ];
       };
+
   in {
     darwinConfigurations.mac = mkDarwin { user = username; };
     homeConfigurations."${username}@linux" = mkHome { system = "x86_64-linux"; user = username; };
 
     # Dev shells with toolchains
-    devShells = let
-      pkgsDarwin = import nixpkgs { system = "aarch64-darwin"; };
-      pkgsLinux  = import nixpkgs { system = "x86_64-linux"; };
-      mkShell = pkgs: pkgs.mkShell {
+    devShells = {
+      aarch64-darwin.default = let
+        pkgs = nixpkgs.legacyPackages.aarch64-darwin;
+      in pkgs.mkShell {
         packages = import ./nix/lib/devtoolchain.nix { inherit pkgs; };
       };
-    in {
-      aarch64-darwin.default = mkShell pkgsDarwin;
-      x86_64-linux.default   = mkShell pkgsLinux;
+    
+      x86_64-linux.default = let
+        pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      in pkgs.mkShell {
+        packages = import ./nix/lib/devtoolchain.nix { inherit pkgs; };
+      };
     };
 
     checks = {

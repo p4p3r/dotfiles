@@ -1,44 +1,40 @@
-# Returns the list of dev packages given a pkgs set.
+# nix/lib/devtoolchain.nix
 { pkgs }:
-with pkgs; [
-# Essentials
-  git git-lfs gh yq jq
+let
+  # Pick an LLVM set available on 25.05; fall back gracefully.
+  llvm =
+    if pkgs ? llvmPackages_18 then pkgs.llvmPackages_18
+    else if pkgs ? llvmPackages_19 then pkgs.llvmPackages_19
+    else pkgs.llvmPackages;
 
-  # C / C++
-  llvmPackages.latest.clang
-  llvmPackages.latest.lldb
+  # JDK on 25.05: temurin attrnames vary; use jdk21 if present, else jdk.
+  jdk =
+    if pkgs ? jdk21 then pkgs.jdk21
+    else pkgs.jdk;
+
+  nodeExtras = [
+    (pkgs.nodePackages.typescript-language-server or null)
+    (pkgs.nodePackages.eslint or null)
+    (pkgs.nodePackages.typescript or null)
+  ];
+in
+builtins.filter (x: x != null) (with pkgs; [
+  git gh yq jq
+  llvm.clang
+  llvm.lldb
   cmake ninja gnumake pkg-config
 
-  # Node / TS
   nodejs_20
-  corepack
-  nodePackages.typescript
-  nodePackages.typescript-language-server
-  nodePackages.eslint
-  nodePackages.pnpm
-  nodePackages.yarn
+  corepack              # enable pnpm/yarn via: corepack enable
 
-  # Rust
-  rustup rust-analyzer cargo clippy
+  rustup clippy
 
-  # Python
-  python312
-  python312Packages.pip
-  python312Packages.virtualenv
-  pipx
-  ruff
-  pyright
-  uv
+  python312 python312Packages.pip python312Packages.virtualenv pipx ruff pyright
 
-  # Java / JVM
-  temurin-jdk-21 maven gradle
-
-  # Scala
-  scala sbt sbt-extras
-
-  # Kotlin
+  jdk maven gradle
+  scala sbt
   kotlin
 
-  # OCaml
   ocaml opam dune_3 ocamlformat ocamlPackages.utop
-]
+] ++ nodeExtras)
+

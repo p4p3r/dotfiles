@@ -71,6 +71,14 @@
       x86_64-linux.default   = mkShell pkgsLinux;
     };
 
+    checks = {
+      # Build the macOS system derivation (does NOT switch)
+      aarch64-darwin.darwin-build = self.darwinConfigurations.mac.system;
+
+      # Build the Linux Home Manager activation package (does NOT switch)
+      x86_64-linux.hm-build = self.homeConfigurations."${username}@linux".activationPackage;
+    };
+
     formatter.aarch64-darwin = nixpkgs.legacyPackages.aarch64-darwin.nixpkgs-fmt;
     formatter.x86_64-linux   = nixpkgs.legacyPackages.x86_64-linux.nixpkgs-fmt;
   };

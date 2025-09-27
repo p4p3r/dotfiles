@@ -1,0 +1,4 @@
+hyper - s : ~/.local/bin/setleds -name "Trackball*" ^num
+hyper - r : ~/.local/bin/setleds -name "Trackball*" ^caps
+hyper - j : osascript -e 'tell application "Finder" to eject (every disk whose ejectable is true)'
+

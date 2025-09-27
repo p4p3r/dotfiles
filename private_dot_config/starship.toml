@@ -1,0 +1,14 @@
+[aws]
+disabled = false
+
+[kubernetes]
+disabled = false
+format = 'on [⛵ $context \($namespace\)](bold green) '
+# format = 'on [⛵ ($user on )($cluster in )$context \($namespace\)](dimmed green) '
+
+[[kubernetes.contexts]]
+context_pattern = "arn:.*:.*/(?P<cluster>(dev|staging|prod)[a-zA-Z0-9_]*)-.*$"
+context_alias = "$cluster"
+# style = "green"
+# symbol = "💔 "
+

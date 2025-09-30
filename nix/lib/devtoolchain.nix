@@ -27,7 +27,7 @@ builtins.filter (x: x != null) (with pkgs; [
   nodejs_20
   corepack              # enable pnpm/yarn via: corepack enable
 
-  rustup clippy
+  rustup
 
   python312 python312Packages.pip python312Packages.virtualenv pipx ruff pyright
 

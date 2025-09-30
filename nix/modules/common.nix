@@ -35,14 +35,14 @@ in {
   home.packages = devPkgs ++ (with pkgs; [
     # Essentials
     _1password-cli chezmoi gnupg openssl wget curl
-    coreutils findutils gnused gnugrep gawk patch yq-go jq
+    coreutils findutils gnused gnugrep gawk patch jq
 
     # Shell
     fish zsh starship zellij tmux
 
     # Developer quality-of-life
     neovim ripgrep fd bat fzf delta eza
-    jq yq-go tealdeer tree vbindiff rename lsof
+    tealdeer tree vbindiff rename lsof
     nodePackages.prettier lazygit claude-code
 
     # Various tools

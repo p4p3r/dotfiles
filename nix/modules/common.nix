@@ -6,30 +6,9 @@ in {
   home.stateVersion = "24.05";
   programs.home-manager.enable = true;
 
-  programs.fish = {
-    enable = true;
-    shellInit = ''
-      # 1Password SSH agent (auto-detect)
-      if test (uname) = "Darwin"
-        set -l sock "$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
-        if test -S "$sock"; set -gx SSH_AUTH_SOCK "$sock"; end
-      else
-        if test -n "$XDG_RUNTIME_DIR"
-          set -l sock "$XDG_RUNTIME_DIR/1password/agent.sock"
-          if test -S "$sock"; set -gx SSH_AUTH_SOCK "$sock"; end
-        end
-        if not set -q SSH_AUTH_SOCK
-          for sock in "$HOME/.1password/agent.sock" "$HOME/.config/1Password/ssh/agent.sock"
-            if test -S "$sock"; set -gx SSH_AUTH_SOCK "$sock"; break; end
-          end
-        end
-      end
-      # Enable Node corepack (yarn/pnpm shims)
-      if type -q corepack
-        corepack enable >/dev/null ^ /dev/null
-      end
-    '';
-  };
+  # Fish config is managed by chezmoi; home-manager just ensures fish is available
+  # programs.fish.enable would create ~/.config/fish/config.fish and conflict with chezmoi
+  # Instead, the fish config from chezmoi will source nix-managed paths via the shell setup
 
   # Toolchains & dev essentials
   home.packages = devPkgs ++ (with pkgs; [

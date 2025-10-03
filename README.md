@@ -7,5 +7,5 @@ This repo + [dotfiles-private](https://github.com/p4p3r/dotfiles-private) can fu
 Run this one-liner:
 
 ```bash
-bash -c "$(curl -fsSL https://gist.githubusercontent.com/p4p3r/9724833647dd3217414f4463e5ca52bb/raw/5b5c3a0f762d9692b37bc98f7befbb81f9f0708b/bootstrap-new-machine.sh)"
+bash -c "$(curl -fsSL https://gist.githubusercontent.com/p4p3r/9724833647dd3217414f4463e5ca52bb/raw/2fd09583c7d8132e9a0ac1a722f7693377e3ace5/bootstrap-new-machine.sh)"
 ```

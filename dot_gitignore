@@ -12,3 +12,6 @@ Public/
 # Common hidden files that may have permission issues
 .Trash/
 .cups/
+
+# 1Password daemon socket (unsupported file type for Nix)
+.config/op/

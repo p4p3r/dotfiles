@@ -1,2 +1,9 @@
+[onepassword]
+{{ if env "OP_SERVICE_ACCOUNT_TOKEN" }}
+  mode = "service"
+{{ else }}
+  mode = "account"
+{{ end }}
+
 [data]
   ci = {{ if env "GITHUB_ACTIONS" }}true{{ else }}false{{ end }}

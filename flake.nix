@@ -23,9 +23,10 @@
   outputs = inputs@{ self, nixpkgs, home-manager, darwin, nix-homebrew, ... }:
   let
     username = let u = builtins.getEnv "USER"; in if u == "" then "paper" else u;
+    primaryUser = let p = builtins.getEnv "PRIMARY_USER"; in if p == "" then "paper" else p;
     hostName = let h = builtins.getEnv "HOST_NAME"; in if h == "" then "paperware" else h;
 
-    mkDarwin = { user ? username, }: darwin.lib.darwinSystem {
+    mkDarwin = { user ? username, primary ? primaryUser }: darwin.lib.darwinSystem {
       system = "aarch64-darwin";
       specialArgs = { inherit inputs; };
       modules = [
@@ -34,13 +35,14 @@
         home-manager.darwinModules.home-manager
         ({ config, pkgs, lib, ... }: {
           system.stateVersion = 6;
-          system.primaryUser = user;
+          system.primaryUser = primary;
           networking.hostName = hostName;
           security.pam.services.sudo_local.touchIdAuth = true;
           system.defaults.NSGlobalDomain = {
             KeyRepeat = 2;
             InitialKeyRepeat = 15;
           };
+          users.users.root.home = lib.mkForce "/var/root";
           users.users.${user} = {
             home = "/Users/${user}";
             shell = pkgs.fish;

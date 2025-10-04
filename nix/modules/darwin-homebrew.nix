@@ -12,11 +12,6 @@
     enable = true;
 
     taps = [
-      "homebrew/bundle"
-      "homebrew/cask"
-      "homebrew/core"
-      "homebrew/services"
-
       # QMK
       "osx-cross/arm"
       "osx-cross/avr"

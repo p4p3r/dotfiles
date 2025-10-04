@@ -24,20 +24,20 @@ let
     clone_https_with_token() {
       local https_url token
       https_url=$(echo "${privateRepo}" | sed -E 's#git@github.com:(.+)#https://github.com/\1#')
-      token=$(op read "${opTokenRef}")
+      token=$(${pkgs._1password}/bin/op read "${opTokenRef}")
       GIT_ASKPASS=/bin/true \
-      git -c http.extraHeader="AUTHORIZATION: basic $(printf "x:%s" "$token" | base64)" \
+      ${pkgs.git}/bin/git -c http.extraHeader="AUTHORIZATION: basic $(printf "x:%s" "$token" | base64)" \
         clone --depth=1 "$https_url" "${repoRoot}"
     }
 
     if [ ! -d "${repoRoot}/.git" ]; then
-      if ! git clone --depth=1 "${privateRepo}" "${repoRoot}"; then
+      if ! ${pkgs.git}/bin/git clone --depth=1 "${privateRepo}" "${repoRoot}"; then
         echo "[private-restore] SSH clone failed, trying HTTPS via op token…" >&2
         clone_https_with_token
       fi
     else
-      git -C "${repoRoot}" fetch --prune
-      git -C "${repoRoot}" pull --ff-only
+      ${pkgs.git}/bin/git -C "${repoRoot}" fetch --prune
+      ${pkgs.git}/bin/git -C "${repoRoot}" pull --ff-only
     fi
 
     # Overlays: common then per-profile
@@ -48,8 +48,8 @@ let
         rel="''${sub#${overlayRoot}/}"
         dest="$HOME$rel"
         mkdir -p "$dest"
-        if command -v rsync >/dev/null 2>&1; then
-          rsync -a "$sub/" "$dest/"
+        if [ -x "${pkgs.rsync}/bin/rsync" ]; then
+          ${pkgs.rsync}/bin/rsync -a "$sub/" "$dest/"
         else
           cp -R "$sub/." "$dest/"
         fi

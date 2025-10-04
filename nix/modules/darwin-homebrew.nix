@@ -79,16 +79,7 @@
       "wireshark-app"
     ];
 
-    masApps = {
-      "1Password for Safari" = 1569813296;
-      "CARROTweather" = 993487541;
-      "DaisyDisk" = 411643860;
-      "Fantastical" = 975937182;
-      "Keynote" = 409183694;
-      "Numbers" = 409203825;
-      "Okta Verify" = 490179405;
-      "Pages" = 409201541;
-      "Xcode" = 497799835;  };
+    masApps = { };
 
     onActivation = {
       autoUpdate = true;

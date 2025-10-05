@@ -37,6 +37,10 @@
           system.stateVersion = 6;
           system.primaryUser = primary;
           networking.hostName = hostName;
+
+          # Enable Nix experimental features
+          nix.settings.experimental-features = [ "nix-command" "flakes" ];
+
           security.pam.services.sudo_local.touchIdAuth = true;
           system.defaults.NSGlobalDomain = {
             KeyRepeat = 2;

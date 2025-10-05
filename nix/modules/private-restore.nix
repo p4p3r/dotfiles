@@ -14,7 +14,7 @@ let
   scriptsRoot = "${repoRoot}/scripts";
 
   privateRepo = "git@github.com:p4p3r/dotfiles-private.git";
-  opTokenRef = "op://<Vault>/<Item>/<Field>";
+  opTokenRef = "op://dx3cjkbx3glvmiprndt623el34/GITHUB_TOKEN/token";
 
   run = pkgs.writeShellScript "private-restore.sh" ''
     set -euo pipefail
@@ -31,11 +31,15 @@ let
     }
 
     if [ ! -d "${repoRoot}/.git" ]; then
+      # Set up SSH to use openssh from Nix
+      export GIT_SSH_COMMAND="${pkgs.openssh}/bin/ssh"
+
       if ! ${pkgs.git}/bin/git clone --depth=1 "${privateRepo}" "${repoRoot}"; then
         echo "[private-restore] SSH clone failed, trying HTTPS via op token…" >&2
         clone_https_with_token
       fi
     else
+      export GIT_SSH_COMMAND="${pkgs.openssh}/bin/ssh"
       ${pkgs.git}/bin/git -C "${repoRoot}" fetch --prune
       ${pkgs.git}/bin/git -C "${repoRoot}" pull --ff-only
     fi
@@ -44,7 +48,7 @@ let
     sync_one() {
       local src="$1"
       [ -d "$src" ] || return 0
-      find "$src" -mindepth 1 -maxdepth 1 -type d | while read -r sub; do
+      ${pkgs.findutils}/bin/find "$src" -mindepth 1 -maxdepth 1 -type d | while read -r sub; do
         rel="''${sub#${overlayRoot}/}"
         dest="$HOME$rel"
         mkdir -p "$dest"
@@ -59,7 +63,7 @@ let
     [ -d "${overlayRoot}/common" ] && sync_one "${overlayRoot}/common"
     IFS=, read -r -a profs <<< "''${profilesEnv:-personal}"
     for p in "''${profs[@]}"; do
-      p_trim="$(echo "$p" | sed 's/^ *//; s/ *$//')"
+      p_trim="$(echo "$p" | ${pkgs.gnused}/bin/sed 's/^ *//; s/ *$//')"
       [ -z "$p_trim" ] && continue
       sync_one "${overlayRoot}/$p_trim"
     done
@@ -88,7 +92,7 @@ let
       local tdir="${overlayRoot}/private-packages/$p/linux/tarballs"
       [ -d "$tdir" ] && { mkdir -p "$HOME/tmp"; cp -f "$tdir"/*.* "$HOME/tmp" || true; }
     }
-    uname_s="$(uname -s)"
+    uname_s="$(${pkgs.coreutils}/bin/uname -s)"
     for p in "''${profs[@]}"; do
       case "$uname_s" in
         Darwin) install_pkgs_macos "$p";;
@@ -107,6 +111,10 @@ let
   '';
 in {
   home.activation.privateRestore = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
-    PROFILES="''''${profilesEnv:-personal}" ${run}
+    if [[ "''${PRIVATE_RESTORE:-}" == "yes" ]]; then
+      PROFILES="''''${profilesEnv:-personal}" ${run}
+    else
+      echo "[private-restore] Skipping (set PRIVATE_RESTORE=yes to run)"
+    fi
   '';
 }

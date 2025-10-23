@@ -1,0 +1,174 @@
+LC_ALL=en_US.UTF-8
+LC_CTYPE=en_US.UTF-8
+LANG=en_US.UTF-8
+LANGUAGE=en_US.UTF-8
+
+# Base PATH
+export PATH="/usr/local/bin:/usr/local/sbin:/sbin:/usr/sbin:/bin:/usr/bin:$PATH"
+export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH"
+
+# Brew-related paths
+eval "$(/opt/homebrew/bin/brew shellenv)"
+# GNU utils path overrides as default CLI tools
+if can_haz brew; then
+  BREW_PREFIX=$(brew --prefix)
+  if [[ -d "${BREW_PREFIX}/bin" ]]; then
+    export PATH="$PATH:${BREW_PREFIX}/bin"
+  fi
+  if [[ -d "${BREW_PREFIX}/sbin" ]]; then
+    export PATH="$PATH:${BREW_PREFIX}/sbin"
+  fi
+  for d in ${BREW_PREFIX}/opt/*/libexec/gnubin; do export PATH=$d:$PATH; done
+  export PATH="/opt/homebrew/opt/gnu-getopt/bin":$PATH
+  export PATH="/opt/homebrew/opt/ssh-copy-id/bin":$PATH
+  export CPATH="$CPATH:$BREW_PREFIX/include"
+  export LIBRARY_PATH="$LIBRARY_PATH:$BREW_PREFIX/lib"
+fi
+
+# Local home paths
+export PATH="$HOME/.local/bin:$PATH"
+
+# Servers from nvim-lsp-installer
+mkdir -p $HOME/.local/share/nvim/lsp_servers
+for LSP_LANG in $(find "$HOME/.local/share/nvim/lsp_servers" -mindepth 1 -maxdepth 1 -type d -print) ; do
+  if [[ -d "$LSP_LANG/bin" ]]; then
+    export PATH=$LSP_LANG/bin:$PATH
+  elif [[ -d "$LSP_LANG/node_modules/.bin" ]]; then
+    export PATH=$LSP_LANG/node_modules/.bin:$PATH
+  else
+    export PATH=$LSP_LANG:$PATH
+  fi
+done
+
+ZLIB_PREFIX=/opt/homebrew/opt/zlib
+OPENSSL_PREFIX=/opt/homebrew/opt/openssl
+export LDFLAGS="-L$ZLIB_PREFIX/lib -L$OPENSSL_PREFIX/lib"
+export CPPFLAGS="-I$ZLIB_PREFIX/include -I$OPENSSL_PREFIX/include"
+export CFLAGS="-I$ZLIB_PREFIX/include -I$OPENSSL_PREFIX/include"
+export PKG_CONFIG_PATH="$ZLIB_PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH"
+export FLAGS_GETOPT_CMD="/opt/homebrew/opt/gnu-getopt/bin/getopt"
+export PIPENV_VENV_IN_PROJECT=true
+
+if can_haz vim; then
+  export EDITOR=$(command -v vim)
+fi
+export VISUAL="$EDITOR"
+export EDITOR
+
+if can_haz gpg; then
+  export GPG_TTY=$(tty)
+fi
+
+
+# FZF
+export FZF_DEFAULT_COMMAND='rg --files --no-ignore-vcs --hidden -g "!{node_modules/,.git/}"'
+export FZF_COMPLETION_TRIGGER='//'
+
+# INITIAL_QUERY=""
+# RG_PREFIX="rg --column --line-number --no-heading --color=always --smart-case "
+# FZF_DEFAULT_COMMAND="$RG_PREFIX '$INITIAL_QUERY'" \
+#   fzf --bind "change:reload:$RG_PREFIX {q} || true" \
+#       --ansi --disabled --query "$INITIAL_QUERY" \
+#       --height=50% --layout=reverse
+
+# --preview '([[ -f {} ]] && (bat --style=numbers --color=always {} || cat {})) || ([[ -d {} ]] && (tree -C {} | less)) || echo {} 2> /dev/null | head -200'
+# --preview-window=:hidden:right:60%:wrap
+# --preview 'bat --color=always --style=numbers --line-range=:500 {}'
+
+export FZF_DEFAULT_OPTS="
+--height=40%
+--info=inline
+--multi
+--layout=reverse
+--border
+--margin=1
+--preview '([[ -f {} ]] && (bat --style=numbers --color=always {} || cat {})) || ([[ -d {} ]] && (tree -C {} | less)) || echo {} 2> /dev/null | head -200'
+--color=bg+:#302D41,bg:#1E1E2E,spinner:#F8BD96,hl:#F28FAD
+--color=fg:#D9E0EE,header:#F28FAD,info:#DDB6F2,pointer:#F8BD96
+--color=marker:#F8BD96,fg+:#F2CDCD,prompt:#DDB6F2,hl+:#F28FAD
+--prompt='∼ ' --pointer='▶' --marker='✓'
+--bind '?:toggle-preview'
+--bind 'ctrl-a:select-all'
+--bind 'ctrl-y:execute-silent(echo {+} | pbcopy)'
+--bind 'ctrl-e:execute(echo {+} | xargs -o vim)'
+--bind 'ctrl-v:execute(code {+})'
+"
+bindkey "ç" fzf-cd-widget
+
+export FZF_PREVIEW_WINDOW='right:60%:wrap'
+export FZF_PREVIEW_ADVANCED=true
+export LESSOPEN='| lessfilter-fzf %s'
+
+#[ -f ~/.fzf.zsh ] && source ~/.fzf.zsh && enable-fzf-tab
+# source ~/.config/zsh/fzf_git.sh
+# () {
+#   local c
+#   for c in $@; do
+#     eval "fzf-g$c-widget() { local -r result=(\${(f)\"\$(_g$c)\"}); zle reset-prompt; LBUFFER+=\${(j: :)\${(q)result}} }"
+#     eval "zle -N fzf-g$c-widget"
+#     eval "bindkey '^g^$c' fzf-g$c-widget"
+#   done
+# } f b t r h s
+# function _fzf-rg {
+#     zle push-input
+#     BUFFER="fzf_rg.sh"
+#     zle accept-line
+# }
+# zle -N _fzf-rg
+# bindkey '^f' _fzf-rg
+
+# # N
+# export N_PREFIX=$HOME/.n
+# export PATH=$N_PREFIX/bin:$PATH
+# 
+# # Pyenv
+# # export PYENV_VIRTUALENV_DISABLE_PROMPT=1
+# eval "$(pyenv init --path)"
+# eval "$(pyenv virtualenv-init -)"
+# 
+# # Rvm
+# export PATH="$HOME/.rvm/bin:$PATH"
+# source $HOME/.rvm/scripts/rvm
+
+# # Sdkman
+# export SDKMAN_DIR="$HOME/.sdkman"
+# [[ -s "$HOME/.sdkman/bin/sdkman-init.sh" ]] && source "$HOME/.sdkman/bin/sdkman-init.sh"
+
+# Java
+. ~/.asdf/plugins/java/set-java-home.zsh
+
+# Rust
+export PATH="$HOME/.cargo/bin:$PATH"
+CARGO_ENV=$HOME/.cargo/env
+if [ ! "$CARGO_ENV" ]; then
+  . "$CARGO_ENV"
+fi
+. "$HOME/.cargo/env"
+
+# Go
+export GOPATH=$HOME/.golang
+export GOROOT=/opt/homebrew/opt/golang/libexec
+export PATH=$PATH:$GOPATH/bin
+export PATH=$PATH:$GOROOT/bin
+
+# Ocaml
+export PATH="$PATH:$(opam var bin)"
+[[ ! -r $HOME/.opam/opam-init/init.zsh ]] || source $HOME/.opam/opam-init/init.zsh  > /dev/null 2> /dev/null
+
+# QMK compilers
+for ARM_GCC_BIN in $(find /opt/homebrew/opt/arm-gcc-bin* -maxdepth 1 -print)
+do
+  export LDFLAGS="-L$ARM_GCC_BIN/lib $LDFLAGS"
+  export PATH="$ARM_GCC_BIN/bin:$PATH"
+done
+for AVR_GCC in $(find /opt/homebrew/opt/avr-gcc* -maxdepth 1 -print)
+do
+  export LDFLAGS="-L$AVR_GCC/lib $LDFLAGS"
+  export PATH="$AVR_GCC/bin:$PATH"
+done
+
+# ZMK env
+export ZEPHYR_TOOLCHAIN_VARIANT=gnuarmemb
+export GNUARMEMB_TOOLCHAIN_PATH=/Applications/ArmGNUToolchain/11.3.rel1/arm-none-eabi
+source $HOME/src/p4p3r/zmk/zephyr/zephyr-env.sh
+

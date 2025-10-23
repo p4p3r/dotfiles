@@ -1,0 +1,23 @@
+# 1Password SSH agent (auto-detect)
+{{- if eq .chezmoi.os "darwin" -}}
+set -l sock "$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
+if test -S "$sock"
+  set -gx SSH_AUTH_SOCK "$sock"
+end
+{{- else -}}
+if set -q XDG_RUNTIME_DIR
+  set -l sock "$XDG_RUNTIME_DIR/1password/agent.sock"
+  if test -S "$sock"
+    set -gx SSH_AUTH_SOCK "$sock"
+  end
+end
+if not set -q SSH_AUTH_SOCK
+  for sock in "$HOME/.1password/agent.sock" "$HOME/.config/1Password/ssh/agent.sock"
+    if test -S "$sock"
+      set -gx SSH_AUTH_SOCK "$sock"
+      break
+    end
+  end
+end
+{{- end -}}
+

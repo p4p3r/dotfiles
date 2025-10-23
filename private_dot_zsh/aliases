@@ -1,0 +1,56 @@
+# Expand aliases inline - see http://blog.patshead.com/2012/11/automatically-expaning-zsh-global-aliases---simplified.html
+globalias() {
+   if [[ $LBUFFER =~ ' [A-Z0-9]+$' ]]; then
+     zle _expand_alias
+     zle expand-word
+   fi
+   zle self-insert
+}
+zle -N globalias
+bindkey " " globalias
+bindkey "^ " magic-space           # control-space to bypass completion
+bindkey -M isearch " " magic-space # normal space during searches
+
+alias -g Z='| fzf'
+alias cat="bat"
+alias diff="delta"
+alias vim="nvim"
+alias v="nvim"
+alias lg="lazygit"
+
+bindkey '^z' 'rfv'
+
+# Try and find the grc setup file
+if (( $+commands[grc] )); then
+  GRC_SETUP='/usr/local/etc/grc.bashrc'
+fi
+if (( $+commands[grc] )) && (( $+commands[brew] ))
+then
+  GRC_SETUP="$(brew --prefix)/etc/grc.bashrc"
+fi
+if [[ -r "$GRC_SETUP" ]]; then
+  source "$GRC_SETUP"
+fi
+unset GRC_SETUP
+
+if (( $+commands[grc] ))
+then
+  function ping5(){
+    grc --color=auto ping -c 5 "$@"
+  }
+else
+  alias ping5='ping -c 5'
+fi
+
+# These need to be done after $PATH is set up so we can find
+# grc and exa
+
+# Set up colorized ls when gls is present - it's installed by grc
+# shellcheck disable=SC2154
+if (( $+commands[gls] )); then
+  alias ls="gls -F --color"
+  alias l="gls -lAh --color"
+  alias ll="gls -l --color"
+  alias la='gls -A --color'
+fi
+

@@ -1,0 +1,17 @@
+# macOS system files that Nix can't access during flake evaluation
+Library/
+Pictures/
+Movies/
+Music/
+Documents/
+Downloads/
+Desktop/
+Applications/
+Public/
+
+# Common hidden files that may have permission issues
+.Trash/
+.cups/
+
+# 1Password daemon socket (unsupported file type for Nix)
+.config/op/

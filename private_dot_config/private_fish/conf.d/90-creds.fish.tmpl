@@ -1,0 +1,7 @@
+{{- if .ci -}}
+# CI: skip secret value
+{{- else -}}
+set -gx OPENAI_API_KEY "{{ onepasswordRead "op://dx3cjkbx3glvmiprndt623el34/OpenAI/credential" }}"
+set -gx ANTHROPIC_API_KEY "{{ onepasswordRead "op://dx3cjkbx3glvmiprndt623el34/Anthropic/credential" }}"
+set -gx TAVILY_API_KEY "{{ onepasswordRead "op://dx3cjkbx3glvmiprndt623el34/Tavily/credential" }}"
+{{- end -}}

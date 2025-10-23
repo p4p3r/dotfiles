@@ -1,0 +1,86 @@
+function can_haz() {
+  which "$@" > /dev/null 2>&1
+}
+
+function up() {
+  # which zinit > /dev/null && zinit self-update && zinit update --all
+  which zgenom > /dev/null && zgenom update
+  which pipx > /dev/null && pipx upgrade-all
+  which brew > /dev/null && brew update && brew upgrade
+  which softwareupdate > /dev/null && softwareupdate -d
+  which npm > /dev/null && npx npm-check -g -u
+}
+
+# Install (one or multiple) selected application(s)
+# using "brew search" as source input
+# mnemonic [B]rew [I]nstall [P]lugin
+function bip() {
+  local inst=$(brew search | fzf -m)
+
+  if [[ $inst ]]; then
+    for prog in $(echo $inst);
+    do; brew install $prog; done;
+  fi
+}
+
+# Update (one or multiple) selected application(s)
+# mnemonic [B]rew [U]pdate [P]lugin
+function bup() {
+  local upd=$(brew leaves | fzf -m)
+
+  if [[ $upd ]]; then
+    for prog in $(echo $upd);
+    do; brew upgrade $prog; done;
+  fi
+}
+
+# Delete (one or multiple) selected application(s)
+# mnemonic [B]rew [C]lean [P]lugin (e.g. uninstall)
+function bcp() {
+  local uninst=$(brew leaves | fzf -m)
+
+  if [[ $uninst ]]; then
+    for prog in $(echo $uninst);
+    do; brew uninstall $prog; done;
+  fi
+}
+
+# like normal z when used with arguments but displays an fzf prompt when used without.
+unalias z 2> /dev/null
+function z() {
+    [ $# -gt 0 ] && _z "$*" && return
+    cd "$(_z -l 2>&1 | fzf --height 40% --nth 2.. --reverse --inline-info +s --tac --query "${*##-* }" | sed 's/^[0-9,.]* *//')"
+}
+
+# find-in-file - usage: fif <SEARCH_TERM>
+unalias fif 2> /dev/null
+fff() {
+  if [ ! "$#" -gt 0 ]; then
+    echo "Need a string to search for!";
+    return 1;
+  fi
+  rg --files-with-matches --no-messages "$1" | fzf --preview-window "$FZF_PREVIEW_WINDOW" --preview "rg --ignore-case --pretty --context 10 '$1' {}"
+}
+
+dfu-flash() {
+  if [ ! -f $1 ] || [ -z $1 ]; then
+    echo "Usage: dfu-flash <firmware.hex> [left|right]"
+    return 1
+  fi
+  until [ -n "$(ioreg -p IOUSB | grep ATm32U4DFU)" ]; do
+    echo "Waiting for ATm32U4DFU bootloader..."; sleep 3
+  done
+  dfu-programmer atmega32u4 erase --force
+  if [ $2 = "left" ]; then
+    echo -e "\nFlashing left EEPROM" && \
+    echo -e ':0F000000000000000000000000000000000001F0\n:00000001FF' | \
+    dfu-programmer atmega32u4 flash --force --suppress-validation --eeprom STDIN
+  elif [ $2 = "right" ]; then
+    echo -e "\nFlashing right EEPROM" && \
+    echo -e ':0F000000000000000000000000000000000000F1\n:00000001FF' | \
+    dfu-programmer atmega32u4 flash --force --suppress-validation --eeprom STDIN
+  fi
+  echo -e "\nFlashing $1" && dfu-programmer atmega32u4 flash --force $1
+  dfu-programmer atmega32u4 reset
+}
+

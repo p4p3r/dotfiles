@@ -1,0 +1,147 @@
+# Clone zgenom if you haven't already
+if [[ -z "$ZGENOM_PARENT_DIR" ]]; then
+  ZGENOM_PARENT_DIR=$HOME/.local/share
+  ZGENOM_SOURCE_FILE=$ZGENOM_PARENT_DIR/zgenom/zgenom.zsh
+fi
+
+# zgenom stores the clones plugins & themes in $ZGEN_DIR when it
+# is set. Otherwise it stuffs everything in the source tree, which
+# is unclean.
+ZGEN_DIR=${ZGEN_DIR:-$HOME/.zgenom}
+
+if [[ ! -f "$ZGENOM_SOURCE_FILE" ]] ; then
+  if [[ ! -d "$ZGENOM_PARENT_DIR" ]]; then
+    mkdir -p "$ZGENOM_PARENT_DIR"
+  fi
+  pushd $ZGENOM_PARENT_DIR
+  print -P "%F{33}▓▒░ %F{220}Installing %F{33}ZGenom%F{220} Plugin Manager (%F{33}jandamm/zgenom%F{220})…%f"
+  command git clone https://github.com/jandamm/zgenom.git zgenom && \
+    print -P "%F{33}▓▒░ %F{34}Installation successful.%f%b" || \
+    print -P "%F{160}▓▒░ The clone has failed.%f%b"
+  popd
+fi
+
+if [[ ! -f "$ZGENOM_SOURCE_FILE" ]] ; then
+  echo "Can't find zgenom.zsh"
+else
+  # echo "Loading zgenom"
+  source "$ZGENOM_SOURCE_FILE"
+fi
+
+unset ZGENOM_PARENT_DIR ZGENOM_SOURCE_FILE
+
+setup-zgenom-plugins() {
+  echo "Creating a zgenom save"
+  ZGEN_LOADED=()
+  ZGEN_COMPLETIONS=()
+
+  # Add this if you experience issues with missing completions or errors mentioning compdef.
+  # zgenom compdef
+
+  zgenom load jandamm/zgenom-ext-release
+  zgenom load jandamm/zgenom-ext-eval
+
+  zgenom ohmyzsh
+  zgenom ohmyzsh plugins/asdf
+  zgenom ohmyzsh plugins/aws
+  zgenom ohmyzsh plugins/brew
+  zgenom ohmyzsh plugins/colored-man-pages
+  zgenom ohmyzsh plugins/colorize
+  zgenom ohmyzsh plugins/git
+  zgenom ohmyzsh plugins/github
+  zgenom ohmyzsh plugins/history
+  zgenom ohmyzsh plugins/kubectl
+  zgenom ohmyzsh plugins/kubectx
+  zgenom ohmyzsh plugins/macos
+  zgenom ohmyzsh plugins/pip
+  zgenom ohmyzsh plugins/pipenv
+  zgenom ohmyzsh plugins/poetry
+  zgenom ohmyzsh plugins/python
+  # zgenom ohmyzsh plugins/pyenv
+  # zgenom eval <<EOF
+  #  pyenv rehash
+  #EOF
+  zgenom ohmyzsh plugins/rsync
+  zgenom ohmyzsh plugins/sudo
+  zgenom ohmyzsh plugins/z
+  zgenom ohmyzsh plugins/fzf
+  zgenom load unixorn/fzf-zsh-plugin
+  zgenom load trapd00r/LS_COLORS
+
+  zgenom load zsh-users/zsh-completions src
+  zgenom load Aloxaf/fzf-tab
+  zgenom eval <<EOF
+  zstyle ':fzf-tab:complete:cd:*' fzf-preview 'exa -1 --color=always $realpath'
+  zstyle ':fzf-tab:*' switch-group ',' '.'
+EOF
+  zgenom load zdharma-continuum/fast-syntax-highlighting
+  zgenom load zsh-users/zsh-autosuggestions
+
+  zgenom load chrissicool/zsh-256color
+  zgenom load djui/alias-tips
+  zgenom load hlissner/zsh-autopair
+  zgenom load marlonrichert/zsh-edit
+  zgenom load sharat87/pip-app
+  # zgenom load unixorn/jpb.zshplugin
+  zgenom load unixorn/tumult.plugin.zsh
+  # zgenom load unixorn/warhol.plugin.zsh
+  zgenom load willghatch/zsh-saneopt
+  zgenom load supercrabtree/k
+
+  zgenom load peterhurford/git-it-on.zsh
+  zgenom load unixorn/git-extra-commands
+  # After ohmyzsh/plugins/git
+  zgenom load wfxr/forgit
+  # zgenom bin tj/git-extras
+
+  zgenom load zsh-users/zsh-history-substring-search
+  zgenom eval <<EOF
+  zmodload zsh/terminfo
+  bindkey "$terminfo[kcuu1]" history-substring-search-up
+  bindkey "$terminfo[kcud1]" history-substring-search-down
+EOF
+  # bindkey "^[[A" history-substring-search-up
+  # bindkey "^[[B" history-substring-search-down
+
+  # zgenom compile "$HOME/.zshrc"
+
+  # generate the init script from plugins above
+  zgenom save
+}
+
+# This comes from https://stackoverflow.com/questions/17878684/best-way-to-get-file-modified-time-in-seconds
+# This works on both Linux with GNU fileutils and macOS with BSD stat.
+
+# Naturally BSD/macOS and Linux can't share the same options to stat.
+if [[ $(uname | grep -ci -e Darwin -e BSD) = 1 ]]; then
+
+  # macOS version.
+  get_file_modification_time() {
+    modified_time=$(stat -f %m "$1" 2> /dev/null) || modified_time=0
+    echo "${modified_time}"
+  }
+
+elif [[ $(uname | grep -ci Linux) = 1 ]]; then
+
+  # Linux version.
+  get_file_modification_time() {
+    modified_time=$(stat -c %Y "$1" 2> /dev/null) || modified_time=0
+    echo "${modified_time}"
+  }
+fi
+
+# Update zgenom and plugins
+zgenom autoupdate
+
+# check if there's an init.zsh file for zgen and generate one if not.
+if ! zgenom saved; then
+  setup-zgenom-plugins
+fi
+
+# If .zgen-setup is newer than init.zsh, regenerate init.zsh
+REAL_ZGEN_SETUP=~/.zgenom-setup
+if [ $(get_file_modification_time ${REAL_ZGEN_SETUP}) -gt $(get_file_modification_time ~/.zgenom/init.zsh) ]; then
+  echo "$(basename ${REAL_ZGEN_SETUP}) ($REAL_ZGEN_SETUP) updated; creating a new init.zsh from plugin list in ${REAL_ZGEN_SETUP}"
+  setup-zgenom-plugins
+fi
+unset REAL_ZGEN_SETUP

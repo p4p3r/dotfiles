@@ -1,0 +1,18 @@
+.config/nvim/session
+
+# devenv/direnv inside private config (chezmoi external handles the clone)
+.config/private/**/.devenv
+.config/private/**/.direnv
+.config/private/**/devenv.lock
+
+# Nix source directory lives in chezmoi source but is accessed via symlink
+# Prevent chezmoi from creating ~/nix/ in the home directory
+nix
+
+# devenv artifacts
+.devenv
+.devenv.flake.nix
+devenv.lock
+
+# direnv
+.direnv

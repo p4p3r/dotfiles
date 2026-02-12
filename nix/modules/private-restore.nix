@@ -7,41 +7,18 @@ let
     map (p: lib.trim p) (lib.splitString "," profilesEnv);
 
   home = config.home.homeDirectory;
-  repoCache = "${home}/.cache/private-bootstrap";
-  repoRoot  = "${repoCache}/repo";
+  # Private repo is cloned by chezmoi (.chezmoiexternal.toml) to ~/.config/private/
+  repoRoot = "${home}/.config/private";
   overlayRoot = "${repoRoot}/overlay";
-  manifestsRoot = "${overlayRoot}/manifests";
   scriptsRoot = "${repoRoot}/scripts";
-
-  privateRepo = "git@github.com:p4p3r/dotfiles-private.git";
-  opTokenRef = "op://dx3cjkbx3glvmiprndt623el34/GITHUB_TOKEN/token";
 
   run = pkgs.writeShellScript "private-restore.sh" ''
     set -euo pipefail
 
-    mkdir -p "${repoCache}"
-
-    clone_https_with_token() {
-      local https_url token
-      https_url=$(echo "${privateRepo}" | sed -E 's#git@github.com:(.+)#https://github.com/\1#')
-      token=$(${pkgs._1password}/bin/op read "${opTokenRef}")
-      GIT_ASKPASS=/bin/true \
-      ${pkgs.git}/bin/git -c http.extraHeader="AUTHORIZATION: basic $(printf "x:%s" "$token" | base64)" \
-        clone --depth=1 "$https_url" "${repoRoot}"
-    }
-
-    if [ ! -d "${repoRoot}/.git" ]; then
-      # Set up SSH to use openssh from Nix
-      export GIT_SSH_COMMAND="${pkgs.openssh}/bin/ssh"
-
-      if ! ${pkgs.git}/bin/git clone --depth=1 "${privateRepo}" "${repoRoot}"; then
-        echo "[private-restore] SSH clone failed, trying HTTPS via op token…" >&2
-        clone_https_with_token
-      fi
-    else
-      export GIT_SSH_COMMAND="${pkgs.openssh}/bin/ssh"
-      ${pkgs.git}/bin/git -C "${repoRoot}" fetch --prune
-      ${pkgs.git}/bin/git -C "${repoRoot}" pull --ff-only
+    if [ ! -d "${repoRoot}" ]; then
+      echo "[private-restore] Private repo not found at ${repoRoot}"
+      echo "[private-restore] Run 'chezmoi apply' first to clone it via .chezmoiexternal.toml"
+      exit 1
     fi
 
     # Overlays: common then per-profile

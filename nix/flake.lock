@@ -77,6 +77,26 @@
         "type": "github"
       }
     },
+    "nix-private": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1770931548,
+        "narHash": "sha256-lq1X68p+zcqfoBDVFVuRDOTV8R1WE9CsLk5A6tlD1N0=",
+        "ref": "refs/heads/main",
+        "rev": "e2c17e3e876267599fe301278dd35c3c9a9592ed",
+        "revCount": 24,
+        "type": "git",
+        "url": "ssh://git@github.com/p4p3r/dotfiles-private.git"
+      },
+      "original": {
+        "type": "git",
+        "url": "ssh://git@github.com/p4p3r/dotfiles-private.git"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1759143472,
@@ -114,6 +134,7 @@
         "darwin": "darwin",
         "home-manager": "home-manager",
         "nix-homebrew": "nix-homebrew",
+        "nix-private": "nix-private",
         "nixpkgs": "nixpkgs",
         "nixpkgs-darwin": "nixpkgs-darwin"
       }

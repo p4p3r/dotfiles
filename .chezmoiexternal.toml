@@ -1,0 +1,9 @@
+# External resources managed by chezmoi
+# These are cloned/updated but not tracked as regular files
+
+[".config/private"]
+    type = "git-repo"
+    url = "git@github.com:p4p3r/dotfiles-private.git"
+    refreshPeriod = "168h"
+    [".config/private".pull]
+        args = ["--ff-only"]

@@ -1,5 +1,5 @@
 {
-  description = "Hybrid Nix (nix-darwin + nix-homebrew + Home Manager) + chezmoi + private overlay";
+  description = "Hybrid Nix (nix-darwin + nix-homebrew + Home Manager) + chezmoi";
 
   inputs = {
     # Linux & general packages (25.05 stable)
@@ -32,13 +32,15 @@
     primaryUser = let p = builtins.getEnv "PRIMARY_USER"; in if p == "" then "paper" else p;
     hostName = let h = builtins.getEnv "HOST_NAME"; in if h == "" then "paperware" else h;
 
-    mkDarwin = { user ? username, primary ? primaryUser }: darwin.lib.darwinSystem {
+    mkDarwin = { user ? username, primary ? primaryUser, profiles ? [ "p4p3r" ] }: darwin.lib.darwinSystem {
       system = "aarch64-darwin";
       specialArgs = { inherit inputs user primary hostName; };
       modules = [
         { nixpkgs.config.allowUnfree = true; }
         ./modules/nix-settings.nix
         ./modules/darwin-homebrew.nix
+        inputs.nix-private.darwinModule
+        { private.profiles = profiles; }
         # Force the correct user, overriding any empty value from the imported module:
         ({ lib, ... }: {
           nix-homebrew.user = lib.mkForce user;
@@ -83,10 +85,9 @@
             imports = [
               ./modules/common.nix
               ./modules/git-ssh.nix
-              ./modules/link-projects.nix
-              ./modules/private-restore.nix
               inputs.nix-private.homeManagerModule
             ];
+            private.profiles = profiles;
             home.username = "${user}";
             home.homeDirectory = "/Users/${user}";
           };
@@ -94,22 +95,27 @@
       ];
     };
 
-    mkHome = { system, user ? username }:
+    mkHome = { system, user ? username, profiles ? [ "p4p3r" ] }:
       home-manager.lib.homeManagerConfiguration {
         pkgs = nixpkgs.legacyPackages.${system};
         modules = [
           { nixpkgs.config.allowUnfree = true; }
           ./modules/common.nix
           ./modules/git-ssh.nix
-          ./modules/link-projects.nix
-          ./modules/private-restore.nix
           inputs.nix-private.homeManagerModule
-          { home.username = user; home.homeDirectory = "/home/${user}"; }
+          {
+            home.username = user;
+            home.homeDirectory = "/home/${user}";
+            private.profiles = profiles;
+          }
         ];
       };
 
   in {
-    darwinConfigurations."${hostName}" = mkDarwin { user = username; };
+    darwinConfigurations."${hostName}" = mkDarwin {
+      user = username;
+      profiles = [ "p4p3r" "semgrep" ];
+    };
     homeConfigurations."${username}@linux" = mkHome { system = "x86_64-linux"; user = username; };
 
     # Dev shells with toolchains

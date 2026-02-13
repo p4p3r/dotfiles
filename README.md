@@ -1,97 +1,87 @@
-# 🚀 Bootstrapping a New Machine
+# Bootstrapping a New Machine
 
 This dotfiles repo uses **chezmoi** as an orchestrator that automatically:
-1. Clones public **nix-config** and private **nix-config-private** repos
-2. Runs `darwin-rebuild` (macOS) or `home-manager` (Linux)
-3. Manages other dotfiles (Fish, etc.)
-4. Integrates with **1Password** for secrets
+1. Manages dotfiles (Fish, Git, Neovim, etc.)
+2. Clones the private **dotfiles-private** repo
+3. Integrates with **1Password** for secrets
+
+Nix handles system configuration via `darwin-rebuild` (macOS) or `home-manager` (Linux).
 
 ## Quick Start
 
-Run this one-liner:
-
 ```bash
-bash -c "$(curl -fsSL https://gist.githubusercontent.com/p4p3r/9724833647dd3217414f4463e5ca52bb/raw/c968210f793615d35f2b541138b9dc881436dfb5/bootstrap-new-machine.sh)"
+bash -c "$(curl -fsSL https://gist.githubusercontent.com/p4p3r/9724833647dd3217414f4463e5ca52bb/raw/bootstrap-new-machine.sh)"
 ```
 
-Then, if on macOS, in a new terminal:
+Then, on macOS, in a new terminal:
 
 ```bash
 chsh -s /run/current-system/sw/bin/fish
 ```
 
-## How It Works
-
-### Chezmoi as Orchestrator
+## Structure
 
 ```
-~/.local/share/chezmoi/           # Chezmoi source directory (this repo)
-├── .chezmoiexternal.toml         # Clones nix-config and nix-config-private
-├── .chezmoiscripts/
-│   └── run_onchange_after_nix-rebuild.sh  # Auto-runs darwin-rebuild
-└── .chezmoiignore                # Ignores .config/nix/** (managed externally)
+~/Code/p4p3r/dotfiles/            # Chezmoi source directory (this repo)
+├── .chezmoiexternal.toml         # Clones dotfiles-private to ~/.config/private
+├── .chezmoiignore
+├── nix/                          # Public Nix config (symlinked to ~/.config/nix)
+│   ├── flake.nix                 # System configuration (darwin + home-manager)
+│   ├── modules/
+│   │   ├── common.nix            # Packages and home-manager config
+│   │   ├── nix-settings.nix      # Nix daemon and performance settings
+│   │   ├── darwin-homebrew.nix   # Homebrew casks and taps
+│   │   ├── git-ssh.nix           # Git/SSH config (1Password integration)
+│   │   └── shell/fish.nix        # Fish shell configuration
+│   └── lib/
+│       └── devtoolchain.nix      # Common dev tools
+└── dot_config/fish/              # Fish functions and config (chezmoi-managed)
+
+~/.config/private/                # Private config (git@github.com:p4p3r/dotfiles-private)
+├── flake.nix                     # Exports homeManagerModule + darwinModule
+├── nix/
+│   ├── lib/mkOverlay.nix         # Shared overlay logic
+│   └── modules/
+│       ├── default.nix           # Private options (profiles, repoRoot)
+│       ├── darwin.nix            # Private homebrew casks per profile
+│       ├── shell/fish-private.nix
+│       └── overlays/
+│           ├── p4p3r.nix         # Personal repos
+│           └── REDACTED.nix       # Work overlay (files, repos, git identity)
+└── overlay/REDACTED/              # Files deployed to $HOME via home.file
 ```
 
-**On `chezmoi apply`:**
-1. Clones `~/.config/nix` from GitHub (public repo)
-2. Clones `~/.config/nix-private` from GitHub (private repo)
-3. Runs `darwin-rebuild switch` automatically
-4. Applies other dotfiles (Fish config, etc.)
+## Daily Workflow
 
-### Nix Configuration Structure
-
-```
-~/.config/nix/              # Public Nix config (https://github.com/p4p3r/nix-config)
-├── flake.nix               # Main system configuration
-├── modules/
-│   ├── common.nix          # Home Manager packages
-│   ├── nix-settings.nix    # Performance settings
-│   └── git-ssh.nix         # Git/SSH config (1Password integration)
-└── lib/
-    └── base-devtools.nix   # Common dev tools
-
-~/.config/nix-private/      # Private Nix config (git@github.com:p4p3r/nix-config-private.git)
-├── flake.nix               # Exports modules to main config
-├── modules/
-│   ├── work-projects.nix   # Symlinks .envrc to work projects
-│   └── shell/
-│       └── fish-private.nix  # Private Fish functions
-└── projects/
-    ├── work-project-a/     # Private devenv configs
-    │   ├── devenv.nix
-    │   ├── flake.nix
-    │   └── .envrc
-    └── work-project-b/
-        ├── devenv.nix
-        ├── flake.nix
-        └── .envrc
-```
-
-### Daily Workflow
-
-**Making changes to Nix config:**
+**Rebuild system after editing Nix config:**
 ```bash
-cd ~/.config/nix
-# Edit files...
-git add -A && git commit -m "Update config" && git push
+nix_switch        # build + activate (includes private overlays)
 ```
 
-**Making changes to dotfiles:**
+**Other Nix helpers:**
+```bash
+nix_check         # validate flake
+nix_build         # build without activating
+nix_update        # update all flake inputs
+nix_update nixpkgs  # update a single input
+```
+
+**Editing dotfiles:**
 ```bash
 chezmoi edit ~/.config/fish/config.fish
 chezmoi apply
 ```
 
-**Updating on another machine:**
+**Syncing on another machine:**
 ```bash
-chezmoi update  # Pulls latest dotfiles + nix configs
-# darwin-rebuild runs automatically via chezmoi script
+chezmoi update    # pulls latest dotfiles + private repo
+nix_switch        # rebuild system
 ```
 
-## Architecture Benefits
+## Architecture
 
-✅ **Single command restore** - `chezmoi apply` sets up everything  
-✅ **Public/private split** - Sensitive project names stay private  
-✅ **Git-native** - Nix configs are proper Git repos with history  
-✅ **Modular** - Each component (chezmoi, nix-config, nix-private) is independent  
-✅ **1Password integration** - SSH keys and secrets managed securely
+- **chezmoi** manages dotfiles and clones the private repo via `.chezmoiexternal.toml`
+- **Nix flake** (`~/.config/nix`) defines the full system: packages, shell, git, SSH
+- **Private flake** (`~/.config/private`) is a flake input providing overlay modules
+- **Profiles** (`private.profiles`) control which overlays are active per host
+- **1Password** provides SSH keys and secrets (no secrets in either repo)

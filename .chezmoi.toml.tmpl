@@ -1,2 +1,4 @@
+sourceDir = {{ printf "%s/Code/p4p3r/dotfiles" .chezmoi.homeDir | quote }}
+
 [data]
   ci = {{ if env "GITHUB_ACTIONS" }}true{{ else }}false{{ end }}

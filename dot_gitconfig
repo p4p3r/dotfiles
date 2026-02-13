@@ -140,3 +140,6 @@
 	process = git-lfs filter-process
 [safe]
 	directory = *
+
+[includeIf "gitdir:~/Code/semgrep/"]
+	path = ~/Code/semgrep/.gitconfig

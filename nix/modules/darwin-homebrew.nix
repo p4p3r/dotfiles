@@ -36,14 +36,11 @@
       "avrdude"
       "dfu-util"
       "teensy_loader_cli"
+      "dfu-programmer"
+      "mdloader"
       "sketchybar"
       "cirruslabs/cli/tart"
-
-      # Global development tools
-      "node"          # Provides npm and npx
-      "python@3.12"   # Provides pip
-      "pipx"          # Python CLI tools in isolated environments
-      "semgrep"       # Static analysis tool
+      "softnet"
     ];
 
     casks = [
@@ -66,9 +63,7 @@
       "google-chrome"
       "google-drive"
       "keka"
-      "linear-linear"
       "little-snitch"
-      "notion"
       "obs"
       "orbstack"
       "pearcleaner"
@@ -80,7 +75,6 @@
       "setapp"
       "shottr"
       "signal"
-      "slack"
       "sonos"
       "stats"
       "switchresx"
@@ -97,6 +91,8 @@
       "CARROT Weather" = 993487541;
       "DaisyDisk" = 411643860;
       "Fantastical" = 975937182;
+      "1Blocker" = 1365531024;
+      "Save to Raindrop.io" = 1549370672;
     };
 
     onActivation = {

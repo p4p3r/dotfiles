@@ -13,6 +13,7 @@ return {
   -- Themes
   { import = "astrocommunity.colorscheme.catppuccin", enabled = false },
   { import = "astrocommunity.colorscheme.kanagawa-nvim", enabled = false },
+  { import = "astrocommunity.colorscheme.rose-pine" },
   -- Packs
   { import = "astrocommunity.pack.lua" },
   { import = "astrocommunity.pack.python-ruff" },
@@ -24,14 +25,16 @@ return {
   { import = "astrocommunity.motion.hop-nvim" },
   -- Window
   { import = "astrocommunity.split-and-window.minimap-vim" },
+  -- AI
+  { import = "astrocommunity.ai.sidekick-nvim" },
   -- Completion
   { import = "astrocommunity.recipes.ai" },
   { import = "astrocommunity.completion.copilot-cmp" },
-  { import = "astrocommunity.completion.avante-nvim" },
+  { import = "astrocommunity.completion.avante-nvim", enabled = false },
   -- Editing
   { import = "astrocommunity.editing-support.bigfile-nvim" },
   { import = "astrocommunity.editing-support.rainbow-delimiters-nvim" },
   { import = "astrocommunity.editing-support.yanky-nvim" },
   -- VSCode
-  { import = "astrocommunity.recipes.vscode" },
+  -- { import = "astrocommunity.recipes.vscode" },
 }

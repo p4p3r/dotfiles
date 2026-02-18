@@ -1,3 +1,4 @@
+copy-on-select = clipboard
 mouse-scroll-multiplier = 0.5
 
 window-decoration = true
@@ -7,8 +8,8 @@ window-padding-y = 2
 window-padding-balance = true
 
 # theme = dark:catppuccin-frappe,light:catppuccin-latte
-theme = rose-pine-moon
-theme = rose-pine-moon
+theme = Rose Pine Moon
+theme = Rose Pine Moon
 
 font-family = "MesloLGSDZ Nerd Font Mono"
 font-size = 11
@@ -17,6 +18,7 @@ macos-option-as-alt = true
 
 keybind = cmd+t=unbind
 keybind = cmd+n=unbind
+keybind = cmd+h=unbind
 keybind = cmd+d=unbind
 keybind = cmd+w=unbind
 keybind = cmd+enter=unbind
@@ -34,4 +36,12 @@ keybind = cmd+control+right=unbind
 keybind = cmd+control+equal=unbind
 keybind = cmd+opt+left=unbind
 keybind = cmd+opt+right=unbind
+
+# Unbind for Zellij navigation (Super+h/j/k/l/i/o/n/f)
+keybind = cmd+l=unbind
+keybind = cmd+j=unbind
+keybind = cmd+k=unbind
+keybind = cmd+i=unbind
+keybind = cmd+o=unbind
+keybind = cmd+f=unbind
 

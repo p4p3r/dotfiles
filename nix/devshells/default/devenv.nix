@@ -10,7 +10,7 @@
     pkg-config
 
     # Node.js
-    nodejs_20
+    nodejs_22
     corepack
 
     # Python

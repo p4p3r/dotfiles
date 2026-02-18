@@ -59,6 +59,10 @@
             KeyRepeat = 2;
             InitialKeyRepeat = 15;
           };
+          # Disable Cmd+H (Hide) in Ghostty so it passes through to Zellij
+          system.defaults.CustomUserPreferences."com.mitchellh.ghostty" = {
+            NSUserKeyEquivalents = { "Hide Ghostty" = "@~^$h"; };
+          };
           users.users.root.home = lib.mkForce "/var/root";
           users.users.${user} = {
             home = "/Users/${user}";

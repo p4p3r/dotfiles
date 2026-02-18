@@ -12,8 +12,20 @@ if status is-interactive
 
     # Check if our Terminal emulator is Ghostty
     if [ "$TERM" = "xterm-ghostty" ]
-        # Launch zellij
-        eval (zellij setup --generate-auto-start fish | string collect)
+        # Check if already in zellij (prevent nesting)
+        if not set -q ZELLIJ
+            # Determine session name
+            if set -q SIMPLE
+                set -l _zj_name simple
+            else if set -q ZELLIJ_SESSION_NAME
+                set -l _zj_name $ZELLIJ_SESSION_NAME
+            else
+                set -l _zj_name (fish_get_session_name)
+            end
+            # Delete dead (EXITED) sessions to avoid resurrection hangs
+            zellij delete-session $_zj_name 2>/dev/null
+            exec zellij attach $_zj_name --create
+        end
     end
 end
 

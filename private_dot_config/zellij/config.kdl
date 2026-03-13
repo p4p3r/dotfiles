@@ -153,9 +153,6 @@ keybinds clear-defaults=true {
         bind "Super down" { MoveFocus "down"; }
         bind "Super up" { MoveFocus "up"; }
         bind "Super right" { MoveFocusOrTab "right"; }
-        bind "Super +" { Resize "Increase"; }
-        bind "Super -" { Resize "Decrease"; }
-        bind "Super =" { Resize "Increase"; }
         bind "Super [" { PreviousSwapLayout; }
         bind "Super ]" { NextSwapLayout; }
         bind "Super f" { ToggleFloatingPanes; }
@@ -267,6 +264,8 @@ scrollback_lines_to_serialize 10000
 default_shell "fish"
 
 pane_frames false
+
+mouse_mode true
 
 copy_command "pbcopy"
 copy_on_select true

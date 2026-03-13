@@ -42,6 +42,7 @@ in {
 
     # k8s / devops
     kubectl kubernetes-helm kustomize terraform awscli2 k9s
+    argocd argo kubectx stern
 
   ] ++ lib.optionals pkgs.stdenv.isDarwin [
     pinentry_mac

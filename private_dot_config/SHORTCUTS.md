@@ -129,14 +129,86 @@ Press the prefix, then the key below.
 
 ---
 
+## Conductor (tmux, separate socket)
+
+Runs in its own Ghostty window via `conductor` command. Uses a dedicated tmux server (socket: `conductor`) with Zellij-mirrored keybinds. Rose Pine Dawn theme.
+
+### Prefix: Ctrl+Space
+
+Status bar shows hint bar with available keys for each mode.
+
+### Prefix Keys (Ctrl+Space → key)
+| Key | Action |
+|-----|--------|
+| t | Enter tab mode |
+| p | Enter pane mode |
+| n | Enter resize mode |
+| s | Scroll/copy mode |
+| c | New window |
+| d | Detach |
+| q | Kill session |
+| z | Zoom pane (fullscreen toggle) |
+| f | Float pane (floax) |
+| F | Float menu |
+| w | Add random worktree + claude window |
+| h/j/k/l | Focus pane left/down/up/right |
+| 1-9 | Go to window by number |
+| , | Rename window |
+| x | Kill pane |
+| o | Next pane |
+| [ | Copy mode |
+| " | Split vertical |
+| % | Split horizontal |
+
+### Tab Mode (prefix → t → key)
+| Key | Action |
+|-----|--------|
+| h/l | Previous/next tab |
+| j/k | Next/previous tab |
+| 1-9 | Go to tab by number |
+| n | New tab |
+| r | Rename tab |
+| x | Kill tab |
+
+### Pane Mode (prefix → p → key)
+| Key | Action |
+|-----|--------|
+| h/j/k/l | Focus pane |
+| n/r | Split horizontal |
+| d | Split vertical |
+| x | Kill pane |
+| z | Zoom (fullscreen) |
+| p | Next pane |
+
+### Resize Mode (prefix → n → key)
+| Key | Action |
+|-----|--------|
+| h/j/k/l | Resize 5 cells |
+| H/J/K/L | Resize 1 cell |
+
+### Copy Mode
+| Key | Action |
+|-----|--------|
+| q | Quit |
+| Space | Start selection |
+| / | Search |
+
+---
+
 ## Fish Shell Functions
 
 ### Claude Code
 | Command | Description |
 |---------|-------------|
-| `cclaude [args]` | Launch Claude Code with sleep prevention |
-| `claude-squad [args]` | Launch Claude Code with Agent Teams + sleep prevention |
-| `claude-worktree <branch> [base]` | Create/open git worktree in new Ghostty window + auto-start cclaude |
+| `claude [args]` | Launch Claude Code with API key unset + sleep prevention |
+| `claude-worktree <branch> [base]` | Create/open git worktree in new Ghostty window + auto-start claude |
+
+### Conductor
+| Command | Description |
+|---------|-------------|
+| `conductor` | Open conductor view for current repo (Ghostty + tmux + lazygit) |
+| `conductor-add <branch>` | Add worktree + claude/terminal window to running conductor |
+| `conductor-add-random` | Same as above with random 3-word branch name |
 
 ### Terminal & Sessions
 | Command | Description |
@@ -172,7 +244,21 @@ This will:
 2. Symlink `.envrc` from the parent repo (if exists) + `direnv allow`
 3. Open a new Ghostty window in the worktree directory
 4. Auto-start Zellij with session name like `sethmo~claudio-harness`
-5. Auto-launch `cclaude` in the new session
+5. Auto-launch `claude` in the new session
+
+## Workflow: Conductor
+
+```
+conductor
+```
+
+From any git repo, opens a Ghostty window with tmux:
+- **Window 1 (Overview)**: lazygit showing repo status + diffs
+- **Window 2..N**: One per existing worktree, with claude (left 60%) + shell (right 40%)
+
+Add worktrees on the fly:
+- `conductor-add feat-name` — named branch
+- `conductor-add-random` or `Ctrl+Space → w` — random 3-word branch
 
 ### Session Naming Convention
 
@@ -182,4 +268,5 @@ This will:
 | `~/.config` | `config` |
 | Git repo | repo basename (e.g., `my-project`) |
 | Git worktree | abbreviated repo + branch (e.g., `sethmo~feature-x`) |
+| Conductor | `c-<reponame>` (e.g., `c-my-project`) |
 | Long names (>40 chars) | auto-abbreviated (2 chars per word part) |

@@ -129,10 +129,6 @@
   zero-style = syntax
   blame-format = "{author:<18} ({commit:>7}) ┊{timestamp:^16}┊ "
   blame-palette = "#101010 #200020 #002800 #000028 #202000 #280000 #002020 #002800 #202020"
-[credential]
-	helper = /usr/local/share/gcm-core/git-credential-manager
-[credential "https://dev.azure.com"]
-	useHttpPath = true
 [filter "lfs"]
 	required = true
 	clean = git-lfs clean -- %f
@@ -143,3 +139,10 @@
 
 [includeIf "gitdir:~/Code/semgrep/"]
 	path = ~/Code/semgrep/.gitconfig
+[credential]
+	helper = 
+	helper = /usr/local/share/gcm-core/git-credential-manager
+[credential "https://dev.azure.com"]
+	useHttpPath = true
+[credential "https://github.com"]
+	username = p4p3r

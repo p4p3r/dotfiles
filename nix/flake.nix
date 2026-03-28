@@ -71,6 +71,7 @@
           programs.fish.enable = true;
           environment.shells = [ pkgs.fish ];
           environment.variables.SHELL = "/run/current-system/sw/bin/fish";
+          launchd.user.envVariables.SHELL = "/run/current-system/sw/bin/fish";
 
           # Activation script to install global npm packages
           system.activationScripts.postActivation.text = ''

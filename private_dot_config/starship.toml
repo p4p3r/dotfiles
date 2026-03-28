@@ -1,3 +1,13 @@
+# Multi-line prompt: fish truncates lines wider than the terminal, so we
+# split into groups to keep each line short enough for narrow panes.
+format = """$directory$git_branch$git_commit$git_state$git_status\
+$line_break\
+$nix_shell$python$nodejs$rust$env_var\
+$line_break\
+$kubernetes$aws$gcloud$docker_context\
+$line_break\
+$cmd_duration$character"""
+
 [aws]
 disabled = false
 
@@ -5,6 +15,9 @@ disabled = false
 disabled = false
 format = 'on [⛵ $context \($namespace\)](bold green) '
 # format = 'on [⛵ ($user on )($cluster in )$context \($namespace\)](dimmed green) '
+
+[nix_shell]
+format = 'via [$symbol($name)]($style) '
 
 [[kubernetes.contexts]]
 context_pattern = "arn:.*:.*/(?P<cluster>(dev|staging|prod)[a-zA-Z0-9_]*)-.*$"

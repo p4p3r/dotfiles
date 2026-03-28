@@ -20,6 +20,9 @@
       # Graphite
       "withgraphite/tap"
 
+      # Agent Deck (AI agent session manager)
+      "asheshgoplani/tap"
+
       # Others
       "koekeishiya/formulae"
       "nikitabobko/tap"
@@ -41,6 +44,7 @@
       "sketchybar"
       "cirruslabs/cli/tart"
       "softnet"
+      "asheshgoplani/tap/agent-deck"
     ];
 
     casks = [
@@ -50,9 +54,11 @@
       "balenaetcher"
       "brave-browser"
       "claude-code"
+      "claude-island"
       "codex"
-      "cryptomator"
+      "conductor"
       "cursor"
+      "emdash"
       "font-fira-code-nerd-font"
       "font-fira-mono-for-powerline"
       "font-hack-nerd-font"
@@ -76,14 +82,15 @@
       "shottr"
       "signal"
       "sonos"
+      "superset"
       "stats"
       "switchresx"
       "visual-studio-code"
       "visual-studio-code@insiders"
       "vlc"
-      "warp"
       "whatsapp"
       "wireshark-app"
+      "zen"
     ];
 
     masApps = {

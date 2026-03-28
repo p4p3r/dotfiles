@@ -1,7 +1,6 @@
-function claude-worktree -d "Create git worktree and open in new Ghostty window"
+function claude-worktree -d "Open new Ghostty window with Claude Code worktree session"
     if test (count $argv) -eq 0
-        echo "Usage: claude-worktree <branch-name> [base-branch]"
-        echo "Example: claude-worktree claudio/harness develop"
+        echo "Usage: claude-worktree <worktree-name>"
         return 1
     end
 
@@ -10,33 +9,26 @@ function claude-worktree -d "Create git worktree and open in new Ghostty window"
         return 1
     end
 
-    set -l branch_name $argv[1]
-    set -l base_branch main
-    if test (count $argv) -ge 2
-        set base_branch $argv[2]
-    end
+    set -l name $argv[1]
+    set -l repo_root (git rev-parse --show-toplevel)
+    set -l repo_name (basename $repo_root)
+    set -l session_name "$repo_name~$name"
+    set -l fish_bin (command -s fish)
 
-    set -l repo_name (basename (git rev-parse --show-toplevel))
-    set -l safe_branch (string replace -a '/' '-' $branch_name)
-    set -l worktree_path (git rev-parse --show-toplevel)/../$repo_name-$safe_branch
+    # Launcher script sets env vars and execs into interactive login fish.
+    # Needed because env vars don't survive `open -na` on macOS.
+    set -l launcher (mktemp /tmp/cwt-XXXXXX)
+    printf '%s\n' \
+        "#!$fish_bin" \
+        "rm (status filename)" \
+        "set -gx ZELLIJ_SESSION_NAME $session_name" \
+        "set -gx CLAUDE_WORKTREE $name" \
+        "exec $fish_bin -il" \
+        >$launcher
+    chmod +x $launcher
 
-    if not test -d $worktree_path
-        # Use existing branch if it exists, otherwise create new one
-        if git rev-parse --verify $branch_name &>/dev/null
-            git worktree add $worktree_path $branch_name
-        else
-            git worktree add $worktree_path -b $branch_name $base_branch
-        end
-        or return 1
-        echo "Worktree created at $worktree_path"
-
-        set -l repo_root (git rev-parse --show-toplevel)
-        if test -f $repo_root/.envrc
-            ln -s $repo_root/.envrc $worktree_path/.envrc
-            direnv allow $worktree_path
-        end
-    end
-
-    touch $worktree_path/.claude-autorun
-    ghostty-here $worktree_path
+    open -na Ghostty.app --args \
+        --working-directory=$repo_root \
+        --quit-after-last-window-closed \
+        --command=$launcher
 end

@@ -1,5 +1,8 @@
 # This file contains fish universal variable definitions.
 # VERSION: 3.0
+SETUVAR --export ANTHROPIC_API_KEY:sk\x2dant\x2dapi03\x2dfOrlq4ctbrxtB8CRqd8uKof70hJEPBZjsDomTouHw8lelbohCIltMIaDv4xPBjYDh_YK9rtcvaP5hwsjxw33iw\x2dl\x2dYUQQAA
+SETUVAR --export OPENAI_API_KEY:sk\x2dproj\x2djpRs9TxpRrmtwFjztjhPWfGGpSSa5GRAavppHt4UGYmQaAUSfbAGnbyT17upY9mgxLJQW9d6cvT3BlbkFJvafmNBW98mXSJP6kzibLJ9V5uYWnxfeDyaQ6TWmUdXVWxgjwd5jxwkV8GIcw0QLtxHwHn_5fYA
+SETUVAR --export TAVILY_API_KEY:tvly\x2ddev\x2dzYylUAr33JEUrRsarwkl0IA7WHZuYHmu
 SETUVAR ZO_CMD:zo
 SETUVAR Z_CMD:z
 SETUVAR Z_DATA:/Users/paper/\x2elocal/share/z/data

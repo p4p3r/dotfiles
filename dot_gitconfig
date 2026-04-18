@@ -2,7 +2,7 @@
   untrackedCache = true
   manyFiles = true
   pager = delta --line-numbers --dark
-  editot = nvim
+	editor = nvim
 
 [user]
   name = p4p3r

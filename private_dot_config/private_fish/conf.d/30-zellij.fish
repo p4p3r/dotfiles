@@ -1,7 +1,9 @@
 # Auto-launch Zellij in Ghostty — runs after PATH setup (nix, brew) but
 # before heavy conf.d (languages, creds) so parent shell stays lightweight.
 
-if status is-interactive; and test "$TERM" = xterm-ghostty; and not set -q ZELLIJ; and not set -q CONDUCTOR_WORKSPACE_NAME; and not set -q USE_TMUX; and not set -q SKIP_MUX
+if status is-interactive; and test "$TERM" = xterm-ghostty; and not set -q ZELLIJ; and not set -q CONDUCTOR_WORKSPACE_NAME; and not set -q SKIP_MUX
+    # Defensively drop any tmux-mode leak from a parent agent-deck shell.
+    set -e USE_TMUX
     set -gx ZELLIJ_CONFIG_DIR $HOME/.config/zellij
 
     # Honor explicit target dir set by ghostty-here (--working-directory unreliable in 1.2)

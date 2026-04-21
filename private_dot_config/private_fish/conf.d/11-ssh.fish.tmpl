@@ -5,17 +5,31 @@ if test -S "$sock"
   set -gx SSH_AUTH_SOCK "$sock"
 end
 {{- else -}}
-if set -q XDG_RUNTIME_DIR
-  set -l sock "$XDG_RUNTIME_DIR/1password/agent.sock"
-  if test -S "$sock"
-    set -gx SSH_AUTH_SOCK "$sock"
-  end
+# On Linux, PREFER the persistent systemd ssh-agent over a forwarded one.
+# Rationale: forwarded sockets die when SSH disconnects, breaking tmux/claude/
+# agent-deck sessions that need git/ssh. The persistent agent survives.
+# The forwarded socket (if any) is still available via $SSH_FORWARDED_AUTH_SOCK
+# for explicit use.
+if set -q SSH_AUTH_SOCK; and test -S "$SSH_AUTH_SOCK"
+  set -gx SSH_FORWARDED_AUTH_SOCK "$SSH_AUTH_SOCK"
 end
-if not set -q SSH_AUTH_SOCK
-  for sock in "$HOME/.1password/agent.sock" "$HOME/.config/1Password/ssh/agent.sock"
+
+if set -q XDG_RUNTIME_DIR; and test -S "$XDG_RUNTIME_DIR/ssh-agent.socket"
+  set -gx SSH_AUTH_SOCK "$XDG_RUNTIME_DIR/ssh-agent.socket"
+else if not set -q SSH_AUTH_SOCK; or not test -S "$SSH_AUTH_SOCK"
+  # Fallback: 1Password Linux desktop paths (for Linux workstations, not devboxes)
+  if set -q XDG_RUNTIME_DIR
+    set -l sock "$XDG_RUNTIME_DIR/1password/agent.sock"
     if test -S "$sock"
       set -gx SSH_AUTH_SOCK "$sock"
-      break
+    end
+  end
+  if not set -q SSH_AUTH_SOCK; or not test -S "$SSH_AUTH_SOCK"
+    for sock in "$HOME/.1password/agent.sock" "$HOME/.config/1Password/ssh/agent.sock"
+      if test -S "$sock"
+        set -gx SSH_AUTH_SOCK "$sock"
+        break
+      end
     end
   end
 end

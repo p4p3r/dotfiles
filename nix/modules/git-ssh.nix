@@ -1,7 +1,7 @@
 { config, pkgs, lib, ... }:
 {
   # Set SSH_AUTH_SOCK to use 1Password SSH agent
-  home.sessionVariables = {
+  home.sessionVariables = lib.optionalAttrs pkgs.stdenv.isDarwin {
     SSH_AUTH_SOCK = "~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock";
   };
 
@@ -31,7 +31,7 @@
       push.autoSetupRemote = true;
 
       # Credential handling (1Password)
-      credential.helper = "osxkeychain";
+      credential.helper = if pkgs.stdenv.isDarwin then "osxkeychain" else "";
 
       # Performance
       core.preloadindex = true;
@@ -74,7 +74,7 @@
     enable = true;
 
     # OrbStack SSH integration - MUST be first (before any Host blocks)
-    includes = [ "~/.orbstack/ssh/config" ];
+    includes = lib.optionals pkgs.stdenv.isDarwin [ "~/.orbstack/ssh/config" ];
 
     # Add keys to SSH agent
     addKeysToAgent = "yes";
@@ -107,9 +107,10 @@
 
       # Wildcard settings for all hosts
       "*" = {
-        identityAgent = ''"~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"'';
         extraOptions = {
           PubkeyAcceptedKeyTypes = "ssh-ed25519,ssh-rsa";
+        } // lib.optionalAttrs pkgs.stdenv.isDarwin {
+          IdentityAgent = ''"~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"'';
         };
       };
     };

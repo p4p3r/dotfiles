@@ -23,7 +23,7 @@ chsh -s /run/current-system/sw/bin/fish
 
 ```
 ~/Code/p4p3r/dotfiles/            # Chezmoi source directory (this repo)
-├── .chezmoiexternal.toml         # Clones dotfiles-private to ~/.config/private
+├── .chezmoiexternal.toml         # Clones dotfiles-private to ~/Code/p4p3r/dotfiles-private
 ├── .chezmoiignore
 ├── nix/                          # Public Nix config (symlinked to ~/.config/nix)
 │   ├── flake.nix                 # System configuration (darwin + home-manager)
@@ -37,7 +37,7 @@ chsh -s /run/current-system/sw/bin/fish
 │       └── devtoolchain.nix      # Common dev tools
 └── dot_config/fish/              # Fish functions and config (chezmoi-managed)
 
-~/.config/private/                # Private config (git@github.com:p4p3r/dotfiles-private)
+~/Code/p4p3r/dotfiles-private/    # Private source — edit + commit + push here
 ├── flake.nix                     # Exports homeManagerModule + darwinModule
 ├── nix/
 │   ├── lib/mkOverlay.nix         # Shared overlay logic
@@ -49,6 +49,8 @@ chsh -s /run/current-system/sw/bin/fish
 │           ├── p4p3r.nix         # Personal repos
 │           └── semgrep.nix       # Work overlay (files, repos, git identity)
 └── overlay/semgrep/              # Files deployed to $HOME via home.file
+
+~/.config/private                 # Symlink → ~/Code/p4p3r/dotfiles-private (chezmoi-managed)
 ```
 
 ## Daily Workflow
@@ -80,8 +82,8 @@ nix_switch        # rebuild system
 
 ## Architecture
 
-- **chezmoi** manages dotfiles and clones the private repo via `.chezmoiexternal.toml`
+- **chezmoi** manages dotfiles and clones the private repo to `~/Code/p4p3r/dotfiles-private/` via `.chezmoiexternal.toml`, also creating a `~/.config/private` symlink to it
 - **Nix flake** (`~/.config/nix`) defines the full system: packages, shell, git, SSH
-- **Private flake** (`~/.config/private`) is a flake input providing overlay modules
+- **Private flake** (`nix-private` input, overridden to `~/Code/p4p3r/dotfiles-private`) provides overlay modules — nix uses the real clone path, not the symlink, because `path:` flake inputs can't handle symlinks
 - **Profiles** (`private.profiles`) control which overlays are active per host
 - **1Password** provides SSH keys and secrets (no secrets in either repo)

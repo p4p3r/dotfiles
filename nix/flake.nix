@@ -92,7 +92,7 @@
               mkdir -p "$NPM_CONFIG_PREFIX"
               npm install -g @openai/codex || true
               npm install -g @zed-industries/codex-acp || true
-              npm install -g @zed-industries/claude-code-acp || true
+              npm install -g @agentclientprotocol/claude-agent-acp || true
             '
 
             # User-scoped CLIs via upstream installers. postActivation runs as root,

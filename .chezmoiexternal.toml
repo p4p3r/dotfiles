@@ -1,9 +1,14 @@
 # External resources managed by chezmoi
 # These are cloned/updated but not tracked as regular files
 
-[".config/private"]
+# The private dotfiles live as a working clone at ~/Code/p4p3r/dotfiles-private
+# (symmetric with the public dotfiles source). chezmoi keeps it fast-forward-
+# pulled to origin; user edits/commits/pushes directly from that directory.
+# A symlink at ~/.config/private points at this clone so tools (nix_switch,
+# flake inputs, etc.) can keep referencing the familiar ~/.config/private path.
+["Code/p4p3r/dotfiles-private"]
     type = "git-repo"
     url = "git@github.com:p4p3r/dotfiles-private.git"
     refreshPeriod = "168h"
-    [".config/private".pull]
+    ["Code/p4p3r/dotfiles-private".pull]
         args = ["--ff-only"]

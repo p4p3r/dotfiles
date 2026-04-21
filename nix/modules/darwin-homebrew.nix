@@ -61,7 +61,7 @@
       "brave-browser"
       "aws-vpn-client"
       "claude-island"
-      "codex"
+      # codex CLI is installed via npm (@openai/codex) in flake.nix activation
       "conductor"
       "cursor"
       "emdash"

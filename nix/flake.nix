@@ -73,14 +73,38 @@
           environment.variables.SHELL = "/run/current-system/sw/bin/fish";
           launchd.user.envVariables.SHELL = "/run/current-system/sw/bin/fish";
 
-          # Activation script to install global npm packages
+          # Activation script to install global npm packages and user CLIs.
+          # Self-updating upstream tools (claude, opencode) are bootstrapped via
+          # their official installers rather than nix-packaged, so the tools'
+          # own updaters can manage versions without fighting nix pinning.
+          # Node comes from nixpkgs (same nodejs_22 the home devenv uses); npm
+          # globals land in /Users/${user}/.npm-global so they're user-owned and
+          # don't try to write to the read-only nix store. That prefix's bin dir
+          # is added to the user's PATH via home.sessionPath in common.nix.
           system.activationScripts.postActivation.text = ''
-            # Install Zed ACP packages globally via npm (after Homebrew installs node)
-            if command -v npm >/dev/null 2>&1; then
-              echo "Installing @zed-industries/codex-acp globally..."
-              npm install -g @zed-industries/codex-acp 2>/dev/null || true
-              echo "Installing @zed-industries/claude-code-acp globally..."
-              npm install -g @zed-industries/claude-code-acp 2>/dev/null || true
+            # Global npm installs — user-scoped to ~/.npm-global/{lib,bin}
+            # - @openai/codex: OpenAI Codex CLI
+            # - @zed-industries/*-acp: ACP bridges so Zed can talk to Codex / Claude Code
+            echo "Installing global npm packages..."
+            sudo -u ${user} -H bash -c '
+              export PATH=${pkgs.nodejs_22}/bin:$PATH
+              export NPM_CONFIG_PREFIX=$HOME/.npm-global
+              mkdir -p "$NPM_CONFIG_PREFIX"
+              npm install -g @openai/codex || true
+              npm install -g @zed-industries/codex-acp || true
+              npm install -g @zed-industries/claude-code-acp || true
+            '
+
+            # User-scoped CLIs via upstream installers. postActivation runs as root,
+            # so drop to the user with `sudo -u` to write into /Users/${user}/.local.
+            if [ ! -x /Users/${user}/.local/bin/claude ]; then
+              echo "Installing Claude Code (native installer)..."
+              sudo -u ${user} -H bash -c 'curl -fsSL https://claude.ai/install.sh | bash' || true
+            fi
+            # opencode's installer writes to ~/.opencode/bin/opencode, not ~/.local/bin.
+            if [ ! -x /Users/${user}/.opencode/bin/opencode ]; then
+              echo "Installing opencode..."
+              sudo -u ${user} -H bash -c 'curl -fsSL https://opencode.ai/install | bash' || true
             fi
           '';
 

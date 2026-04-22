@@ -9,6 +9,7 @@
   email = me@p4p3r.dev
   signingkey = ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMnyyU1t9iaE0dBttrT1qzxhI0/tyoHjf9iQiqcnvQaq
 
+{{ if eq .chezmoi.os "darwin" -}}
 [gpg]
   format = ssh
 
@@ -18,6 +19,7 @@
 [commit]
   gpgsign = true
 
+{{ end -}}
 [interactive]
   diffFilter = delta --color-only --features=interactive
 

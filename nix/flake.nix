@@ -2,18 +2,18 @@
   description = "Hybrid Nix (nix-darwin + nix-homebrew + Home Manager) + chezmoi";
 
   inputs = {
-    # Linux & general packages (25.05 stable)
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+    # Linux & general packages (25.11 stable)
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
 
-    # macOS-specific nixpkgs branch that matches nix-darwin 25.05
-    nixpkgs-darwin.url = "github:NixOS/nixpkgs/nixpkgs-25.05-darwin";
+    # macOS-specific nixpkgs branch that matches nix-darwin 25.11
+    nixpkgs-darwin.url = "github:NixOS/nixpkgs/nixpkgs-25.11-darwin";
 
     # nix-darwin must follow the darwin branch of nixpkgs
-    darwin.url = "github:nix-darwin/nix-darwin/nix-darwin-25.05";
+    darwin.url = "github:nix-darwin/nix-darwin/nix-darwin-25.11";
     darwin.inputs.nixpkgs.follows = "nixpkgs-darwin";
 
-    # Home Manager release matching 25.05, follow the Linux/general nixpkgs
-    home-manager.url = "github:nix-community/home-manager/release-25.05";
+    # Home Manager release matching 25.11, follow the Linux/general nixpkgs
+    home-manager.url = "github:nix-community/home-manager/release-25.11";
     home-manager.inputs.nixpkgs.follows = "nixpkgs";
 
     # nix-homebrew (no special follows needed)

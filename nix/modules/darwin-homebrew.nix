@@ -119,6 +119,11 @@
 
     onActivation = {
       autoUpdate = true;
+      # Run installs but skip the in-place upgrade pass. The upgrade pass calls
+      # `mas upgrade <id>` per app and returns non-zero on already-current apps
+      # (e.g. 1Blocker), aborting the whole activation. Manual `brew upgrade` /
+      # `mas upgrade` still work when you want them.
+      upgrade = false;
       cleanup = "zap";
     };
   };

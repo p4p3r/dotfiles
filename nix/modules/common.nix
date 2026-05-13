@@ -51,4 +51,32 @@ in {
   ]);
 
   home.sessionPath = [ "$HOME/.local/bin" "$HOME/.npm-global/bin" "$HOME/.opencode/bin" ];
+
+  # Linux-side equivalent of the nix-darwin `system.activationScripts.postActivation`
+  # block in flake.nix. nix-darwin's hook is darwin-only — on Linux we run the
+  # same npm globals + claude/opencode installers from home-manager activation
+  # so the same upstream-managed CLIs end up under ~/.local/bin, ~/.npm-global/bin,
+  # ~/.opencode/bin (all of which are already in sessionPath above).
+  home.activation = lib.mkIf pkgs.stdenv.isLinux {
+    installUpstreamClis = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+      export PATH=${pkgs.nodejs_22}/bin:${pkgs.curl}/bin:${pkgs.bash}/bin:$PATH
+      export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+      mkdir -p "$NPM_CONFIG_PREFIX"
+
+      echo "[postActivation] Installing global npm packages…"
+      npm install -g @openai/codex             || true
+      npm install -g @zed-industries/codex-acp || true
+      npm install -g @agentclientprotocol/claude-agent-acp || true
+
+      if [ ! -x "$HOME/.local/bin/claude" ]; then
+        echo "[postActivation] Installing Claude Code (native installer)…"
+        curl -fsSL https://claude.ai/install.sh | bash || true
+      fi
+
+      if [ ! -x "$HOME/.opencode/bin/opencode" ]; then
+        echo "[postActivation] Installing opencode…"
+        curl -fsSL https://opencode.ai/install | bash || true
+      fi
+    '';
+  };
 }

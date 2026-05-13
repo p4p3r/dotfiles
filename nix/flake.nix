@@ -146,7 +146,18 @@
       user = username;
       profiles = [ "p4p3r" "REDACTED" ];
     };
-    homeConfigurations."${username}@linux" = mkHome { system = "x86_64-linux"; user = username; };
+    # Linux home-manager: profile list comes from the PROFILES env var when set
+    # (e.g. `PROFILES=REDACTED home-manager switch --flake .#paper@linux --impure`).
+    # Falls back to ["p4p3r"] for parity with mkHome's default.
+    homeConfigurations."${username}@linux" = mkHome {
+      system = "x86_64-linux";
+      user = username;
+      profiles = let
+        env = builtins.getEnv "PROFILES";
+      in
+        if env == "" then [ "p4p3r" ]
+        else nixpkgs.lib.splitString "," env;
+    };
 
     # Dev shells with toolchains
     devShells = {

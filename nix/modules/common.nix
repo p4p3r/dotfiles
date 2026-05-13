@@ -59,7 +59,8 @@ in {
   # ~/.opencode/bin (all of which are already in sessionPath above).
   home.activation = lib.mkIf pkgs.stdenv.isLinux {
     installUpstreamClis = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
-      export PATH=${pkgs.nodejs_22}/bin:${pkgs.curl}/bin:${pkgs.bash}/bin:$PATH
+      # opencode's installer extracts a tarball, so tar/gzip must be on PATH.
+      export PATH=${pkgs.nodejs_22}/bin:${pkgs.curl}/bin:${pkgs.bash}/bin:${pkgs.gnutar}/bin:${pkgs.gzip}/bin:$PATH
       export NPM_CONFIG_PREFIX="$HOME/.npm-global"
       mkdir -p "$NPM_CONFIG_PREFIX"
 

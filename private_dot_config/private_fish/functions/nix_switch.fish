@@ -12,12 +12,15 @@ function nix_switch --description "Build and activate the darwin system configur
     # generation while /nix/var/nix/profiles/system is already bumped to the
     # newly built one. Re-running home-manager activation from /run/current-system
     # would then re-activate the OLD gen and silently revert home.file changes.
-    # Use the latest profile instead so we activate the gen darwin-rebuild
-    # actually just built.
+    # Two hops: system's `activate` references a per-user `activation-<user>`
+    # script which in turn exec's the home-manager generation's `activate`.
     set -l latest /nix/var/nix/profiles/system
-    set -l hm_gen (sudo grep -hoE '/nix/store/[a-z0-9]+-home-manager-generation' $latest/activate | head -1)
-    if test -n "$hm_gen"; and test -x "$hm_gen/activate"
-        echo "Running home-manager activation ($hm_gen)…"
-        "$hm_gen/activate"
+    set -l act_user (sudo grep -hoE '/nix/store/[a-z0-9]+-activation-[a-z_-]+' $latest/activate | head -1)
+    if test -n "$act_user"; and test -f "$act_user"
+        set -l hm_gen (sudo grep -hoE '/nix/store/[a-z0-9]+-home-manager-generation' $act_user | head -1)
+        if test -n "$hm_gen"; and test -x "$hm_gen/activate"
+            echo "Running home-manager activation ($hm_gen)…"
+            "$hm_gen/activate"
+        end
     end
 end

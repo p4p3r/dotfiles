@@ -23,6 +23,9 @@
       # Agent Deck (AI agent session manager)
       "asheshgoplani/tap"
 
+      # Datadog
+      "datadog-labs/pack"
+
       # Others
       "koekeishiya/formulae"
       "nikitabobko/tap"
@@ -36,6 +39,7 @@
       "osx-cross/arm/arm-gcc-bin@10"
       "qmk/qmk/hid_bootloader_cli"
       "qmk/qmk/qmk"
+      "datadog-labs/pack/pup"
       "avrdude"
       "dfu-util"
       "teensy_loader_cli"
@@ -47,6 +51,7 @@
       "asheshgoplani/tap/agent-deck"
       "clang-format"
       "make"
+      "node"
       "ripgrep"
       "semgrep"
       "terraform-docs"

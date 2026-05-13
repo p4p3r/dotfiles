@@ -1,11 +1,16 @@
-if test -z "$Z_DATA"
-    if test -z "$XDG_DATA_HOME"
-        set -U Z_DATA_DIR "$HOME/.local/share/z"
-    else
-        set -U Z_DATA_DIR "$XDG_DATA_HOME/z"
-    end
-    set -U Z_DATA "$Z_DATA_DIR/data"
+# Recompute Z_DATA every shell startup against the current $HOME. Earlier this
+# used `set -U`, which persists into ~/.config/fish/fish_variables — when
+# fish_variables is chezmoi-managed and synced across machines, a macOS-set
+# value like /Users/paper/.local/share/z follows you to a Linux box and breaks.
+# Erase any stale universal value, then use `set -gx` for the current session.
+set -eU Z_DATA_DIR 2>/dev/null
+set -eU Z_DATA     2>/dev/null
+if test -z "$XDG_DATA_HOME"
+    set -gx Z_DATA_DIR "$HOME/.local/share/z"
+else
+    set -gx Z_DATA_DIR "$XDG_DATA_HOME/z"
 end
+set -gx Z_DATA "$Z_DATA_DIR/data"
 
 if test ! -e "$Z_DATA"
     if test ! -e "$Z_DATA_DIR"
@@ -32,12 +37,10 @@ if test ! -z $ZO_CMD
     end
 end
 
-if not set -q Z_EXCLUDE
-    set -U Z_EXCLUDE "^$HOME\$"
-else if contains $HOME $Z_EXCLUDE
-    # Workaround: migrate old default values to a regex (see #90).
-    set Z_EXCLUDE (string replace -r -- "^$HOME\$" '^'$HOME'$$' $Z_EXCLUDE)
-end
+# Z_EXCLUDE embeds $HOME, so a universal value carried across machines points
+# at the wrong dir. Recompute it per-session like Z_DATA above.
+set -eU Z_EXCLUDE 2>/dev/null
+set -gx Z_EXCLUDE "^$HOME\$"
 
 # Setup completions once first
 __z_complete

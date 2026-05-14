@@ -1,0 +1,105 @@
+# Port of ~/.config/amethyst/amethyst.yml to AeroSpace
+# Docs: https://nikitabobko.github.io/AeroSpace/guide
+
+after-startup-command = []
+start-at-login = true
+
+enable-normalization-flatten-containers = true
+enable-normalization-opposite-orientation-for-nested-containers = true
+accordion-padding = 30
+
+default-root-container-layout = 'tiles'
+default-root-container-orientation = 'auto'
+
+# Keep the mouse stationary when focus changes to mirror Amethyst's mouse-follows-focus = false
+on-focused-monitor-changed = []
+
+automatically-unhide-macos-hidden-apps = false
+
+[key-mapping]
+preset = 'qwerty'
+
+[gaps]
+inner.horizontal = 8
+inner.vertical = 8
+outer.left = 0
+outer.right = 0
+outer.top = [{ monitor.main = 0 }, 0]
+outer.bottom = 0
+
+# Float Fantastical the same way Amethyst's floating blacklist does
+[[on-window-detected]]
+if.app-id = 'com.flexibits.fantastical2.mac'
+run = 'layout floating'
+
+[[on-window-detected]]
+if.app-id = 'com.grailr.CARROT-Weather'
+run = 'layout floating'
+
+[mode.main.binding]
+# Layout cycling and selection
+alt-period = 'layout h_tiles v_tiles h_accordion v_accordion'
+alt-slash = 'layout v_tiles h_tiles v_accordion h_accordion'
+alt-a = 'layout h_tiles'
+alt-s = 'layout v_tiles'
+alt-d = 'fullscreen'
+alt-f = 'layout h_accordion'
+
+# Resize main/stack split
+alt-n = 'resize smart -50'
+alt-m = 'resize smart +50'
+alt-u = 'join-with left'
+alt-o = 'join-with right'
+
+# Focus helpers
+alt-l = 'focus --boundaries-action wrap-around-the-workspace dfs-next'
+alt-h = 'focus --boundaries-action wrap-around-the-workspace dfs-prev'
+alt-y = 'focus --dfs-index 0'
+alt-j = 'workspace --wrap-around prev'
+alt-k = 'workspace --wrap-around next'
+
+# Promote/demote relative to the "main" position
+alt-enter = 'swap --swap-focus left'
+
+# Workspace shortcuts (numeric row mirrors 1:1 monitor/workspace mapping)
+alt-1 = 'workspace 1'
+alt-2 = 'workspace 2'
+alt-3 = 'workspace 3'
+
+# Move focused window between workspaces (swap-screen bindings)
+alt-shift-h = '''exec-and-forget ~/.config/aerospace/scripts/move-window-relative.sh prev'''
+alt-shift-l = '''exec-and-forget ~/.config/aerospace/scripts/move-window-relative.sh next'''
+
+# Swap depth-first order (swap-ccw / swap-cw)
+alt-shift-j = 'swap dfs-prev'
+alt-shift-k = 'swap dfs-next'
+
+# Workspace focus (limit to the shared three-workspace setup)
+ctrl-alt-x = 'workspace 1'
+ctrl-alt-c = 'workspace 2'
+ctrl-alt-v = 'workspace 3'
+
+# Throw windows to workspaces and follow them (restrict to 1–3 since others unused)
+alt-shift-x = 'move-node-to-workspace --focus-follows-window 1'
+alt-shift-c = 'move-node-to-workspace --focus-follows-window 2'
+alt-shift-v = 'move-node-to-workspace --focus-follows-window 3'
+
+# Layout / tiling maintenance
+alt-t = 'layout floating tiling'
+alt-z = ['flatten-workspace-tree', 'balance-sizes']
+alt-shift-z = 'reload-config'
+alt-g = '''exec-and-forget ~/.config/aerospace/scripts/toggle-main-stack.sh'''
+
+# Collapse all windows to workspace 1 (laptop-only / "road mode")
+alt-shift-b = '''exec-and-forget ~/.config/aerospace/scripts/collapse-to-1.sh'''
+
+# Redistribute windows across workspaces 1–3 (home multi-monitor layout)
+alt-shift-n = '''exec-and-forget ~/.config/aerospace/scripts/redistribute-home-layout.sh'''
+
+# Redistribute windows for travel (1 external monitor: ws 2+3 share it, ws 1 stays on laptop)
+alt-shift-m = '''exec-and-forget ~/.config/aerospace/scripts/redistribute-travel-layout.sh'''
+
+[workspace-to-monitor-force-assignment]
+"1" = "Built-in Retina Display"
+"2" = "LG HDR 4K (1)"
+"3" = "LG HDR 4K (2)"

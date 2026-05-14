@@ -1,0 +1,113 @@
+#!/usr/bin/env sh
+
+PLUGIN_DIR="$HOME/.config/sketchybar/plugins"
+BAR_HEIGHT=30
+
+sketchybar --bar \
+  height=$BAR_HEIGHT \
+  blur_radius=30 \
+  margin=0 \
+  padding_left=12 \
+  padding_right=12 \
+  color=0x80111111 \
+  position=top
+
+FONT_MAIN="SF Pro Text:Semibold:13.0"
+FONT_SMALL="SF Pro Text:Regular:11.0"
+
+default=(
+  background.color=0x00000000
+  background.padding_left=6
+  background.padding_right=6
+  icon.font="$FONT_MAIN"
+  label.font="$FONT_MAIN"
+  icon.color=0xffe0e0e0
+  label.color=0xfff4f4f4
+)
+
+dim_label=(
+  label.color=0xffb0b0b0
+)
+
+# --- Left section: Apple menu + focused app title stack
+sketchybar --add item apple left \
+  --set apple "${default[@]}" \
+  icon="" \
+  click_script="open -a 'System Settings'"
+
+sketchybar --add item front_app left \
+  --set front_app "${default[@]}" \
+  script="$PLUGIN_DIR/focus_app.sh" \
+  updates=on
+
+sketchybar --add item window_title left \
+  --set window_title "${default[@]}" "${dim_label[@]}" \
+  script="$PLUGIN_DIR/window_title.sh" \
+  updates=on
+
+sketchybar --add bracket left_stack apple front_app window_title
+
+# --- Center section: workspaces
+sketchybar --add item spaces center \
+  --set spaces "${default[@]}" "${dim_label[@]}" \
+  script="$PLUGIN_DIR/aerospace_spaces.sh" \
+  updates=on
+
+# --- Right section: status controls similar to Bartender defaults
+sketchybar --add item wifi right \
+  --set wifi "${default[@]}" \
+  script="$PLUGIN_DIR/wifi.sh" \
+  updates=on \
+  label.font="$FONT_SMALL"
+
+sketchybar --add item bluetooth right \
+  --set bluetooth "${default[@]}" \
+  script="$PLUGIN_DIR/bluetooth.sh" \
+  updates=on \
+  label.drawing=off
+
+sketchybar --add item battery right \
+  --set battery "${default[@]}" \
+  script="$PLUGIN_DIR/battery.sh" \
+  updates=on \
+  label.font="$FONT_SMALL"
+
+sketchybar --add item volume right \
+  --set volume "${default[@]}" \
+  script="$PLUGIN_DIR/volume.sh" \
+  updates=on \
+  label.font="$FONT_SMALL"
+
+sketchybar --add item clock right \
+  --set clock "${default[@]}" \
+  update_freq=20 \
+  script="date +'%a %b %d  %H:%M'"
+
+# Hidden tray-style extras toggled by the arrow
+sketchybar --add item tray_bt right \
+  --set tray_bt "${default[@]}" \
+  script="$PLUGIN_DIR/bluetooth.sh" \
+  updates=on \
+  drawing=off \
+  icon.drawing=off \
+  label.font="$FONT_SMALL" \
+  label.padding_left=0 \
+  label.padding_right=0
+
+sketchybar --add item tray_battery right \
+  --set tray_battery "${default[@]}" \
+  script="$PLUGIN_DIR/battery.sh" \
+  updates=on \
+  drawing=off \
+  icon.drawing=off \
+  label.font="$FONT_SMALL" \
+  label.padding_left=0 \
+  label.padding_right=0
+
+sketchybar --add item tray_toggle right \
+  --set tray_toggle "${default[@]}" \
+  icon="▾" \
+  label.drawing=off \
+  click_script="$PLUGIN_DIR/toggle_tray.sh"
+
+sketchybar --add bracket right_stack wifi bluetooth battery volume clock tray_bt tray_battery tray_toggle

@@ -47,7 +47,7 @@ in {
   ] ++ lib.optionals pkgs.stdenv.isDarwin [
     pinentry_mac
   ] ++ lib.optionals pkgs.stdenv.isLinux [
-    pinentry
+    pinentry-curses    # `pinentry` was removed in nixpkgs 25.11; pick a variant
   ]);
 
   home.sessionPath = [ "$HOME/.local/bin" "$HOME/.npm-global/bin" "$HOME/.opencode/bin" ];

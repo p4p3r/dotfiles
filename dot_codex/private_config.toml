@@ -1,0 +1,6 @@
+model = "gpt-5.1-codex"
+[projects."/Users/paper"]
+trust_level = "trusted"
+
+[notice]
+hide_gpt5_1_migration_prompt = true

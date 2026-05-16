@@ -11,20 +11,63 @@ function nix_switch --description "Build and activate the system configuration (
         sudo env USER=$USER darwin-rebuild switch --flake $flake $override --impure $argv
         or return $status
 
+        # Capture the home-manager profile generation count BEFORE re-running
+        # HM activate. We verify AFTER that the count grew — that proves the
+        # user-level activation actually fired and the ~/.local/bin/foo
+        # symlinks point at the new generation. Without this check, a silent
+        # failure leaves stale user-level state (saw this happen on 2026-05-16,
+        # where the system gen bumped to 78 but the HM profile stayed at 42
+        # because nix-darwin's `launchctl asuser` step apparently no-op'd).
+        set -l hm_before (count /Users/$USER/.local/state/nix/profiles/home-manager-*-link 2>/dev/null)
+
         # nix-darwin's switch can leave /run/current-system pointing at an older
         # generation while /nix/var/nix/profiles/system is already bumped to the
         # newly built one. Re-running home-manager activation from /run/current-system
         # would then re-activate the OLD gen and silently revert home.file changes.
-        # Two hops: system's `activate` references a per-user `activation-<user>`
-        # script which in turn exec's the home-manager generation's `activate`.
-        set -l latest /nix/var/nix/profiles/system
-        set -l act_user (sudo grep -hoE '/nix/store/[a-z0-9]+-activation-[a-z_-]+' $latest/activate | head -1)
-        if test -n "$act_user"; and test -f "$act_user"
-            set -l hm_gen (sudo grep -hoE '/nix/store/[a-z0-9]+-home-manager-generation' $act_user | head -1)
-            if test -n "$hm_gen"; and test -x "$hm_gen/activate"
-                echo "Running home-manager activation ($hm_gen)…"
-                "$hm_gen/activate"
-            end
+        #
+        # Resolution strategy:
+        #  1. Take the LATEST system-*-link by mtime — this is the gen just
+        #     built, not whichever one /nix/var/nix/profiles/system happens to
+        #     symlink to (`profiles/system` can lag mid-activation).
+        #  2. From its `activate` script, grep the activation-<user> path
+        #     using a USER-SPECIFIC pattern (the original `-[a-z_-]+` regex
+        #     could match `activation-scripts` or similar before reaching
+        #     `activation-paper`).
+        #  3. Exec the HM-generation `activate` referenced inside.
+        #  4. Fail loudly if any of the above misses; do NOT silently skip.
+        set -l latest_system (ls -1dt /nix/var/nix/profiles/system-*-link 2>/dev/null | head -1)
+        if test -z "$latest_system"; or not test -f "$latest_system/activate"
+            echo "WARN: could not locate latest system generation under /nix/var/nix/profiles/" >&2
+            echo "      HM activation skipped. ~/.local/bin symlinks may be stale." >&2
+            return 1
+        end
+        set -l act_user (sudo grep -hoE "/nix/store/[a-z0-9]+-activation-$USER" $latest_system/activate | head -1)
+        if test -z "$act_user"; or not test -f "$act_user"
+            echo "WARN: could not locate activation-$USER path in $latest_system/activate" >&2
+            echo "      HM activation skipped. ~/.local/bin symlinks may be stale." >&2
+            return 1
+        end
+        set -l hm_gen (sudo grep -hoE '/nix/store/[a-z0-9]+-home-manager-generation' $act_user | head -1)
+        if test -z "$hm_gen"; or not test -x "$hm_gen/activate"
+            echo "WARN: could not locate home-manager-generation under $act_user" >&2
+            echo "      HM activation skipped. ~/.local/bin symlinks may be stale." >&2
+            return 1
+        end
+        echo "Running home-manager activation ($hm_gen)…"
+        "$hm_gen/activate"
+        or begin
+            echo "ERROR: home-manager activation FAILED. Review output above." >&2
+            return 1
+        end
+
+        # Sanity check: HM profile generation count should have grown by 1.
+        # If not, the activate script was a no-op (rare but possible) — flag
+        # it so the user knows something's off before they assume everything
+        # is current.
+        set -l hm_after (count /Users/$USER/.local/state/nix/profiles/home-manager-*-link 2>/dev/null)
+        if test "$hm_after" -le "$hm_before"
+            echo "NOTE: home-manager profile generation count did not increase ($hm_before → $hm_after)." >&2
+            echo "      Either there was nothing to change for the user, or activation no-op'd." >&2
         end
     else
         # Linux (e.g. the remote devbox). No nix-darwin — just home-manager.

@@ -21,7 +21,9 @@ devenv.lock
 # written by the fish daemon — never track).
 .config/fish/fish_variables
 
-# home-manager owns this — the symlink target embeds a nix-store hash that
-# changes every activation. Tracking it via chezmoi caused a prompt on every
+# home-manager owns these — the symlink target embeds a nix-store hash that
+# changes every activation. Tracking them via chezmoi caused a prompt on every
 # `chezmoi apply` because the live target != the source-pinned target.
 .config/direnv/lib/hm-nix-direnv.sh
+.config/fish/conf.d/00-direnv.fish
+.config/fish/conf.d/01-session-path.fish

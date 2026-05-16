@@ -1,0 +1,44 @@
+layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+        children
+        pane size=2 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+    }
+
+    tab name="Squad" focus=true {
+        pane split_direction="vertical" {
+            // Main Claude Code pane (70% width)
+            pane size="70%" {
+                focus true
+            }
+
+            // Right sidebar (30% width)
+            pane split_direction="horizontal" size="30%" {
+                // Monitoring pane
+                pane size="60%" {
+                    name "Monitor"
+                    command "fish"
+                    args "-c" "echo 'Monitoring pane - use for logs, ps, etc.'; fish"
+                }
+
+                // Tasks pane
+                pane size="40%" {
+                    name "Tasks"
+                    command "fish"
+                    args "-c" "echo 'Run: watch -n 2 \"ps aux | grep claude\"'; fish"
+                }
+            }
+        }
+    }
+
+    tab name="Logs" {
+        pane {
+            command "fish"
+            args "-c" "echo 'View Claude logs here'; echo 'Try: tail -f ~/.claude/debug/<session-id>/*.log'; fish"
+        }
+    }
+}

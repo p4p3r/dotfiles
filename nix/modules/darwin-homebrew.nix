@@ -20,9 +20,6 @@
       # Agent Deck (AI agent session manager)
       "asheshgoplani/tap"
 
-      # Datadog
-      "datadog-labs/pack"
-
       # Others
       "koekeishiya/formulae"
       "nikitabobko/tap"
@@ -35,7 +32,6 @@
       "osx-cross/arm/arm-gcc-bin@10"
       "qmk/qmk/hid_bootloader_cli"
       "qmk/qmk/qmk"
-      "datadog-labs/pack/pup"
       "avrdude"
       "dfu-util"
       "teensy_loader_cli"
@@ -45,12 +41,10 @@
       "cirruslabs/cli/tart"
       "softnet"
       "asheshgoplani/tap/agent-deck"
-      "make"
-      "node"
-      "ripgrep"
-      "tmux"
-      # graphite, REDACTED, terraform-docs, clang-format: now via
-      # pkgs-unstable in nix/modules/common.nix (cross-platform).
+      # Cross-platform tools (make, node, ripgrep, tmux) now via nix in
+      # nix/modules/common.nix. graphite/REDACTED/terraform-docs/clang-format
+      # via pkgs-unstable in same file. pup installed from GitHub releases
+      # in flake.nix postActivation (Mac) + common.nix activation (Linux).
     ];
 
     casks = [

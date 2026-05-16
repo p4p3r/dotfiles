@@ -7,7 +7,16 @@
 [user]
   name = p4p3r
   email = me@p4p3r.dev
+{{ if eq .chezmoi.os "darwin" -}}
+  # Laptop signingkey: served via 1Password SSH agent + op-ssh-sign.
   signingkey = ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMnyyU1t9iaE0dBttrT1qzxhI0/tyoHjf9iQiqcnvQaq
+{{ else if eq .chezmoi.os "linux" -}}
+  # Devbox signingkey: the sg_devbox key staged from 1Password into ~/.ssh/.
+  # Same key used for auth + signing. Git accepts a file path here; it'll
+  # read the pubkey body and pair with the matching private key when calling
+  # ssh-keygen -Y sign.
+  signingkey = ~/.ssh/id_ed25519.pub
+{{ end -}}
 
 {{ if eq .chezmoi.os "darwin" -}}
 [gpg]
@@ -15,6 +24,18 @@
 
 [gpg "ssh"]
   program = "/Applications/1Password.app/Contents/MacOS/op-ssh-sign"
+
+[commit]
+  gpgsign = true
+
+{{ else if eq .chezmoi.os "linux" -}}
+[gpg]
+  format = ssh
+
+# No gpg.ssh.program — falls back to system ssh-keygen (default), which
+# is on the devbox at /usr/bin/ssh-keygen and signs using the private key
+# matching the user.signingkey file. op-ssh-sign is Mac-only and won't
+# work here.
 
 [commit]
   gpgsign = true

@@ -44,3 +44,8 @@ keybind = cmd+i=unbind
 keybind = cmd+o=unbind
 keybind = cmd+f=unbind
 
+
+# Auto-install xterm-ghostty terminfo on remote SSH targets so tmux/vim/etc.
+# do not blow up with "missing or unsuitable terminal". Also forwards env hints
+# (TERM, COLORTERM) so the remote shell knows what we are.
+shell-integration-features = ssh-env,ssh-terminfo

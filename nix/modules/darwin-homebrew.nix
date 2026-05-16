@@ -17,9 +17,6 @@
       "osx-cross/avr"
       "qmk/qmk"
 
-      # Graphite
-      "withgraphite/tap"
-
       # Agent Deck (AI agent session manager)
       "asheshgoplani/tap"
 
@@ -35,7 +32,6 @@
 
     brews = [
       "koekeishiya/formulae/skhd"
-      "withgraphite/tap/graphite"
       "osx-cross/arm/arm-gcc-bin@10"
       "qmk/qmk/hid_bootloader_cli"
       "qmk/qmk/qmk"
@@ -49,13 +45,12 @@
       "cirruslabs/cli/tart"
       "softnet"
       "asheshgoplani/tap/agent-deck"
-      "clang-format"
       "make"
       "node"
       "ripgrep"
-      "semgrep"
-      "terraform-docs"
       "tmux"
+      # graphite, semgrep, terraform-docs, clang-format: now via
+      # pkgs-unstable in nix/modules/common.nix (cross-platform).
     ];
 
     casks = [

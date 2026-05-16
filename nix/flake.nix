@@ -122,6 +122,32 @@
               echo "Installing opencode..."
               sudo -u ${user} -H bash -c 'curl -fsSL https://opencode.ai/install | bash' || true
             fi
+
+            # pup (Datadog) — installed from GitHub releases. README lists
+            # brew, cargo, or manual download; no upstream install script.
+            # Fetch latest tarball, extract into ~/.local/bin/pup.
+            if [ ! -x /Users/${user}/.local/bin/pup ]; then
+              echo "Installing pup (DataDog/pup latest release)..."
+              sudo -u ${user} -H bash -c '
+                export PATH=${pkgs.curl}/bin:${pkgs.gnutar}/bin:${pkgs.gzip}/bin:${pkgs.gnused}/bin:$PATH
+                mkdir -p "$HOME/.local/bin"
+                pup_ver="$(curl -fsSL https://api.github.com/repos/DataDog/pup/releases/latest \
+                  | sed -n "s/.*\"tag_name\": *\"v\([^\"]*\)\".*/\1/p" | head -1)"
+                if [ -n "$pup_ver" ]; then
+                  arch="$(uname -m)"
+                  case "$arch" in
+                    arm64|aarch64) pup_arch="arm64" ;;
+                    x86_64)        pup_arch="x86_64" ;;
+                    *)             pup_arch="$arch" ;;
+                  esac
+                  url="https://github.com/DataDog/pup/releases/download/v$pup_ver/pup_''${pup_ver}_Darwin_''${pup_arch}.tar.gz"
+                  curl -fsSL "$url" | tar -xzC "$HOME/.local/bin" pup \
+                    || echo "WARN: pup install failed (non-fatal)"
+                else
+                  echo "WARN: could not resolve pup latest version"
+                fi
+              ' || true
+            fi
           '';
 
           home-manager.useGlobalPkgs = true;
@@ -163,48 +189,51 @@
         ];
       };
 
+    # Linux profile list: from PROFILES env var when set
+    # (e.g. `PROFILES=semgrep home-manager switch --flake .#paper@linux --impure`).
+    # Falls back to ["p4p3r"] for parity with mkHome's default.
+    linuxProfiles = let
+      env = builtins.getEnv "PROFILES";
+    in
+      if env == "" then [ "p4p3r" ]
+      else nixpkgs.lib.splitString "," env;
+
+    linuxSystems = [ "x86_64-linux" "aarch64-linux" ];
   in {
     darwinConfigurations."${hostName}" = mkDarwin {
       user = username;
       profiles = [ "p4p3r" "semgrep" ];
     };
-    # Linux home-manager: profile list comes from the PROFILES env var when set
-    # (e.g. `PROFILES=semgrep home-manager switch --flake .#paper@linux --impure`).
-    # Falls back to ["p4p3r"] for parity with mkHome's default.
-    homeConfigurations."${username}@linux" = mkHome {
-      system = "x86_64-linux";
-      user = username;
-      profiles = let
-        env = builtins.getEnv "PROFILES";
-      in
-        if env == "" then [ "p4p3r" ]
-        else nixpkgs.lib.splitString "," env;
+
+    # Linux home-manager configs for both x86_64 and aarch64.
+    # Default `@linux` alias targets x86_64-linux to preserve the existing
+    # `nix_switch` invocation contract. Use `@linux-aarch64` (or pick via the
+    # arch-aware nix_switch.fish branch) on Graviton/Apple-silicon Linux boxes.
+    homeConfigurations = {
+      "${username}@linux"          = mkHome { system = "x86_64-linux";  user = username; profiles = linuxProfiles; };
+      "${username}@linux-x86_64"   = mkHome { system = "x86_64-linux";  user = username; profiles = linuxProfiles; };
+      "${username}@linux-aarch64"  = mkHome { system = "aarch64-linux"; user = username; profiles = linuxProfiles; };
     };
 
-    # Dev shells with toolchains
-    devShells = {
-      aarch64-darwin.default = let
-        pkgs = nixpkgs.legacyPackages.aarch64-darwin;
+    # Dev shells with toolchains — one per supported system.
+    devShells = nixpkgs.lib.genAttrs ([ "aarch64-darwin" ] ++ linuxSystems) (system: {
+      default = let
+        pkgs = nixpkgs.legacyPackages.${system};
       in pkgs.mkShell {
         packages = import ./lib/devtoolchain.nix { inherit pkgs; };
       };
-
-      x86_64-linux.default = let
-        pkgs = nixpkgs.legacyPackages.x86_64-linux;
-      in pkgs.mkShell {
-        packages = import ./lib/devtoolchain.nix { inherit pkgs; };
-      };
-    };
+    });
 
     checks = {
       # Build the macOS system derivation (does NOT switch)
       aarch64-darwin.darwin-build = self.darwinConfigurations."${hostName}".system;
 
-      # Build the Linux Home Manager activation package (does NOT switch)
-      x86_64-linux.hm-build = self.homeConfigurations."${username}@linux".activationPackage;
+      # Build the Linux Home Manager activation packages (does NOT switch)
+      x86_64-linux.hm-build  = self.homeConfigurations."${username}@linux-x86_64".activationPackage;
+      aarch64-linux.hm-build = self.homeConfigurations."${username}@linux-aarch64".activationPackage;
     };
 
-    formatter.aarch64-darwin = nixpkgs.legacyPackages.aarch64-darwin.nixpkgs-fmt;
-    formatter.x86_64-linux   = nixpkgs.legacyPackages.x86_64-linux.nixpkgs-fmt;
+    formatter = nixpkgs.lib.genAttrs ([ "aarch64-darwin" ] ++ linuxSystems)
+      (system: nixpkgs.legacyPackages.${system}.nixpkgs-fmt);
   };
 }

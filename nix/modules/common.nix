@@ -1,4 +1,4 @@
-{ config, pkgs, lib, ... }:
+{ config, pkgs, pkgs-unstable, lib, ... }:
 let
   baseDevPkgs = import ../lib/base-devtools.nix { inherit pkgs; };
 in {
@@ -16,7 +16,12 @@ in {
     nix-direnv.enable = true;
   };
 
-  # Base toolchains & dev essentials
+  # Base toolchains & dev essentials.
+  # Convention:
+  #   - `pkgs.X`         → 25.11 stable. Stable across devenv projects too.
+  #     Use for everything where reproducibility matters more than version freshness.
+  #   - `pkgs-unstable.X` → rolling nixos-unstable. Use for CLIs you want close
+  #     to upstream HEAD. Refresh with `nix_update nixpkgs-unstable && nix_switch`.
   home.packages = baseDevPkgs ++ (with pkgs; [
     # devenv for per-project development environments
     devenv nil nixfmt
@@ -48,6 +53,13 @@ in {
     pinentry_mac
   ] ++ lib.optionals pkgs.stdenv.isLinux [
     pinentry-curses    # `pinentry` was removed in nixpkgs 25.11; pick a variant
+  ]) ++ (with pkgs-unstable; [
+    # Tools we want bleeding-edge — sourced from nixos-unstable rather than the
+    # 25.11 stable channel.
+    graphite-cli
+    REDACTED
+    terraform-docs
+    clang-tools
   ]);
 
   home.sessionPath = [ "$HOME/.local/bin" "$HOME/.npm-global/bin" "$HOME/.opencode/bin" ];

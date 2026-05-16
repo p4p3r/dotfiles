@@ -2,11 +2,16 @@
   description = "Hybrid Nix (nix-darwin + nix-homebrew + Home Manager) + chezmoi";
 
   inputs = {
-    # Linux & general packages (25.11 stable)
+    # Linux & general packages (25.11 stable). Used for everything inside
+    # devenv projects and anything where reproducibility outweighs freshness.
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
 
     # macOS-specific nixpkgs branch that matches nix-darwin 25.11
     nixpkgs-darwin.url = "github:NixOS/nixpkgs/nixpkgs-25.11-darwin";
+
+    # Rolling unstable nixpkgs. Used for "I want this CLI on $PATH and want
+    # it close to upstream HEAD" tools — see pkgs-unstable usage in common.nix.
+    nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     # nix-darwin must follow the darwin branch of nixpkgs
     darwin.url = "github:nix-darwin/nix-darwin/nix-darwin-25.11";
@@ -26,15 +31,26 @@
     };
   };
 
-  outputs = inputs@{ self, nixpkgs, home-manager, darwin, nix-homebrew, ... }:
+  outputs = inputs@{ self, nixpkgs, nixpkgs-unstable, home-manager, darwin, nix-homebrew, ... }:
   let
     username = let u = builtins.getEnv "USER"; in if u == "" then "paper" else u;
     primaryUser = let p = builtins.getEnv "PRIMARY_USER"; in if p == "" then "paper" else p;
     hostName = let h = builtins.getEnv "HOST_NAME"; in if h == "" then "paperware" else h;
 
+    # Helper: build a pkgs-unstable for a given system, passed into both
+    # darwin + home-manager configs via specialArgs / extraSpecialArgs so
+    # modules can do `pkgs-unstable.foo` for bleeding-edge tools.
+    mkUnstable = system: import nixpkgs-unstable {
+      inherit system;
+      config.allowUnfree = true;
+    };
+
     mkDarwin = { user ? username, primary ? primaryUser, profiles ? [ "p4p3r" ] }: darwin.lib.darwinSystem {
       system = "aarch64-darwin";
-      specialArgs = { inherit inputs user primary hostName; };
+      specialArgs = {
+        inherit inputs user primary hostName;
+        pkgs-unstable = mkUnstable "aarch64-darwin";
+      };
       modules = [
         { nixpkgs.config.allowUnfree = true; }
         ./modules/nix-settings.nix
@@ -111,6 +127,9 @@
           home-manager.useGlobalPkgs = true;
           home-manager.useUserPackages = true;
           home-manager.backupFileExtension = "hm-backup";
+          home-manager.extraSpecialArgs = {
+            pkgs-unstable = mkUnstable "aarch64-darwin";
+          };
           home-manager.users.${user} = { pkgs, ... }: {
             imports = [
               ./modules/common.nix
@@ -128,6 +147,9 @@
     mkHome = { system, user ? username, profiles ? [ "p4p3r" ] }:
       home-manager.lib.homeManagerConfiguration {
         pkgs = nixpkgs.legacyPackages.${system};
+        extraSpecialArgs = {
+          pkgs-unstable = mkUnstable system;
+        };
         modules = [
           { nixpkgs.config.allowUnfree = true; }
           ./modules/common.nix

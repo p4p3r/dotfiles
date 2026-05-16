@@ -16,4 +16,7 @@ devenv.lock
 
 # direnv
 .direnv
-private_dot_config/private_fish/fish_variables
+
+# fish universal-variable store (runtime state; contains live env values
+# written by the fish daemon — never track).
+.config/fish/fish_variables

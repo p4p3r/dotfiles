@@ -60,9 +60,10 @@ in {
   home.activation = lib.mkIf pkgs.stdenv.isLinux {
     installUpstreamClis = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
       # opencode's installer extracts a tarball, so tar/gzip must be on PATH.
-      export PATH=${pkgs.nodejs_22}/bin:${pkgs.curl}/bin:${pkgs.bash}/bin:${pkgs.gnutar}/bin:${pkgs.gzip}/bin:$PATH
+      # jq is used to resolve the agent-deck latest release tag.
+      export PATH=${pkgs.nodejs_22}/bin:${pkgs.curl}/bin:${pkgs.bash}/bin:${pkgs.gnutar}/bin:${pkgs.gzip}/bin:${pkgs.jq}/bin:$PATH
       export NPM_CONFIG_PREFIX="$HOME/.npm-global"
-      mkdir -p "$NPM_CONFIG_PREFIX"
+      mkdir -p "$NPM_CONFIG_PREFIX" "$HOME/.local/bin"
 
       echo "[postActivation] Installing global npm packages…"
       npm install -g @openai/codex             || true
@@ -77,6 +78,23 @@ in {
       if [ ! -x "$HOME/.opencode/bin/opencode" ]; then
         echo "[postActivation] Installing opencode…"
         curl -fsSL https://opencode.ai/install | bash || true
+      fi
+
+      # agent-deck — Linux equivalent of the asheshgoplani/tap/agent-deck
+      # Homebrew cask we use on macOS. No nixpkgs entry; GitHub releases
+      # ship versioned linux_amd64 tarballs.
+      if [ ! -x "$HOME/.local/bin/agent-deck" ]; then
+        echo "[postActivation] Installing agent-deck (latest GitHub release)…"
+        ver=$(curl -fsSL https://api.github.com/repos/asheshgoplani/agent-deck/releases/latest 2>/dev/null \
+              | jq -r '.tag_name' | sed 's/^v//')
+        if [ -n "$ver" ]; then
+          curl -fsSL "https://github.com/asheshgoplani/agent-deck/releases/download/v''${ver}/agent-deck_''${ver}_linux_amd64.tar.gz" \
+            | tar -xzC "$HOME/.local/bin" agent-deck 2>/dev/null \
+            && chmod +x "$HOME/.local/bin/agent-deck" \
+            || echo "[postActivation] WARN: agent-deck install failed (non-fatal)"
+        else
+          echo "[postActivation] WARN: couldn't resolve agent-deck latest tag (non-fatal)"
+        fi
       fi
     '';
   };

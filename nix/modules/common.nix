@@ -61,14 +61,20 @@ in {
     terraform-docs
     clang-tools
   ] ++ lib.optionals pkgs.stdenv.isLinux [
-    # Docker CLI on Linux only (macOS uses Orbstack). The `docker` package
-    # ships both `docker` (client) and `dockerd` (daemon) binaries. We only
-    # need the client here — the daemon must run as a system service, which
-    # home-manager can't manage (no root + systemd-system access). Install
-    # the daemon at the system level (e.g. via user_data.sh on the devbox)
-    # and add the user to the `docker` group so the client can talk to
-    # /var/run/docker.sock without sudo.
+    # Docker CLI on Linux only (macOS uses Orbstack, which provides both
+    # `docker` and `docker compose`). The `docker` package ships both
+    # `docker` (client) and `dockerd` (daemon) binaries. We only need the
+    # client here — the daemon must run as a system service, which
+    # home-manager can't manage (no root + systemd-system access). The
+    # daemon is installed via the `installSystemPackagesLinux` activation
+    # block below (apt install docker.io).
     docker
+
+    # docker-compose v2 (Go-based plugin) — Orbstack ships this on Mac at
+    # ~/.docker/cli-plugins/docker-compose, so `docker compose` works there.
+    # On Linux we install via nix + symlink into the same CLI-plugins dir
+    # in the activation block below, so the same `docker compose` UX works.
+    docker-compose
   ]);
 
   home.sessionPath = [ "$HOME/.local/bin" "$HOME/.npm-global/bin" "$HOME/.opencode/bin" ];
@@ -148,6 +154,20 @@ in {
         echo "[postActivation] Installing agent-deck (upstream install.sh)…"
         curl -fsSL https://raw.githubusercontent.com/asheshgoplani/agent-deck/main/install.sh | bash \
           || echo "[postActivation] WARN: agent-deck install failed (non-fatal)"
+      fi
+
+      # docker-compose v2 plugin wiring — nix installs the binary at
+      # ~/.nix-profile/bin/docker-compose. Docker CLI v2 also looks for
+      # plugins at ~/.docker/cli-plugins/<name>, where `<name>` becomes
+      # the `docker <name>` subcommand. Mirror Orbstack's macOS layout by
+      # symlinking the nix binary there so `docker compose ...` works,
+      # not just the standalone `docker-compose ...`.
+      mkdir -p "$HOME/.docker/cli-plugins"
+      if [ ! -L "$HOME/.docker/cli-plugins/docker-compose" ] \
+         || [ ! -x "$HOME/.docker/cli-plugins/docker-compose" ]; then
+        if command -v docker-compose >/dev/null 2>&1; then
+          ln -sf "$(command -v docker-compose)" "$HOME/.docker/cli-plugins/docker-compose"
+        fi
       fi
 
       # pup (Datadog) — installed from GitHub releases. README lists brew,

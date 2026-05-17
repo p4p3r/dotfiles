@@ -172,5 +172,45 @@ in {
         fi
       fi
     '';
+
+    # System-level packages on Ubuntu — things home-manager can't manage on
+    # non-NixOS Linux (services, /etc/, system-wide binaries that need root).
+    # Mirrors what nix-darwin's `homebrew.brews` covers on macOS.
+    #
+    # Requires NOPASSWD sudo: the devbox user_data grants this; on other
+    # Ubuntu hosts run `sudo visudo` first. `sudo -n` makes this fail fast
+    # rather than hanging on a password prompt.
+    #
+    # Each step is idempotent — re-running on `nix_switch` is a no-op once
+    # the package/service/group state is already correct.
+    installSystemPackagesLinux = lib.hm.dag.entryAfter [ "installUpstreamClis" ] ''
+      export PATH=${pkgs.coreutils}/bin:${pkgs.gnugrep}/bin:${pkgs.systemd}/bin:$PATH
+
+      if ! sudo -n true 2>/dev/null; then
+        echo "[postActivation] WARN: no NOPASSWD sudo — skipping system package install."
+        echo "                  (docker daemon, etc. will not be set up. Configure"
+        echo "                   sudoers or install them manually with apt.)"
+        exit 0
+      fi
+
+      # Docker daemon (CLI comes from pkgs-unstable via home.packages). On
+      # macOS we use Orbstack; Linux has no equivalent abstraction here.
+      if ! dpkg -s docker.io >/dev/null 2>&1; then
+        echo "[postActivation] Installing docker.io via apt…"
+        sudo -n apt-get update -qq
+        sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io \
+          || echo "[postActivation] WARN: docker.io install failed (non-fatal)"
+      fi
+      if dpkg -s docker.io >/dev/null 2>&1; then
+        if ! sudo -n systemctl is-enabled --quiet docker 2>/dev/null; then
+          echo "[postActivation] Enabling docker.service…"
+          sudo -n systemctl enable --now docker || true
+        fi
+        if ! id -nG "$USER" 2>/dev/null | grep -qw docker; then
+          echo "[postActivation] Adding $USER to docker group (requires re-login to take effect)…"
+          sudo -n usermod -aG docker "$USER" || true
+        fi
+      fi
+    '';
   };
 }

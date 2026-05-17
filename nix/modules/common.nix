@@ -60,6 +60,15 @@ in {
     REDACTED
     terraform-docs
     clang-tools
+  ] ++ lib.optionals pkgs.stdenv.isLinux [
+    # Docker CLI on Linux only (macOS uses Orbstack). The `docker` package
+    # ships both `docker` (client) and `dockerd` (daemon) binaries. We only
+    # need the client here — the daemon must run as a system service, which
+    # home-manager can't manage (no root + systemd-system access). Install
+    # the daemon at the system level (e.g. via user_data.sh on the devbox)
+    # and add the user to the `docker` group so the client can talk to
+    # /var/run/docker.sock without sudo.
+    docker
   ]);
 
   home.sessionPath = [ "$HOME/.local/bin" "$HOME/.npm-global/bin" "$HOME/.opencode/bin" ];

@@ -184,7 +184,10 @@ in {
     # Each step is idempotent — re-running on `nix_switch` is a no-op once
     # the package/service/group state is already correct.
     installSystemPackagesLinux = lib.hm.dag.entryAfter [ "installUpstreamClis" ] ''
-      export PATH=${pkgs.coreutils}/bin:${pkgs.gnugrep}/bin:${pkgs.systemd}/bin:$PATH
+      # System binaries live at /usr/bin and /bin on Ubuntu — home-manager
+      # activation gets a scrubbed PATH (mostly nix store), so we need to
+      # prepend the system paths explicitly to find sudo/apt-get/dpkg/etc.
+      export PATH=${pkgs.coreutils}/bin:${pkgs.gnugrep}/bin:${pkgs.systemd}/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
 
       if ! sudo -n true 2>/dev/null; then
         echo "[postActivation] WARN: no NOPASSWD sudo — skipping system package install."

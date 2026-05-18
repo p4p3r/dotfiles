@@ -1,1 +1,7 @@
 /nix/result
+
+# On Linux devboxes, ~/.config/nix is a symlink to nix/ inside this repo,
+# so home-manager's `xdg.configFile."nix/nix.conf"` (from modules/common.nix)
+# materializes its symlink AT /nix/nix.conf inside the working tree. Cosmetic
+# pollution only — the symlink target lives in /nix/store/.../home-files/.
+/nix/nix.conf

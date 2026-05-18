@@ -82,23 +82,19 @@ in {
   # ----------------------------------------------------------------------------
   # Linux nix config + auto-gc.
   # Mac equivalents live in nix/modules/nix-settings.nix (only loaded by
-  # mkDarwin in flake.nix). On Linux we drive nix via home-manager:
-  #   - user-level ~/.config/nix/nix.conf for substituters (binary caches)
+  # mkDarwin in flake.nix). On Linux:
+  #   - System-level /etc/nix/nix.conf (substituters, public keys, experimental
+  #     features, keep-outputs) is written by installSystemPackagesLinux below.
+  #     System-level matches nix-darwin's `nix.settings` placement on Mac and
+  #     avoids polluting ~/.config/nix/ (which is symlinked into the dotfiles
+  #     repo on the devbox, so an xdg.configFile entry would materialize a
+  #     stray symlink inside the working tree).
+  #   - User must be in `trusted-users` in /etc/nix/nix.conf for client-set
+  #     options to apply. user_data.sh Phase 12.5 handles that at instance
+  #     boot; not the user's responsibility post-bootstrap.
   #   - systemd user timer for `nix-collect-garbage` (parity with the launchd
-  #     job nix-darwin installs from `nix.gc.automatic = true`)
-  # Note: for substituters to actually be honored, the user must be in
-  # `trusted-users` in /etc/nix/nix.conf (system-level). On the devbox this is
-  # handled by user_data.sh during instance bootstrap.
+  #     job nix-darwin installs from `nix.gc.automatic = true`).
   # ----------------------------------------------------------------------------
-  xdg.configFile = lib.mkIf pkgs.stdenv.isLinux {
-    "nix/nix.conf".text = ''
-      experimental-features = nix-command flakes
-      keep-outputs = true
-      keep-derivations = true
-      substituters = https://cache.nixos.org https://nix-community.cachix.org https://devenv.cachix.org
-      trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs= devenv.cachix.org-1:w1cLUi8dv3hnoSPGAuibQv+f9TZLr6cv/Hm9XgU50cw=
-    '';
-  };
 
   systemd.user.services = lib.mkIf pkgs.stdenv.isLinux {
     nix-gc = {
@@ -233,6 +229,41 @@ in {
           echo "[postActivation] Adding $USER to docker group (requires re-login to take effect)…"
           sudo -n usermod -aG docker "$USER" || true
         fi
+      fi
+
+      # /etc/nix/nix.conf: substituters + trusted-public-keys + experimental
+      # features + keep-{outputs,derivations}. Lives at SYSTEM level (matches
+      # nix-darwin's `nix.settings`) so the daemon honors them directly
+      # instead of needing `trusted-users` to forward user-level overrides.
+      # Wrapped in a marker block — re-runs of this activation step replace
+      # the block atomically rather than appending duplicates.
+      NIXCONF=/etc/nix/nix.conf
+      MARKER_START='# >>> managed by home-manager installSystemPackagesLinux >>>'
+      MARKER_END='# <<< managed by home-manager installSystemPackagesLinux <<<'
+      if [ -f "$NIXCONF" ]; then
+        # Strip any existing managed block.
+        sudo -n sed -i.bak "/$MARKER_START/,/$MARKER_END/d" "$NIXCONF" 2>/dev/null || true
+        sudo -n rm -f "$NIXCONF.bak"
+      else
+        sudo -n mkdir -p /etc/nix
+        sudo -n touch "$NIXCONF"
+      fi
+      # Append fresh block. `tee -a` works under sudo without needing a
+      # subshell redirect.
+      sudo -n tee -a "$NIXCONF" >/dev/null <<EOF
+$MARKER_START
+experimental-features = nix-command flakes
+keep-outputs = true
+keep-derivations = true
+extra-substituters = https://nix-community.cachix.org https://devenv.cachix.org
+extra-trusted-public-keys = nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs= devenv.cachix.org-1:w1cLUi8dv3hnoSPGAuibQv+f9TZLr6cv/Hm9XgU50cw=
+$MARKER_END
+EOF
+      # Reload the daemon so the new config takes effect for subsequent
+      # nix invocations. is-active check avoids a spurious "Unit not found"
+      # error during very first activation before nix-daemon is installed.
+      if sudo -n systemctl is-active --quiet nix-daemon.service 2>/dev/null; then
+        sudo -n systemctl restart nix-daemon.service || true
       fi
     '';
   };

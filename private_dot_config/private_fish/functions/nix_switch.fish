@@ -36,18 +36,24 @@ function nix_switch --description "Build and activate the system configuration (
         #  3. Exec the HM-generation `activate` referenced inside.
         #  4. Fail loudly if any of the above misses; do NOT silently skip.
         set -l latest_system (ls -1dt /nix/var/nix/profiles/system-*-link 2>/dev/null | head -1)
+        echo "  latest_system = $latest_system"
         if test -z "$latest_system"; or not test -f "$latest_system/activate"
             echo "WARN: could not locate latest system generation under /nix/var/nix/profiles/" >&2
             echo "      HM activation skipped. ~/.local/bin symlinks may be stale." >&2
             return 1
         end
-        set -l act_user (sudo grep -hoE "/nix/store/[a-z0-9]+-activation-$USER" $latest_system/activate | head -1)
+        # No sudo needed — system/*-link/activate is world-readable. Sudo
+        # caused intermittent silent empties on past runs (TTY-less prompt
+        # eaten by background invocations).
+        set -l act_user (grep -hoE "/nix/store/[a-z0-9]+-activation-$USER" $latest_system/activate | head -1)
+        echo "  activation-$USER = $act_user"
         if test -z "$act_user"; or not test -f "$act_user"
             echo "WARN: could not locate activation-$USER path in $latest_system/activate" >&2
             echo "      HM activation skipped. ~/.local/bin symlinks may be stale." >&2
             return 1
         end
-        set -l hm_gen (sudo grep -hoE '/nix/store/[a-z0-9]+-home-manager-generation' $act_user | head -1)
+        set -l hm_gen (grep -hoE '/nix/store/[a-z0-9]+-home-manager-generation' $act_user | head -1)
+        echo "  home-manager-generation = $hm_gen"
         if test -z "$hm_gen"; or not test -x "$hm_gen/activate"
             echo "WARN: could not locate home-manager-generation under $act_user" >&2
             echo "      HM activation skipped. ~/.local/bin symlinks may be stale." >&2

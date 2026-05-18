@@ -130,7 +130,11 @@ mcp_default_scope = ""
   window_style_override = ""
   clear_on_restart = false
   detach_key = ""
-  socket_name = ""
+  # Isolate agent-deck's tmux server on its own socket. Keeps
+  # `tmux ls` (your regular sessions) and `tmux -L agent-deck ls`
+  # (agent-deck's sessions) cleanly separated; a stray
+  # `tmux kill-server` in your shell can't take agents down.
+  socket_name = "agent-deck"
 
 [docker]
   default_image = ""

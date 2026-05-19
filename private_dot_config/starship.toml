@@ -1,12 +1,20 @@
 # Multi-line prompt: fish truncates lines wider than the terminal, so we
 # split into groups to keep each line short enough for narrow panes.
-format = """$directory$git_branch$git_commit$git_state$git_status\
+format = """$hostname$directory$git_branch$git_commit$git_state$git_status\
 $line_break\
 $nix_shell$python$nodejs$rust$env_var\
 $line_break\
 $kubernetes$aws$gcloud$docker_context\
 $line_break\
 $cmd_duration$character"""
+
+[hostname]
+# Only show when SSH'd in (default). Differentiates local laptop ghostty
+# windows (no hostname) from SSH'd ones (e.g. devbox). If you ever want
+# the hostname on local sessions too, set `ssh_only = false`.
+ssh_only = true
+format = '[$hostname]($style):'
+style = "bold blue"
 
 [aws]
 disabled = false

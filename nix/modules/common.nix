@@ -72,10 +72,23 @@ in {
 
     # docker-compose v2 (Go-based plugin) — Orbstack ships this on Mac at
     # ~/.docker/cli-plugins/docker-compose, so `docker compose` works there.
-    # On Linux we install via nix + symlink into the same CLI-plugins dir
-    # in the activation block below, so the same `docker compose` UX works.
+    # On Linux we install via nix + wire the plugin in via home.file below.
     docker-compose
   ]);
+
+  # docker-compose v2 plugin wiring (Linux only). Docker CLI v2 looks for
+  # plugins at ~/.docker/cli-plugins/<name>, where `<name>` becomes the
+  # `docker <name>` subcommand. nixpkgs' docker-compose IS the v2 plugin
+  # at ${pkgs.docker-compose}/libexec/docker/cli-plugins/docker-compose;
+  # we declare a home.file symlink straight at the store path, which is
+  # idempotent and PATH-independent. (The previous imperative activation
+  # block ran `command -v docker-compose` but PATH may not include
+  # ~/.nix-profile/bin during activation, so the symlink silently
+  # wasn't created.)
+  home.file = lib.mkIf pkgs.stdenv.isLinux {
+    ".docker/cli-plugins/docker-compose".source =
+      "${pkgs.docker-compose}/libexec/docker/cli-plugins/docker-compose";
+  };
 
   home.sessionPath = [ "$HOME/.local/bin" "$HOME/.npm-global/bin" "$HOME/.opencode/bin" ];
 
@@ -150,20 +163,6 @@ in {
         echo "[postActivation] Installing agent-deck (upstream install.sh)…"
         curl -fsSL https://raw.githubusercontent.com/asheshgoplani/agent-deck/main/install.sh | bash \
           || echo "[postActivation] WARN: agent-deck install failed (non-fatal)"
-      fi
-
-      # docker-compose v2 plugin wiring — nix installs the binary at
-      # ~/.nix-profile/bin/docker-compose. Docker CLI v2 also looks for
-      # plugins at ~/.docker/cli-plugins/<name>, where `<name>` becomes
-      # the `docker <name>` subcommand. Mirror Orbstack's macOS layout by
-      # symlinking the nix binary there so `docker compose ...` works,
-      # not just the standalone `docker-compose ...`.
-      mkdir -p "$HOME/.docker/cli-plugins"
-      if [ ! -L "$HOME/.docker/cli-plugins/docker-compose" ] \
-         || [ ! -x "$HOME/.docker/cli-plugins/docker-compose" ]; then
-        if command -v docker-compose >/dev/null 2>&1; then
-          ln -sf "$(command -v docker-compose)" "$HOME/.docker/cli-plugins/docker-compose"
-        fi
       fi
 
       # pup (Datadog) — installed from GitHub releases. README lists brew,

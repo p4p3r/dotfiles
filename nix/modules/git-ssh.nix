@@ -86,8 +86,10 @@
     enable = true;
     enableDefaultConfig = false;
 
-    # OrbStack SSH integration — MUST be first (before any Host blocks)
-    includes = lib.optionals pkgs.stdenv.isDarwin [ "~/.orbstack/ssh/config" ];
+    # OrbStack + sbx drop-in configs — Include order matters (first match wins)
+    includes =
+      (lib.optionals pkgs.stdenv.isDarwin [ "~/.orbstack/ssh/config" ])
+      ++ [ "~/.ssh/config.d/*" ];
 
     matchBlocks = {
       # Home Assistant host

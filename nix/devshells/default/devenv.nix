@@ -28,7 +28,6 @@
       rustup
     ])
     ++ (with pkgs-unstable; [
-      # Tools we want close to upstream HEAD live here. Empty by default; add
-      # entries (e.g. `claude-code`, `bun`, etc.) as needed.
+      uv
     ]);
 }

@@ -142,7 +142,7 @@ in {
   home.activation = lib.mkIf pkgs.stdenv.isLinux {
     installUpstreamClis = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
       # opencode's installer extracts a tarball, so tar/gzip must be on PATH.
-      export PATH=${pkgs.nodejs_22}/bin:${pkgs.curl}/bin:${pkgs.bash}/bin:${pkgs.gnutar}/bin:${pkgs.gzip}/bin:$PATH
+      export PATH=${pkgs.nodejs_22}/bin:${pkgs.curl}/bin:${pkgs.bash}/bin:${pkgs.gnutar}/bin:${pkgs.gzip}/bin:${pkgs.tmux}/bin:${pkgs.gawk}/bin:$PATH
       export NPM_CONFIG_PREFIX="$HOME/.npm-global"
       mkdir -p "$NPM_CONFIG_PREFIX" "$HOME/.local/bin"
 
@@ -165,12 +165,9 @@ in {
       # Homebrew cask we use on macOS. Use the upstream install script.
       # --non-interactive: avoid /dev/tty prompts (no TTY over SSH provisioning).
       # --skip-tmux-config: tmux.conf is managed by HM, don't touch it.
-      # PATH: tmux is provided by HM (${pkgs.tmux}) but the activation PATH
-      # is scrubbed; make it visible so the installer's `command -v tmux` succeeds.
       if [ ! -x "$HOME/.local/bin/agent-deck" ]; then
         echo "[postActivation] Installing agent-deck (upstream install.sh)…"
-        PATH=${pkgs.tmux}/bin:$PATH \
-          curl -fsSL https://raw.githubusercontent.com/asheshgoplani/agent-deck/main/install.sh \
+        curl -fsSL https://raw.githubusercontent.com/asheshgoplani/agent-deck/main/install.sh \
           | bash -s -- --non-interactive --skip-tmux-config \
           || echo "[postActivation] WARN: agent-deck install failed (non-fatal)"
       fi

@@ -57,7 +57,6 @@ in {
     # Tools we want bleeding-edge — sourced from nixos-unstable rather than the
     # 25.11 stable channel.
     graphite-cli
-    REDACTED
     terraform-docs
     clang-tools
   ] ++ lib.optionals pkgs.stdenv.isLinux [
@@ -91,6 +90,11 @@ in {
   };
 
   home.sessionPath = [ "$HOME/.local/bin" "$HOME/.npm-global/bin" "$HOME/.opencode/bin" ];
+
+  # npm's default global prefix is the read-only nix store, so interactive
+  # `npm install -g` fails. Point it at the user-owned prefix the activation
+  # scripts already use, so manual updates (e.g. codex) work outside a rebuild.
+  home.sessionVariables.NPM_CONFIG_PREFIX = "$HOME/.npm-global";
 
   # ----------------------------------------------------------------------------
   # Linux nix config + auto-gc.
@@ -159,9 +163,15 @@ in {
 
       # agent-deck — Linux equivalent of the asheshgoplani/tap/agent-deck
       # Homebrew cask we use on macOS. Use the upstream install script.
+      # --non-interactive: avoid /dev/tty prompts (no TTY over SSH provisioning).
+      # --skip-tmux-config: tmux.conf is managed by HM, don't touch it.
+      # PATH: tmux is provided by HM (${pkgs.tmux}) but the activation PATH
+      # is scrubbed; make it visible so the installer's `command -v tmux` succeeds.
       if [ ! -x "$HOME/.local/bin/agent-deck" ]; then
         echo "[postActivation] Installing agent-deck (upstream install.sh)…"
-        curl -fsSL https://raw.githubusercontent.com/asheshgoplani/agent-deck/main/install.sh | bash \
+        PATH=${pkgs.tmux}/bin:$PATH \
+          curl -fsSL https://raw.githubusercontent.com/asheshgoplani/agent-deck/main/install.sh \
+          | bash -s -- --non-interactive --skip-tmux-config \
           || echo "[postActivation] WARN: agent-deck install failed (non-fatal)"
       fi
 

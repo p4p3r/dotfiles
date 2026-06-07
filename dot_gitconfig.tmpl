@@ -162,10 +162,16 @@
 
 [includeIf "gitdir:~/Code/REDACTED/"]
 	path = ~/Code/REDACTED/.gitconfig
+{{ if eq .chezmoi.os "darwin" -}}
 [credential]
-	helper = 
+	helper =
 	helper = /usr/local/share/gcm-core/git-credential-manager
 [credential "https://dev.azure.com"]
 	useHttpPath = true
 [credential "https://github.com"]
 	username = p4p3r
+{{ else if eq .chezmoi.os "linux" -}}
+[credential "https://github.com"]
+	helper = !/usr/bin/env gh auth git-credential
+	username = p4p3r
+{{ end -}}

@@ -37,7 +37,9 @@
       "WebFetch(domain:docs.anthropic.com)",
       "WebFetch(domain:stackoverflow.com)",
       "WebFetch(domain:npmjs.com)",
-      "WebFetch(domain:pypi.com)"
+      "WebFetch(domain:pypi.com)",
+      "Bash(python3 -c \"import toml\")",
+      "Bash(python3 -c \"import aiogram\")"
     ],
     "deny": []
   }

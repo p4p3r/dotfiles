@@ -84,11 +84,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1778700693,
-        "narHash": "sha256-if1qVJ1K7eXeeF26rTzYgCAJLG66swrzSYdX5PBZb1Y=",
+        "lastModified": 1781175783,
+        "narHash": "sha256-3kqal7V7cGjR91VzY0vSRD+SGwyO71QBStmtZmnl+CU=",
         "ref": "refs/heads/main",
-        "rev": "77ea73cb54b6181741b0ed6e168022e648e7eca2",
-        "revCount": 47,
+        "rev": "0d257683c23cd22429ebdc556399050b9e50546f",
+        "revCount": 80,
         "type": "git",
         "url": "ssh://git@github.com/p4p3r/dotfiles-private.git"
       },
@@ -129,6 +129,22 @@
         "type": "github"
       }
     },
+    "nixpkgs-unstable": {
+      "locked": {
+        "lastModified": 1780749050,
+        "narHash": "sha256-3av0pIjlOWQ6rDbNOmpUSvbNnJkGORQKKjb4LtCZsIY=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "a799d3e3886da994fa307f817a6bc705ae538eeb",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "darwin": "darwin",
@@ -136,7 +152,8 @@
         "nix-homebrew": "nix-homebrew",
         "nix-private": "nix-private",
         "nixpkgs": "nixpkgs",
-        "nixpkgs-darwin": "nixpkgs-darwin"
+        "nixpkgs-darwin": "nixpkgs-darwin",
+        "nixpkgs-unstable": "nixpkgs-unstable"
       }
     }
   },

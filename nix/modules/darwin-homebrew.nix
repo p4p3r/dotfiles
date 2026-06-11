@@ -42,7 +42,7 @@
       "softnet"
       "asheshgoplani/tap/agent-deck"
       # Cross-platform tools (make, node, ripgrep, tmux) now via nix in
-      # nix/modules/common.nix. graphite/REDACTED/terraform-docs/clang-format
+      # nix/modules/common.nix. graphite/terraform-docs/clang-format
       # via pkgs-unstable in same file. pup installed from GitHub releases
       # in flake.nix postActivation (Mac) + common.nix activation (Linux).
     ];

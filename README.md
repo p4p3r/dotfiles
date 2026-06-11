@@ -47,8 +47,8 @@ chsh -s /run/current-system/sw/bin/fish
 │       ├── shell/fish-private.nix
 │       └── overlays/
 │           ├── p4p3r.nix         # Personal repos
-│           └── REDACTED.nix       # Work overlay (files, repos, git identity)
-└── overlay/REDACTED/              # Files deployed to $HOME via home.file
+│           └── <profile>.nix      # Work overlay (files, repos, git identity)
+└── overlay/<profile>/            # Files deployed to $HOME via home.file
 ```
 
 ## Daily Workflow

@@ -160,8 +160,6 @@
 [safe]
 	directory = *
 
-[includeIf "gitdir:~/Code/REDACTED/"]
-	path = ~/Code/REDACTED/.gitconfig
 {{ if eq .chezmoi.os "darwin" -}}
 [credential]
 	helper =

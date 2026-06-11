@@ -15,9 +15,26 @@
 input="$1"
 worktree="$2"
 
+# Base directories to scan for the project name. Kept configurable so machine-
+# or work-specific roots can be added without baking them into this public
+# script. Resolution order:
+#   - AGENT_DECK_BASE_DIRS env var (whitespace-separated) overrides everything
+#   - ~/.config/agent-deck/base-dirs file (whitespace-separated; may be
+#     deployed by a private overlay)
+#   - personal default
+cfg="$HOME/.config/agent-deck/base-dirs"
+if [ -n "$AGENT_DECK_BASE_DIRS" ]; then
+  base_dirs="$AGENT_DECK_BASE_DIRS"
+elif [ -f "$cfg" ]; then
+  base_dirs="$(cat "$cfg")"
+else
+  base_dirs="$HOME/Code/p4p3r $HOME/Code/other"
+fi
+
 # Resolve project directory
 resolved=""
-for base in ~/Code/REDACTED ~/Code/p4p3r ~/Code/other; do
+for base in $base_dirs; do
+  base="${base/#\~/$HOME}"
   match="$base/$input"
   if [ -d "$match" ]; then
     resolved="$match"

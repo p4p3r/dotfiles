@@ -1,1 +1,8 @@
 /nix/result
+
+# Never commit secret env files (org policy). Keeps .env-test / .envrc trackable.
+.env
+**/.env
+
+# agent-deck conductor config (telegram user_id) — machine-local, never publish
+dot_agent-deck/

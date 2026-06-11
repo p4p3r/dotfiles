@@ -27,3 +27,16 @@ devenv.lock
 .config/direnv/lib/hm-nix-direnv.sh
 .config/fish/conf.d/00-direnv.fish
 .config/fish/conf.d/01-session-path.fish
+
+# Secret env files holding bot tokens — never track (org policy: never commit .env).
+# The agent-deck conductor bridge sources TELEGRAM_BOT_TOKEN from such a .env.
+.env
+**/.env
+.agent-deck/**/.env
+.local/share/agent-deck/**/.env
+
+# agent-deck config carries the conductor Telegram user_id (a private chat id) +
+# machine-local conductor state. Keep it OUT of this public repo and let chezmoi
+# leave the live ~/.agent-deck/config.toml alone. (user_id to be re-injected at
+# provision time from secrets, separately.)
+.agent-deck/config.toml

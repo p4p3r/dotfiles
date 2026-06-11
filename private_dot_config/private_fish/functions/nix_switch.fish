@@ -8,8 +8,29 @@ function nix_switch --description "Build and activate the system configuration (
 
     if test (uname) = Darwin
         echo "Switching to $flake (darwin) ..."
-        sudo env USER=$USER darwin-rebuild switch --flake $flake $override --impure $argv
-        or return $status
+        set -l rebuild_log (mktemp)
+        sudo env USER=$USER darwin-rebuild switch --flake $flake $override --impure $argv 2>&1 | tee $rebuild_log
+        set -l rebuild_status $pipestatus[1]
+
+        # Finish HM activation even when Homebrew/mas exits nonzero for a benign
+        # already-installed App Store app. Surface real rebuild failures later.
+        if test $rebuild_status -ne 0
+            set -l sudo_errors (grep -iE 'sudo: .*password|sudo: a terminal is required|sudo: .*authentication' $rebuild_log)
+            set -l mas_errors (grep -iE 'mas installation failed|Unable to install .* app\.' $rebuild_log)
+            set -l real_errors (grep -iE 'error' $rebuild_log | grep -viE 'mas installation failed|Unable to install .* app\.')
+            if test (count $sudo_errors) -gt 0
+                echo "ERROR: darwin-rebuild could not run because sudo authentication failed. Not running HM activation from a stale system generation." >&2
+                rm -f $rebuild_log
+                return $rebuild_status
+            else if test (count $mas_errors) -gt 0; and test (count $real_errors) -eq 0
+                echo "WARN: darwin-rebuild exited $rebuild_status but only reported a benign mas install failure; treating as success." >&2
+                set rebuild_status 0
+            else
+                echo "WARN: darwin-rebuild switch exited $rebuild_status with real errors. Continuing to HM activation; will report at end." >&2
+                printf '  %s\n' $real_errors >&2
+            end
+        end
+        rm -f $rebuild_log
 
         # Capture the home-manager profile generation count BEFORE re-running
         # HM activate. We verify AFTER that the count grew — that proves the
@@ -74,6 +95,11 @@ function nix_switch --description "Build and activate the system configuration (
         if test "$hm_after" -le "$hm_before"
             echo "NOTE: home-manager profile generation count did not increase ($hm_before → $hm_after)." >&2
             echo "      Either there was nothing to change for the user, or activation no-op'd." >&2
+        end
+
+        if test $rebuild_status -ne 0
+            echo "darwin-rebuild switch had exited $rebuild_status (see WARN above). HM activation completed regardless." >&2
+            return $rebuild_status
         end
     else
         # Linux (e.g. the remote devbox). No nix-darwin — just home-manager.

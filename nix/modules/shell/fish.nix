@@ -19,6 +19,13 @@
     fish_add_path -gp ${lib.concatStringsSep " " config.home.sessionPath}
   '';
 
+  # Same story for home.sessionVariables: HM only writes them into
+  # hm-session-vars.sh (bash/zsh), so fish never sees them. Shim
+  # NPM_CONFIG_PREFIX so interactive `npm install -g` targets ~/.npm-global.
+  home.file.".config/fish/conf.d/02-session-vars.fish".text = ''
+    set -gx NPM_CONFIG_PREFIX "$HOME/.npm-global"
+  '';
+
   # Note: All other Fish configuration (config.fish, functions, other conf.d files)
   # remains in chezmoi at ~/.config/fish/
   # This allows applications to auto-configure Fish while keeping direnv working

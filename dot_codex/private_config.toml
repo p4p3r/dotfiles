@@ -1,6 +1,14 @@
-model = "gpt-5.1-codex"
+model = "gpt-5.5"
+model_reasoning_effort = "xhigh"
 [projects."/Users/paper"]
+trust_level = "trusted"
+
+[projects."/home/paper"]
 trust_level = "trusted"
 
 [notice]
 hide_gpt5_1_migration_prompt = true
+notify = ["/bin/sh", "/home/paper/.codex/sbx-notify.sh"]
+
+[tui.model_availability_nux]
+"gpt-5.5" = 1

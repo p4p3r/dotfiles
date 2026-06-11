@@ -173,3 +173,10 @@
 	helper = !/usr/bin/env gh auth git-credential
 	username = p4p3r
 {{ end -}}
+
+# Machine-local / work overrides. Provided by the private home-manager overlay
+# (e.g. routing ~/Code/<work>/* repos to a work git identity) when that profile
+# is active; git silently ignores this include if the file does not exist.
+# Single-owner: chezmoi owns this base file, home-manager owns ~/.gitconfig.local.
+[include]
+	path = ~/.gitconfig.local

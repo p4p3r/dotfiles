@@ -41,10 +41,15 @@
       "cirruslabs/cli/tart"
       "softnet"
       "asheshgoplani/tap/agent-deck"
+      "mutagen-io/mutagen/mutagen"
+      # pipx: provisions PyPI CLI tools into ~/.local/bin. Sourced from brew
+      # (not nix) on purpose: brew's Python is stable across nix rebuilds, so
+      # pipx venvs don't get orphaned when a nix-store Python path changes.
+      "pipx"
       # Cross-platform tools (make, node, ripgrep, tmux) now via nix in
-      # nix/modules/common.nix. graphite/terraform-docs/clang-format
-      # via pkgs-unstable in same file. pup installed from GitHub releases
-      # in flake.nix postActivation (Mac) + common.nix activation (Linux).
+      # nix/modules/common.nix. graphite/terraform-docs/clang-format via
+      # pkgs-unstable in same file. pup installed from GitHub releases in
+      # flake.nix postActivation (Mac) + common.nix activation (Linux).
     ];
 
     casks = [

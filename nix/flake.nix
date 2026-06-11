@@ -190,7 +190,7 @@
       };
 
     # Linux profile list: from PROFILES env var when set
-    # (e.g. `PROFILES=REDACTED home-manager switch --flake .#paper@linux --impure`).
+    # (e.g. `PROFILES=work home-manager switch --flake .#paper@linux --impure`).
     # Falls back to ["p4p3r"] for parity with mkHome's default.
     linuxProfiles = let
       env = builtins.getEnv "PROFILES";
@@ -202,7 +202,10 @@
   in {
     darwinConfigurations."${hostName}" = mkDarwin {
       user = username;
-      profiles = [ "p4p3r" "REDACTED" ];
+      # Personal profile plus any extra profiles contributed by the private
+      # input (kept out of this public flake). `or [ ]` keeps eval working
+      # before the private input's lock is updated to expose extraProfiles.
+      profiles = [ "p4p3r" ] ++ (inputs.nix-private.extraProfiles or [ ]);
     };
 
     # Linux home-manager configs for both x86_64 and aarch64.

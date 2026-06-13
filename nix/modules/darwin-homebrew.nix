@@ -109,6 +109,7 @@
       "Fantastical" = 975937182;
       "1Blocker" = 1365531024;
       "Save to Raindrop.io" = 1549370672;
+      "Wireguard" = 1451685025;
     };
 
     onActivation = {

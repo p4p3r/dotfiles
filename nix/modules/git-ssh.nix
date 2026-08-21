@@ -92,6 +92,22 @@
       ++ [ "~/.ssh/config.d/*" ];
 
     matchBlocks = {
+      # Sandbox EC2 boxes (172.16.1.x), reached over the Tailscale subnet route.
+      # agent-deck connects to these BY IP with its own mux socket
+      # (/tmp/agent-deck-ssh/%r@%h:%p). When the Tailscale route flaps, a mux
+      # master's TCP dies but the master process lingers as a zombie — every new
+      # session-attach then can't reuse it, prints "disabling multiplexing", and
+      # pays a full cold handshake (~4s vs ~0.6s warm). Tight keepalive makes a
+      # dead master self-exit in ~45s (vs 180s under the "*" defaults) so the
+      # socket frees and the next connect rebuilds a healthy, reusable master;
+      # ConnectTimeout fails a genuinely-unreachable box fast instead of hanging.
+      # Ordered before "*" so these win the first-match on serverAlive*.
+      "172.16.1.*" = lib.hm.dag.entryBefore [ "*" ] {
+        serverAliveInterval = 15;
+        serverAliveCountMax = 3;
+        extraOptions.ConnectTimeout = "5";
+      };
+
       # Home Assistant host
       "antioche-ha.local" = {
         hostname = "antioche-ha.local";

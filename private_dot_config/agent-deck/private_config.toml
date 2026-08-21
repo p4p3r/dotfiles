@@ -1,0 +1,15 @@
+# Agent Deck Configuration
+# All options: https://github.com/asheshgoplani/agent-deck/blob/main/skills/agent-deck/references/config-reference.md
+#
+# Shared across machines via chezmoi. This repo is PUBLIC, so this file is
+# deliberately SECRET-FREE: the Telegram credentials are env-var references,
+# resolved by bridge.py's _resolve_secret() (supports "$VAR" / "${VAR}" and
+# "keychain:service-name"). The values themselves come from the private secret
+# store and are exported into the environment on every box.
+# Do not paste literal tokens back into this file.
+
+[conductor]
+  heartbeat_interval = 15
+  [conductor.telegram]
+    token = "${TELEGRAM_BOT_TOKEN}"
+    user_id = "${TELEGRAM_USER_ID}"

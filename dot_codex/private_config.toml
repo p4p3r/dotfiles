@@ -1,5 +1,8 @@
-model = "gpt-5.5"
-model_reasoning_effort = "xhigh"
+model = "gpt-5.6-sol"
+model_reasoning_effort = "medium"
+# agent-deck notify hook. MUST be a top-level key: a `notify` nested under a
+# table (it was previously under [notice]) is silently ignored by Codex.
+notify = ["agent-deck", "codex-notify"]
 [projects."/Users/paper"]
 trust_level = "trusted"
 
@@ -8,7 +11,6 @@ trust_level = "trusted"
 
 [notice]
 hide_gpt5_1_migration_prompt = true
-notify = ["/bin/sh", "/home/paper/.codex/sbx-notify.sh"]
 
 [tui.model_availability_nux]
 "gpt-5.5" = 1

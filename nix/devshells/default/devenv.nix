@@ -33,6 +33,14 @@ in
       cmake
       pkg-config
 
+      # Genealogy/document research
+      ghostscript
+      poppler-utils
+      imagemagick
+      exiftool
+      tesseract
+      sqlite
+
       # Node.js
       nodejs_22
       corepack
@@ -45,11 +53,14 @@ in
       # site-packages (and pip) are wired in. agent-deck's conductor bridge
       # imports toml plus the configured remote-channel SDKs, and its setup
       # shells out to `python3 -m pip install`, so these must live inside the
-      # interpreter.
+      # interpreter. openpyxl/pillow/pyyaml are the genealogy research tools.
       (python312.withPackages (ps: [
         ps.pip
         ps.virtualenv
         ps.toml
+        ps.openpyxl
+        ps.pillow
+        ps.pyyaml
       ] ++ pkgs.lib.optionals slackCutover [
         ps.slack-bolt
         ps.slack-sdk

@@ -99,5 +99,7 @@
   "remoteControlAtStartup": true,
   "skipDangerousModePermissionPrompt": true,
   "theme": "dark",
-  "tui": "fullscreen"
+  "env": {
+    "ANTHROPIC_API_KEY": ""
+  }
 }

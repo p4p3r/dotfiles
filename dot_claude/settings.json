@@ -3,6 +3,9 @@
   "enabledPlugins": {
     "agent-deck@agent-deck": true
   },
+  "env": {
+    "ANTHROPIC_API_KEY": ""
+  },
   "extraKnownMarketplaces": {
     "agent-deck": {
       "source": {
@@ -99,7 +102,5 @@
   "remoteControlAtStartup": true,
   "skipDangerousModePermissionPrompt": true,
   "theme": "dark",
-  "env": {
-    "ANTHROPIC_API_KEY": ""
-  }
+  "tui": "fullscreen"
 }

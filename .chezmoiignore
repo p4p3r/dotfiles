@@ -34,9 +34,19 @@ devenv.lock
 .agent-deck/**/.env
 .local/share/agent-deck/**/.env
 
-# agent-deck config carries machine-local conductor state. Keep it out of this
-# public repo and let chezmoi leave the live ~/.agent-deck/config.toml alone.
+# agent-deck config carries machine-local state. Keep it out of this public
+# repo and let chezmoi leave the live ~/.agent-deck/config.toml alone.
 .agent-deck/config.toml
+
+# The agent-deck orchestrator tree is NOT public. Its instruction tier now lives
+# in the private overlay repo and is seeded from there copy-once, so chezmoi must
+# not manage it here. Ignoring only makes the target unmanaged -- chezmoi never
+# deletes an ignored path, and the live tree is left exactly as it is.
+# Do not re-add it with `chezmoi add`.
+.local/share/agent-deck/conductor
+.local/share/agent-deck/conductor/**
+.agent-deck/conductor
+.agent-deck/conductor/**
 
 # Machine-local Codex directory trust, spliced into ~/.codex/config.toml by
 # dot_codex/private_config.toml.tmpl. Never track it: it holds real checkout paths.

@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "printf \"\\a\" \u003e /dev/tty 2\u003e/dev/null || printf \"\\a\""
+            "command": "printf \"\\a\" > /dev/tty 2>/dev/null || printf \"\\a\""
           }
         ]
       },
@@ -98,5 +98,6 @@
   },
   "remoteControlAtStartup": true,
   "skipDangerousModePermissionPrompt": true,
-  "theme": "dark"
+  "theme": "dark",
+  "tui": "fullscreen"
 }

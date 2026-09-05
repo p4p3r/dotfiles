@@ -37,3 +37,7 @@ devenv.lock
 # agent-deck config carries machine-local conductor state. Keep it out of this
 # public repo and let chezmoi leave the live ~/.agent-deck/config.toml alone.
 .agent-deck/config.toml
+
+# Machine-local Codex directory trust, spliced into ~/.codex/config.toml by
+# dot_codex/private_config.toml.tmpl. Never track it: it holds real checkout paths.
+.codex/trust.local.toml

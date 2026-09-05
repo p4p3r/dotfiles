@@ -7,9 +7,226 @@
 # "keychain:service-name"). The values themselves come from the private secret
 # store and are exported into the environment on every box.
 # Do not paste literal tokens back into this file.
+#
+# NOTE (2026-09-05): this file is resolved XDG-FIRST -- its mere existence takes
+# precedence over the legacy ~/.agent-deck/config.toml, which is then ignored
+# entirely. So it must be COMPLETE, not a fragment. In particular
+# `[conductor] enabled = true` is load-bearing: bridge.py defaults it to False
+# and calls sys.exit(1), and the unit is Restart=always -> silent crash-loop.
+# Reconciled against the live legacy config it supersedes.
+
+default_tool = "claude"
+theme = "dark"
+mcp_default_scope = ""
+
+[tools]
+
+[mcps]
+
+[plugins]
+
+[claude]
+  command = ""
+  config_dir = ""
+  dangerous_mode = false
+  allow_dangerous_mode = false
+  auto_mode = true
+  default_model = ""
+  use_chrome = false
+  use_teammate_mode = false
+  env_file = ""
+  vim_mode = false
+
+[gemini]
+  yolo_mode = false
+  default_model = ""
+  env_file = ""
+  command = ""
+
+[opencode]
+  default_model = ""
+  default_agent = ""
+  env_file = ""
+  command = ""
+
+[codex]
+  command = ""
+  config_dir = ""
+  yolo_mode = false
+  env_file = ""
+
+[copilot]
+  env_file = ""
+  command = ""
+  default_model = ""
+  allow_all = false
+
+[crush]
+  command = ""
+  env_file = ""
+  yolo_mode = false
+
+[hermes]
+  command = ""
+  env_file = ""
+  yolo_mode = false
+  gateway_url = ""
+  dashboard_url = ""
+  api_token_env = ""
+  workspace_dir = ""
+
+[worktree]
+  auto_cleanup = true
+  default_enabled = true
+  default_location = "subdirectory"
+
+[global_search]
+  enabled = true
+  tier = "auto"
+  memory_limit_mb = 0
+  recent_days = 90
+  index_rate_limit = 0
+
+[logs]
+  max_size_mb = 10
+  max_lines = 10000
+  remove_orphans = true
+  debug_level = ""
+  debug_format = ""
+  debug_max_mb = 0
+  debug_backups = 0
+  debug_retention_days = 0
+  debug_compress = false
+  ring_buffer_mb = 0
+  pprof_enabled = false
+  aggregate_interval_secs = 0
+
+[mcp_pool]
+  enabled = false
+  auto_start = false
+  port_start = 0
+  port_end = 0
+  start_on_demand = false
+  shutdown_on_exit = false
+  fallback_to_stdio = true
+  show_pool_status = false
+  pool_all = false
+  socket_wait_timeout = 0
+
+[updates]
+  auto_update = true
+  check_enabled = true
+  check_interval_hours = 0
+  notify_in_cli = false
+
+[preview]
+  show_output = true
+  show_analytics = false
+  show_notes = false
+  notes_output_split = 0.33
+  [preview.analytics]
+
+[experiments]
+  directory = ""
+  date_prefix = false
+  default_tool = ""
+
+[notifications]
+  enabled = false
+  max_shown = 0
+  show_all = false
+  minimal = false
+
+[instances]
+
+[shell]
+  init_script = ""
+
+[maintenance]
+  enabled = false
+
+[status]
 
 [conductor]
+  enabled = true
   heartbeat_interval = 15
   [conductor.telegram]
     token = "${TELEGRAM_BOT_TOKEN}"
     user_id = "${TELEGRAM_USER_ID}"
+  [conductor.slack]
+    bot_token = ""
+    app_token = ""
+    channel_id = ""
+    listen_mode = ""
+  [conductor.discord]
+    bot_token = ""
+    guild_id = 0
+    channel_id = 0
+    user_id = 0
+    listen_mode = ""
+    ignore_replies_to_others = false
+
+[tmux]
+  window_style_override = ""
+  clear_on_restart = false
+  detach_key = ""
+  socket_name = "agent-deck"
+
+[docker]
+  default_image = ""
+  default_enabled = false
+  cpu_limit = ""
+  memory_limit = ""
+  mount_ssh = false
+
+[openclaw]
+  gateway_url = ""
+  password = ""
+  auto_sync = false
+  group_name = ""
+
+[display]
+  full_repaint = false
+  default_filter = ""
+  active_filter_label = ""
+  show_session_timestamps = false
+
+[costs]
+  currency = ""
+  timezone = ""
+  retention_days = 0
+  [costs.budgets]
+    daily_limit = 0.0
+    weekly_limit = 0.0
+    monthly_limit = 0.0
+  [costs.pricing]
+
+[system_stats]
+  enabled = true
+  refresh_seconds = 5
+  format = "compact"
+  show = ["cpu", "ram", "disk", "network"]
+
+[watcher]
+  max_events_per_watcher = 0
+  max_silence_minutes = 0
+  health_check_interval_seconds = 0
+  [watcher.alerts]
+    enabled = false
+    debounce_minutes = 0
+
+[feedback]
+  disabled = true
+
+[terminal]
+
+[web]
+
+[ui]
+  preview_pct = 0
+  iterm_open_as = ""
+  remote_latency_refresh_secs = 0
+  remote_session_refresh_secs = 0
+  show_only_installed_tools = false
+  footer = ""
+  new_session_enter_advances = false

@@ -76,6 +76,7 @@
       "keka"
       "linear"
       "little-snitch"
+      "nextcloud"
       "notion"
       "obs"
       "orbstack"

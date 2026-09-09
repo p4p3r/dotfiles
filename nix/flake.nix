@@ -160,6 +160,7 @@
             imports = [
               ./modules/common.nix
               ./modules/git-ssh.nix
+              ./modules/homebrew-trust.nix
               inputs.nix-private.homeManagerModule
             ];
             private.profiles = profiles;

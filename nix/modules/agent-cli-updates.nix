@@ -126,6 +126,14 @@ let
           "internal/session/conductor_bridge.py" \
           'codex output freshness timeout' \
           "async late-reply handling for long Codex turns" || gate_ok=1
+        check_agent_deck_feature "$source_dir" \
+          "internal/session/conductor_bridge.py" \
+          '_resolve_secret(str(sl.get("channel_id"' \
+          "Slack channel environment-reference resolution" || gate_ok=1
+        check_agent_deck_feature "$source_dir" \
+          "internal/session/conductor_bridge.py" \
+          '_resolve_secret(str(user_id' \
+          "Slack user allowlist environment-reference resolution" || gate_ok=1
 
         return "$gate_ok"
       }

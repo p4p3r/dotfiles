@@ -2,10 +2,11 @@
 # All options: https://github.com/asheshgoplani/agent-deck/blob/main/skills/agent-deck/references/config-reference.md
 #
 # Shared across machines via chezmoi. This repo is PUBLIC, so this file is
-# deliberately SECRET-FREE: the Telegram credentials are env-var references,
-# resolved by bridge.py's _resolve_secret() (supports "$VAR" / "${VAR}" and
-# "keychain:service-name"). The values themselves come from the private secret
-# store and are exported into the environment on every box.
+# deliberately SECRET-FREE: remote-channel credentials and identifiers are
+# env-var references, resolved by bridge.py's _resolve_secret() (supports
+# "$VAR" / "${VAR}" and "keychain:service-name"). The values themselves come
+# from the private secret store and are exported into the environment on every
+# box.
 # Do not paste literal tokens back into this file.
 #
 # NOTE (2026-09-05): this file is resolved XDG-FIRST -- its mere existence takes
@@ -162,14 +163,20 @@ mcp_default_scope = ""
 [conductor]
   enabled = true
   heartbeat_interval = 15
+{{ $slackCutover := and (ne (env "SLACK_BOT_TOKEN") "") (ne (env "SLACK_APP_TOKEN") "") (ne (env "SLACK_DECK_CHANNEL") "") (ne (env "SLACK_DECK_USER") "") }}
+{{ if not $slackCutover }}
   [conductor.telegram]
     token = "${TELEGRAM_BOT_TOKEN}"
     user_id = "${TELEGRAM_USER_ID}"
+{{ end }}
   [conductor.slack]
-    bot_token = ""
-    app_token = ""
-    channel_id = ""
-    listen_mode = ""
+    bot_token = "${SLACK_BOT_TOKEN}"
+    app_token = "${SLACK_APP_TOKEN}"
+    channel_id = "${SLACK_DECK_CHANNEL}"
+    listen_mode = "mentions"
+    # A configured-but-unresolved entry remains deny-all in bridge.py. Never
+    # remove this list: an actually empty allowlist means allow every user.
+    allowed_user_ids = ["${SLACK_DECK_USER}"]
   [conductor.discord]
     bot_token = ""
     guild_id = 0

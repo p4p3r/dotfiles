@@ -1,5 +1,13 @@
 { pkgs, pkgs-unstable, ... }:
 
+let
+  slackCutover = builtins.all (name: builtins.getEnv name != "") [
+    "SLACK_BOT_TOKEN"
+    "SLACK_APP_TOKEN"
+    "SLACK_DECK_CHANNEL"
+    "SLACK_DECK_USER"
+  ];
+in
 {
   # Default development toolchain. Available in $HOME when not inside a
   # project-specific direnv.
@@ -35,13 +43,19 @@
       # `import toml` / `import aiogram` and `python3 -m pip` all fail with
       # ModuleNotFoundError. withPackages produces a single python3 whose
       # site-packages (and pip) are wired in. agent-deck's conductor bridge
-      # imports toml + aiogram and its setup shells out to `python3 -m pip
-      # install`, so all three must live inside the interpreter.
-      (python312.withPackages (ps: with ps; [
-        pip
-        virtualenv
-        toml
-        aiogram
+      # imports toml plus the configured remote-channel SDKs, and its setup
+      # shells out to `python3 -m pip install`, so these must live inside the
+      # interpreter.
+      (python312.withPackages (ps: [
+        ps.pip
+        ps.virtualenv
+        ps.toml
+      ] ++ pkgs.lib.optionals slackCutover [
+        ps.slack-bolt
+        ps.slack-sdk
+        ps.aiohttp
+      ] ++ pkgs.lib.optionals (!slackCutover) [
+        ps.aiogram
       ]))
       pipx
 

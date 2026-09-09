@@ -144,7 +144,16 @@
       # Store apps: brew's install_batch! ignores no_upgrade and always runs
       # `mas upgrade` for installed apps. Manual `brew upgrade` still works.
       upgrade = false;
-      cleanup = "zap";
+      # Homebrew 6 deprecated the `--cleanup` switch: it no longer removes
+      # anything, it only prints what it WOULD remove and exits non-zero, which
+      # made every switch fail on a purely informational report. Set to "none"
+      # until the Brewfile is curated — the preview showed it would otherwise
+      # uninstall 25 formulae (node, cmake, bash, ripgrep, trufflehog,
+      # wireguard-tools, graphite ...), untap 3 taps and delete 6 Mac App Store
+      # apps (Amphetamine, GarageBand, iMovie, Keynote, Numbers, Pages), none of
+      # which are declared here. Run `brew bundle cleanup` (no --force) to
+      # preview before ever re-enabling.
+      cleanup = "none";
     };
   };
 }

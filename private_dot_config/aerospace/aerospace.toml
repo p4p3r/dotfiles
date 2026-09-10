@@ -99,6 +99,19 @@ alt-shift-n = '''exec-and-forget ~/.config/aerospace/scripts/redistribute-home-l
 # Redistribute windows for travel (1 external monitor: ws 2+3 share it, ws 1 stays on laptop)
 alt-shift-m = '''exec-and-forget ~/.config/aerospace/scripts/redistribute-travel-layout.sh'''
 
+# --- Ploopy Nano trackball (migrated from skhd, which is in maintenance mode) ---
+# The Nano is button-less, so its QMK firmware watches host LED state to decide
+# what the ball does. setleds flips the LED on that device specifically, and the
+# firmware reacts. Keycodes come from qmk_userspace_common/layout.h:
+#   PLP_SCR = HYPR(KC_S) -> toggle scroll mode
+#   PLP_RST = HYPR(KC_R) -> reset
+# hyper == cmd-alt-ctrl-shift.
+cmd-alt-ctrl-shift-s = '''exec-and-forget ~/.local/bin/setleds -name "Trackball*" ^num'''
+cmd-alt-ctrl-shift-r = '''exec-and-forget ~/.local/bin/setleds -name "Trackball*" ^caps'''
+
+# Eject all ejectable disks (also migrated from skhd)
+cmd-alt-ctrl-shift-j = '''exec-and-forget /usr/bin/osascript -e 'tell application "Finder" to eject (every disk whose ejectable is true)' '''
+
 [workspace-to-monitor-force-assignment]
 "1" = "Built-in Retina Display"
 "2" = "LG HDR 4K (1)"

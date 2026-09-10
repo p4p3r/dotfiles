@@ -21,21 +21,12 @@
       "asheshgoplani/tap"
 
       # Others
-      # skhd/yabai, referenced by the author's CURRENT account name asmvik.
-      # They renamed koekeishiya -> asmvik, so the old name only resolved via
-      # GitHub's rename redirect, and a different account has since taken the
-      # freed old username (created 2025-12-09). If that account ever creates
-      # homebrew-formulae the redirect dies and the old shorthand would
-      # silently tap THEIRS. Naming the real owner needs no clone_target and
-      # leaves no squattable name anywhere in this config.
-      "asmvik/formulae"
       "nikitabobko/tap"
       "FelixKratz/formulae"
       "cirruslabs/cli"
     ];
 
     brews = [
-      "asmvik/formulae/skhd"
       "osx-cross/arm/arm-gcc-bin@10"
       "qmk/qmk/hid_bootloader_cli"
       "qmk/qmk/qmk"

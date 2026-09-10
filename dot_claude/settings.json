@@ -1,106 +1,368 @@
 {
-  "agentPushNotifEnabled": true,
-  "enabledPlugins": {
-    "agent-deck@agent-deck": true
+  "agentPushNotifEnabled" : true,
+  "defaultMode" : "acceptEdits",
+  "effortLevel" : "medium",
+  "enabledPlugins" : {
+    "caveman@caveman" : true,
+    "frontend-design@claude-plugins-official" : true,
+    "pyright-lsp@claude-plugins-official" : true,
+    "rust-analyzer-lsp@claude-plugins-official" : true
   },
-  "env": {
-    "ANTHROPIC_API_KEY": ""
+  "env" : {
+    "ANTHROPIC_API_KEY" : "",
+    "AWS_PROFILE" : "engineer",
+    "AWS_REGION" : "us-west-2"
   },
-  "extraKnownMarketplaces": {
-    "agent-deck": {
-      "source": {
-        "source": "github",
-        "repo": "asheshgoplani/agent-deck"
+  "extraKnownMarketplaces" : {
+    "caveman" : {
+      "source" : {
+        "repo" : "JuliusBrussee\/caveman",
+        "source" : "github"
       }
     }
   },
-  "hooks": {
-    "Notification": [
+  "hooks" : {
+    "Notification" : [
       {
-        "hooks": [
+        "hooks" : [
           {
-            "type": "command",
-            "command": "printf \"\\a\" > /dev/tty 2>/dev/null || printf \"\\a\""
+            "async" : true,
+            "command" : "agent-deck hook-handler",
+            "type" : "command"
+          }
+        ],
+        "matcher" : "permission_prompt|elicitation_dialog"
+      },
+      {
+        "hooks" : [
+          {
+            "command" : "python3 '\/Users\/paper\/.claude\/hooks\/claude-island-state.py'",
+            "type" : "command"
+          }
+        ],
+        "matcher" : "*"
+      }
+    ],
+    "PermissionDenied" : [
+      {
+        "hooks" : [
+          {
+            "command" : "python3 '\/Users\/paper\/.claude\/hooks\/claude-island-state.py'",
+            "type" : "command"
+          }
+        ],
+        "matcher" : "*"
+      }
+    ],
+    "PermissionRequest" : [
+      {
+        "hooks" : [
+          {
+            "command" : "agent-deck hook-handler",
+            "type" : "command"
           }
         ]
       },
       {
-        "matcher": "permission_prompt|elicitation_dialog",
-        "hooks": [
+        "hooks" : [
           {
-            "type": "command",
-            "command": "agent-deck hook-handler",
-            "async": true
+            "command" : "python3 '\/Users\/paper\/.claude\/hooks\/claude-island-state.py'",
+            "timeout" : 86400,
+            "type" : "command"
+          }
+        ],
+        "matcher" : "*"
+      }
+    ],
+    "PostCompact" : [
+      {
+        "hooks" : [
+          {
+            "command" : "python3 '\/Users\/paper\/.claude\/hooks\/claude-island-state.py'",
+            "type" : "command"
+          }
+        ],
+        "matcher" : "auto"
+      },
+      {
+        "hooks" : [
+          {
+            "command" : "python3 '\/Users\/paper\/.claude\/hooks\/claude-island-state.py'",
+            "type" : "command"
+          }
+        ],
+        "matcher" : "manual"
+      }
+    ],
+    "PostToolUse" : [
+      {
+        "hooks" : [
+          {
+            "command" : "python3 '\/Users\/paper\/.claude\/hooks\/claude-island-state.py'",
+            "type" : "command"
+          }
+        ],
+        "matcher" : "*"
+      }
+    ],
+    "PostToolUseFailure" : [
+      {
+        "hooks" : [
+          {
+            "command" : "python3 '\/Users\/paper\/.claude\/hooks\/claude-island-state.py'",
+            "type" : "command"
+          }
+        ],
+        "matcher" : "*"
+      }
+    ],
+    "PreCompact" : [
+      {
+        "hooks" : [
+          {
+            "command" : "agent-deck hook-handler",
+            "type" : "command"
+          }
+        ]
+      },
+      {
+        "hooks" : [
+          {
+            "command" : "python3 '\/Users\/paper\/.claude\/hooks\/claude-island-state.py'",
+            "type" : "command"
+          }
+        ],
+        "matcher" : "auto"
+      },
+      {
+        "hooks" : [
+          {
+            "command" : "python3 '\/Users\/paper\/.claude\/hooks\/claude-island-state.py'",
+            "type" : "command"
+          }
+        ],
+        "matcher" : "manual"
+      }
+    ],
+    "PreToolUse" : [
+      {
+        "hooks" : [
+          {
+            "command" : "python3 '\/Users\/paper\/.claude\/hooks\/claude-island-state.py'",
+            "type" : "command"
+          }
+        ],
+        "matcher" : "*"
+      }
+    ],
+    "SessionEnd" : [
+      {
+        "hooks" : [
+          {
+            "async" : true,
+            "command" : "agent-deck hook-handler",
+            "type" : "command"
+          }
+        ]
+      },
+      {
+        "hooks" : [
+          {
+            "command" : "python3 '\/Users\/paper\/.claude\/hooks\/claude-island-state.py'",
+            "type" : "command"
           }
         ]
       }
     ],
-    "PermissionRequest": [
+    "SessionStart" : [
       {
-        "hooks": [
+        "hooks" : [
           {
-            "type": "command",
-            "command": "agent-deck hook-handler"
+            "async" : true,
+            "command" : "agent-deck hook-handler",
+            "type" : "command"
+          }
+        ]
+      },
+      {
+        "hooks" : [
+          {
+            "command" : "python3 '\/Users\/paper\/.claude\/hooks\/claude-island-state.py'",
+            "type" : "command"
           }
         ]
       }
     ],
-    "PreCompact": [
+    "Stop" : [
       {
-        "hooks": [
+        "hooks" : [
           {
-            "type": "command",
-            "command": "agent-deck hook-handler"
+            "command" : "agent-deck hook-handler",
+            "type" : "command"
+          }
+        ]
+      },
+      {
+        "hooks" : [
+          {
+            "command" : "python3 '\/Users\/paper\/.claude\/hooks\/claude-island-state.py'",
+            "type" : "command"
           }
         ]
       }
     ],
-    "SessionEnd": [
+    "StopFailure" : [
       {
-        "hooks": [
+        "hooks" : [
           {
-            "type": "command",
-            "command": "agent-deck hook-handler",
-            "async": true
+            "command" : "python3 '\/Users\/paper\/.claude\/hooks\/claude-island-state.py'",
+            "type" : "command"
           }
         ]
       }
     ],
-    "SessionStart": [
+    "SubagentStart" : [
       {
-        "hooks": [
+        "hooks" : [
           {
-            "type": "command",
-            "command": "agent-deck hook-handler",
-            "async": true
+            "command" : "python3 '\/Users\/paper\/.claude\/hooks\/claude-island-state.py'",
+            "type" : "command"
           }
         ]
       }
     ],
-    "Stop": [
+    "SubagentStop" : [
       {
-        "hooks": [
+        "hooks" : [
           {
-            "type": "command",
-            "command": "agent-deck hook-handler"
+            "command" : "python3 '\/Users\/paper\/.claude\/hooks\/claude-island-state.py'",
+            "type" : "command"
           }
         ]
       }
     ],
-    "UserPromptSubmit": [
+    "UserPromptSubmit" : [
       {
-        "hooks": [
+        "hooks" : [
           {
-            "type": "command",
-            "command": "agent-deck hook-handler",
-            "async": true
+            "async" : true,
+            "command" : "agent-deck hook-handler",
+            "type" : "command"
+          }
+        ]
+      },
+      {
+        "hooks" : [
+          {
+            "command" : "python3 '\/Users\/paper\/.claude\/hooks\/claude-island-state.py'",
+            "type" : "command"
           }
         ]
       }
     ]
   },
-  "remoteControlAtStartup": true,
-  "skipDangerousModePermissionPrompt": true,
-  "theme": "dark",
-  "tui": "fullscreen"
+  "model" : "opus",
+  "permissions" : {
+    "allow" : [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash(make *)",
+      "Bash(make)",
+      "Bash(direnv exec *)",
+      "Bash(direnv status)",
+      "Bash(direnv allow)",
+      "Bash(uv run *)",
+      "Bash(uv sync *)",
+      "Bash(uv lock *)",
+      "Bash(uv lock)",
+      "Bash(pytest *)",
+      "Bash(git status)",
+      "Bash(git status *)",
+      "Bash(git log *)",
+      "Bash(git diff *)",
+      "Bash(git diff)",
+      "Bash(git branch *)",
+      "Bash(git branch)",
+      "Bash(git checkout *)",
+      "Bash(git fetch *)",
+      "Bash(git show *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git stash *)",
+      "Bash(git merge *)",
+      "Bash(git rebase *)",
+      "Bash(git tag *)",
+      "Bash(git rev-parse *)",
+      "Bash(git ls-files *)",
+      "Bash(git ls-tree *)",
+      "Bash(git remote *)",
+      "Bash(git push *)",
+      "Bash(ls)",
+      "Bash(ls *)",
+      "Bash(pwd)",
+      "Bash(cd *)",
+      "Bash(find *)",
+      "Bash(grep *)",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc *)",
+      "Bash(sed *)",
+      "Bash(awk *)",
+      "Bash(sort *)",
+      "Bash(uniq *)",
+      "Bash(cut *)",
+      "Bash(tr *)",
+      "Bash(echo *)",
+      "Bash(printf *)",
+      "Bash(tee *)",
+      "Bash(jq *)",
+      "Bash(file *)",
+      "Bash(tree *)",
+      "Bash(which *)",
+      "Bash(type *)",
+      "Bash(realpath *)",
+      "Bash(basename *)",
+      "Bash(dirname *)",
+      "Bash(date *)",
+      "Bash(sleep *)",
+      "Bash(timeout *)",
+      "Bash(rm *)",
+      "Bash(ln *)",
+      "Bash(mkdir *)",
+      "Bash(cp *)",
+      "Bash(mv *)",
+      "Bash(chmod *)",
+      "Bash(touch *)",
+      "Bash(python *)",
+      "Bash(python3 *)",
+      "Bash(node *)",
+      "Bash(npm *)",
+      "Bash(npx *)",
+      "Bash(curl *)",
+      "Bash(ps *)",
+      "Bash(kill *)",
+      "Bash(pkill *)",
+      "Bash(lsof *)",
+      "Bash(sqlite3 *)",
+      "Bash(docker *)",
+      "Bash(kubectl *)",
+      "Bash(helm *)",
+      "Bash(gh *)"
+    ],
+    "defaultMode" : "auto",
+    "deny" : [
+      "Bash(rm -rf *)",
+      "Bash(sudo *)",
+      "Bash(git push --force *)",
+      "Bash(git push --force-with-lease *)",
+      "Bash(git reset --hard *)"
+    ]
+  },
+  "remoteControlAtStartup" : true,
+  "skipAutoPermissionPrompt" : true,
+  "skipDangerousModePermissionPrompt" : true,
+  "theme" : "dark",
+  "tui" : "fullscreen"
 }

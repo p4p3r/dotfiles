@@ -2,23 +2,23 @@
   description = "Hybrid Nix (nix-darwin + nix-homebrew + Home Manager) + chezmoi";
 
   inputs = {
-    # Linux & general packages (25.11 stable). Used for everything inside
+    # Linux & general packages (26.05 stable). Used for everything inside
     # devenv projects and anything where reproducibility outweighs freshness.
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
-    # macOS-specific nixpkgs branch that matches nix-darwin 25.11
-    nixpkgs-darwin.url = "github:NixOS/nixpkgs/nixpkgs-25.11-darwin";
+    # macOS-specific nixpkgs branch that matches nix-darwin 26.05
+    nixpkgs-darwin.url = "github:NixOS/nixpkgs/nixpkgs-26.05-darwin";
 
     # Rolling unstable nixpkgs. Used for "I want this CLI on $PATH and want
     # it close to upstream HEAD" tools — see pkgs-unstable usage in common.nix.
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     # nix-darwin must follow the darwin branch of nixpkgs
-    darwin.url = "github:nix-darwin/nix-darwin/nix-darwin-25.11";
+    darwin.url = "github:nix-darwin/nix-darwin/nix-darwin-26.05";
     darwin.inputs.nixpkgs.follows = "nixpkgs-darwin";
 
-    # Home Manager release matching 25.11, follow the Linux/general nixpkgs
-    home-manager.url = "github:nix-community/home-manager/release-25.11";
+    # Home Manager release matching 26.05, follow the Linux/general nixpkgs
+    home-manager.url = "github:nix-community/home-manager/release-26.05";
     home-manager.inputs.nixpkgs.follows = "nixpkgs";
 
     # nix-homebrew (no special follows needed)

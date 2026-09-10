@@ -37,7 +37,7 @@ in {
     # Developer quality-of-life
     git-lfs neovim ripgrep fd bat fzf delta eza
     tealdeer tree vbindiff rename lsof
-    nodePackages.prettier lazygit sqlitebrowser
+    prettier lazygit sqlitebrowser   # nodePackages.* removed in nixpkgs 26.05
 
     # Various tools
     lesspipe openssh imagemagick graphviz

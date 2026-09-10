@@ -13,9 +13,12 @@ let
     else pkgs.jdk;
 
   nodeExtras = [
-    (pkgs.nodePackages.typescript-language-server or null)
-    (pkgs.nodePackages.eslint or null)
-    (pkgs.nodePackages.typescript or null)
+    # nodePackages was removed in nixpkgs 26.05 and now throws rather than
+    # being a missing attribute, so `or null` no longer guards it. These all
+    # exist at the top level instead.
+    (pkgs.typescript-language-server or null)
+    (pkgs.eslint or null)
+    (pkgs.typescript or null)
   ];
 in
 builtins.filter (x: x != null) (with pkgs; [

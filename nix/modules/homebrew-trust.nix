@@ -30,7 +30,6 @@ let
     # to decide what to remove, and loading an untrusted one is a hard error —
     # so these need trusting even though nothing declares them.
     "felixkratz/formulae"   # sketchybar
-    "withgraphite/tap"      # graphite
     # skhd/yabai. Listed by clone URL, not "koekeishiya/formulae": the tap is
     # pinned to an explicit clone_target in darwin-homebrew.nix, and brew keys
     # trust for such taps by URL. That is the safer shape anyway — a URL cannot

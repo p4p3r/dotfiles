@@ -58,10 +58,27 @@
       # (not nix) on purpose: brew's Python is stable across nix rebuilds, so
       # pipx venvs don't get orphaned when a nix-store Python path changes.
       "pipx"
-      # Cross-platform tools (make, node, ripgrep, tmux) now via nix in
-      # nix/modules/common.nix. graphite/terraform-docs/clang-format via
-      # pkgs-unstable in same file. pup installed from GitHub releases in
-      # flake.nix postActivation (Mac) + common.nix activation (Linux).
+
+      # Declared because brew is their ONLY source in a plain login shell.
+      # nix has them, but only inside the devenv/devtoolchain devshells
+      # (nix/devshells/default/devenv.nix, nix/lib/devtoolchain.nix), not in
+      # home-manager — so outside a direnv-activated shell these come from
+      # brew. Verified against a bare login PATH.
+      "cmake"
+      "node"
+      "pkgconf"
+      # Not packaged in this config's nix at all.
+      "trufflehog"
+      # nixpkgs has it, but brew's macOS packaging of wg-quick/wireguard-go is
+      # the better-tested one here.
+      "wireguard-tools"
+
+      # ripgrep, terraform-docs and graphite-cli are in home-manager
+      # (nix/modules/common.nix, the latter two via pkgs-unstable), so they
+      # resolve from /etc/profiles/per-user even with no devshell active. Their
+      # brew copies were removed as duplicates. make/tmux likewise via nix. pup
+      # installed from GitHub releases in flake.nix postActivation (Mac) +
+      # common.nix activation (Linux).
     ];
 
     casks = [
@@ -123,6 +140,14 @@
       "1Blocker" = 1365531024;
       "Save to Raindrop.io" = 1549370672;
       "Wireguard" = 1451685025;
+      # Installed but previously undeclared, which meant `cleanup` would have
+      # deleted them. Apple stock apps plus Amphetamine.
+      "Amphetamine" = 937984704;
+      "GarageBand" = 682658836;
+      "iMovie" = 408981434;
+      "Keynote" = 409183694;
+      "Numbers" = 409203825;
+      "Pages" = 409201541;
     };
 
     onActivation = {

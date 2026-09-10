@@ -49,7 +49,7 @@ devenv.lock
 .agent-deck/conductor/**
 
 # Machine-local Codex directory trust, spliced into ~/.codex/config.toml by
-# dot_codex/private_config.toml.tmpl. Never track it: it holds real checkout paths.
+# private_dot_codex/private_config.toml.tmpl. Never track it: it holds real checkout paths.
 .codex/trust.local.toml
 
 # OrbStack regenerates ~/.orbstack/ssh/config itself and keeps flipping the

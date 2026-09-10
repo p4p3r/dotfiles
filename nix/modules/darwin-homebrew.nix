@@ -21,23 +21,21 @@
       "asheshgoplani/tap"
 
       # Others
-      # Pinned to an explicit URL, NOT the "koekeishiya/..." shorthand.
-      # The skhd/yabai author renamed their GitHub account koekeishiya ->
-      # asmvik, so github.com/koekeishiya/homebrew-formulae only reaches the
-      # real repo via GitHub's rename redirect. A different account has since
-      # taken the freed "koekeishiya" username (created 2025-12-09), and that
-      # redirect stops working the moment they create a repo of the same name
-      # — at which point the shorthand would silently tap THEIR repo. Pinning
-      # the resolved URL removes the redirect from the trust path entirely.
-      { name = "koekeishiya/formulae";
-        clone_target = "https://github.com/asmvik/homebrew-formulae.git"; }
+      # skhd/yabai, referenced by the author's CURRENT account name asmvik.
+      # They renamed koekeishiya -> asmvik, so the old name only resolved via
+      # GitHub's rename redirect, and a different account has since taken the
+      # freed old username (created 2025-12-09). If that account ever creates
+      # homebrew-formulae the redirect dies and the old shorthand would
+      # silently tap THEIRS. Naming the real owner needs no clone_target and
+      # leaves no squattable name anywhere in this config.
+      "asmvik/formulae"
       "nikitabobko/tap"
       "FelixKratz/formulae"
       "cirruslabs/cli"
     ];
 
     brews = [
-      "koekeishiya/formulae/skhd"
+      "asmvik/formulae/skhd"
       "osx-cross/arm/arm-gcc-bin@10"
       "qmk/qmk/hid_bootloader_cli"
       "qmk/qmk/qmk"
@@ -169,16 +167,14 @@
       # Store apps: brew's install_batch! ignores no_upgrade and always runs
       # `mas upgrade` for installed apps. Manual `brew upgrade` still works.
       upgrade = false;
-      # Homebrew 6 deprecated the `--cleanup` switch: it no longer removes
-      # anything, it only prints what it WOULD remove and exits non-zero, which
-      # made every switch fail on a purely informational report. Set to "none"
-      # until the Brewfile is curated — the preview showed it would otherwise
-      # uninstall 25 formulae (node, cmake, bash, ripgrep, trufflehog,
-      # wireguard-tools, graphite ...), untap 3 taps and delete 6 Mac App Store
-      # apps (Amphetamine, GarageBand, iMovie, Keynote, Numbers, Pages), none of
-      # which are declared here. Run `brew bundle cleanup` (no --force) to
-      # preview before ever re-enabling.
-      cleanup = "none";
+      # Re-enabled now that the Brewfile matches reality: `brew bundle
+      # cleanup` proposes no uninstalls and no untaps, only cache pruning.
+      # It was "none" for a while because Homebrew 6 deprecated the switch
+      # (it previews rather than removes, and exits non-zero), and because the
+      # preview then wanted to delete 25 formulae, 6 Mac App Store apps and 3
+      # taps that were installed but undeclared. Before touching this, run
+      # `brew bundle cleanup` WITHOUT --force and read what it proposes.
+      cleanup = "zap";
     };
   };
 }

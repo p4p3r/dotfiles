@@ -3,48 +3,47 @@
 # Homebrew 6 refuses to load formulae and casks from third-party taps until
 # they are explicitly trusted, and warns it cannot check the rest for updates.
 # Before this, `nix_switch` failed outright: brew bundle aborted on the first
-# untrusted cask (aerospace) and darwin-rebuild exited 1.
+# untrusted cask and darwin-rebuild exited 1.
 #
-# `brew trust` records the decision in ~/.homebrew/trust.json — not under
-# ~/.config, because XDG_CONFIG_HOME is unset on this machine. Declaring the
-# file here keeps trust in version control instead of imperative local state
-# that no other machine would inherit.
+# The file must be a REAL file, not a home.file store symlink. brew resolves
+# ~/.homebrew/trust.json and then checks the ownership of the *resolved* file's
+# parent directory; pointed at /nix/store that is root-owned, and brew bails
+# with "Refusing to write insecure trust store", which breaks `brew install`
+# entirely. So it is installed by an activation script instead.
 #
-# Least privilege: only taps that actually need it are listed. datadog-labs/pack
-# stays out — it is tapped but has nothing installed, so nothing ever loads it.
-# Trusting a tap trusts everything it ships now AND in future, so add one only
-# after checking who publishes it. Every tap here was verified to resolve to a
-# repo owned by its declared owner, except koekeishiya (see below).
+# Consequence: brew's own `brew trust` writes (e.g. the "trustedformulae" key
+# it adds when you install from a tap explicitly) are overwritten on the next
+# switch. That is fine — trusting the tap already covers its formulae — but it
+# does mean this list is the single source of truth.
 #
-# Note this makes the file a read-only store symlink, so `brew trust` can no
-# longer write it. Adding a tap is a nix edit + switch, which is the point.
+# Least privilege: only taps that actually need trust are listed. Trusting a
+# tap trusts everything it ships now AND in future, so add one only after
+# checking who publishes it. Every tap here was verified to resolve to a repo
+# owned by its declared owner.
 
 let
   jsonFormat = pkgs.formats.json { };
 
   trustedTaps = [
     "asheshgoplani/tap"     # agent-deck
-    "cirruslabs/cli"        # tart
-    # sketchybar and graphite are installed from these but not declared in
-    # homebrew.brews. cleanup = "zap" still has to LOAD every installed formula
-    # to decide what to remove, and loading an untrusted one is a hard error —
-    # so these need trusting even though nothing declares them.
+    "asmvik/formulae"       # skhd (the author's current account name)
+    "cirruslabs/cli"        # tart, softnet
     "felixkratz/formulae"   # sketchybar
-    # skhd/yabai. Listed by clone URL, not "koekeishiya/formulae": the tap is
-    # pinned to an explicit clone_target in darwin-homebrew.nix, and brew keys
-    # trust for such taps by URL. That is the safer shape anyway — a URL cannot
-    # be taken over by whoever now holds the freed "koekeishiya" username.
-    "https://github.com/asmvik/homebrew-formulae.git"
     "mutagen-io/mutagen"    # mutagen
     "nikitabobko/tap"       # aerospace
     "osx-cross/arm"         # arm-gcc-bin@10 (QMK toolchain)
     "osx-cross/avr"         # avr-gcc@8, pulled in as a qmk dependency
-    "qmk/qmk"               # qmk, hid_bootloader_cli
+    "qmk/qmk"               # qmk, hid_bootloader_cli, mdloader
   ];
+
+  trustFile = jsonFormat.generate "homebrew-trust.json" {
+    trustedtaps = lib.sort (a: b: a < b) trustedTaps;
+  };
 in
 lib.mkIf pkgs.stdenv.isDarwin {
-  home.file.".homebrew/trust.json".source =
-    jsonFormat.generate "homebrew-trust.json" {
-      trustedtaps = lib.sort (a: b: a < b) trustedTaps;
-    };
+  home.activation.homebrewTrustStore =
+    lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+      run install -d -m 700 "$HOME/.homebrew"
+      run install -m 600 ${trustFile} "$HOME/.homebrew/trust.json"
+    '';
 }

@@ -51,3 +51,10 @@ devenv.lock
 # Machine-local Codex directory trust, spliced into ~/.codex/config.toml by
 # dot_codex/private_config.toml.tmpl. Never track it: it holds real checkout paths.
 .codex/trust.local.toml
+
+# OrbStack regenerates ~/.orbstack/ssh/config itself and keeps flipping the
+# directory mode (40700 <-> 40755), so it shows as permanent chezmoi drift that
+# is never worth applying or re-adding. Machine-generated: leave it unmanaged.
+# Ignoring only stops management -- chezmoi never deletes an ignored path.
+.orbstack
+.orbstack/**

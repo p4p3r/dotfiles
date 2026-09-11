@@ -172,11 +172,20 @@ mcp_default_scope = ""
   [conductor.slack]
     bot_token = "${SLACK_BOT_TOKEN}"
     app_token = "${SLACK_APP_TOKEN}"
-    channel_id = "${SLACK_DECK_CHANNEL}"
+    # Interpolated by chezmoi at apply time, NOT left as ${...}. bridge.py runs
+    # _resolve_secret() over bot_token and app_token only; channel_id and
+    # allowed_user_ids are read raw (verified in stock v1.16.4, the newest
+    # release, so this is not a version to wait out). Left as placeholders the
+    # bridge holds the literal strings: Socket Mode still connects because the
+    # tokens do resolve, so it looks healthy while inbound silently drops every
+    # message (channel comparison never matches) and outbound has no
+    # destination. Neither value is a credential, and only the rendered file on
+    # disk holds them -- this repo stores the template.
+    channel_id = "{{ env "SLACK_DECK_CHANNEL" }}"
     listen_mode = "mentions"
     # A configured-but-unresolved entry remains deny-all in bridge.py. Never
     # remove this list: an actually empty allowlist means allow every user.
-    allowed_user_ids = ["${SLACK_DECK_USER}"]
+    allowed_user_ids = ["{{ env "SLACK_DECK_USER" }}"]
   [conductor.discord]
     bot_token = ""
     guild_id = 0

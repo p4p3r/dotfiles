@@ -56,10 +56,21 @@ in {
     pinentry-curses    # `pinentry` was removed in nixpkgs 25.11; pick a variant
   ]) ++ (with pkgs-unstable; [
     # Tools we want bleeding-edge — sourced from nixos-unstable rather than the
-    # 25.11 stable channel.
-    graphite-cli
+    # 26.05 stable channel.
     terraform-docs
     clang-tools
+  ] ++ lib.optionals pkgs.stdenv.isDarwin [
+    # graphite-cli is Darwin-only on purpose. It is used heavily here (11 repos
+    # carry a .graphite_repo_config) but not at all on the sbx boxes (zero
+    # repos, no user config), and on x86_64-linux it is a hard build failure:
+    # 1.8.6 is not in cache.nixos.org, so it builds from source, and its
+    # postInstall shells out to bwrap to generate shell completions. Ubuntu
+    # sets kernel.apparmor_restrict_unprivileged_userns=1, bwrap cannot map
+    # uids, the completion file lands empty and installShellCompletion aborts.
+    # That failure cascades: home-manager-path -> activation-script -> the whole
+    # generation, so nothing else gets applied either. Keeping it off Linux
+    # avoids relaxing an AppArmor hardening knob for a tool nobody uses there.
+    graphite-cli
   ] ++ lib.optionals pkgs.stdenv.isLinux [
     # Docker CLI on Linux only (macOS uses Orbstack, which provides both
     # `docker` and `docker compose`). The `docker` package ships both

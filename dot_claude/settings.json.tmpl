@@ -21,7 +21,7 @@
       }
     }
   },
-  "hooks" : {
+  "hooks" : {{ if eq .chezmoi.os "darwin" }}{
     "Notification" : [
       {
         "hooks" : [
@@ -260,7 +260,83 @@
         ]
       }
     ]
-  },
+  }{{ else }}{
+    "Notification" : [
+      {
+        "hooks" : [
+          {
+            "async" : true,
+            "command" : "agent-deck hook-handler",
+            "type" : "command"
+          }
+        ],
+        "matcher" : "permission_prompt|elicitation_dialog"
+      }
+    ],
+    "PermissionRequest" : [
+      {
+        "hooks" : [
+          {
+            "command" : "agent-deck hook-handler",
+            "type" : "command"
+          }
+        ]
+      }
+    ],
+    "PreCompact" : [
+      {
+        "hooks" : [
+          {
+            "command" : "agent-deck hook-handler",
+            "type" : "command"
+          }
+        ]
+      }
+    ],
+    "SessionEnd" : [
+      {
+        "hooks" : [
+          {
+            "async" : true,
+            "command" : "agent-deck hook-handler",
+            "type" : "command"
+          }
+        ]
+      }
+    ],
+    "SessionStart" : [
+      {
+        "hooks" : [
+          {
+            "async" : true,
+            "command" : "agent-deck hook-handler",
+            "type" : "command"
+          }
+        ]
+      }
+    ],
+    "Stop" : [
+      {
+        "hooks" : [
+          {
+            "command" : "agent-deck hook-handler",
+            "type" : "command"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit" : [
+      {
+        "hooks" : [
+          {
+            "async" : true,
+            "command" : "agent-deck hook-handler",
+            "type" : "command"
+          }
+        ]
+      }
+    ]
+  }{{ end }},
   "model" : "opus",
   "permissions" : {
     "allow" : [

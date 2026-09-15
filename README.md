@@ -78,6 +78,55 @@ chezmoi update    # pulls latest dotfiles + private repo
 nix_switch        # rebuild system
 ```
 
+## Agent Deck hook configuration probe
+
+After chezmoi installs it, run `agent-deck-hook-probe` to inspect the effective Codex notification
+and Claude hook configuration without invoking either runtime or any configured hook. Both runtimes
+are required by default; `--optional-runtime codex` or `--optional-runtime claude` skips only a
+runtime whose executable and configuration are both absent.
+
+The probe verifies static configuration shape and executable reachability only. It does not prove
+hook invocation, Agent Deck inbox delivery, child completion, or end-to-end Slack delivery. Inbox
+signals remain advisory; poll immutable Agent Deck session IDs for authoritative completion.
+
+## Agent Deck host-local work registry
+
+`agent-deck-work-registry` is a small, single-writer companion for recording one immutable Agent
+Deck owner session, requested/observed status, deadline, last poll time, and reason code per local
+work item. It stores no prompts, messages, output, raw logs, paths, repository names, or arbitrary
+metadata. The default registry is private host-local state at
+`$XDG_STATE_HOME/agent-deck/work-registry.json` (falling back to
+`~/.local/state/agent-deck/work-registry.json`); tests use an explicit temporary `--state`.
+
+Registration, reconciliation, listing, and explicit terminal disposition are available through
+`register`, `reconcile`, `list`/`show`, and `mark-terminal`. Reconciliation executes only
+`agent-deck [-p PROFILE] session show <immutable-id> --json`; it does not query by title, consume
+inbox hints, read child output, or control sessions. Polling proves the observed Agent Deck session
+state, not work completion. Only a separate conductor verification can mark a work packet terminal.
+
+The format has one version and no migration engine. Unknown or malformed state fails closed. The
+registry uses a nonblocking local lock and atomic owner-only writes; concurrent writers,
+distributed ownership, and cross-host state sharing are unsupported.
+
+## Agent Deck maintenance collector
+
+`agent-deck-maintenance-collector` is an hourly-capable, read-only inventory companion. It polls the
+configured Agent Deck profile, explicitly configured git repositories, and filesystem capacity
+bands. Its private host-local snapshot contains exact session IDs plus hashed references and bounded
+reason codes—never raw paths, titles, commands, branches, prompts, messages, transcripts, or
+provider bodies.
+
+The first valid run records a silent baseline. Later identical observations stay silent; a candidate
+add/remove/reason change or filesystem threshold-band transition emits exactly one compact JSON
+event. A candidate requests custodian inspection and never authorizes cleanup. The collector creates
+no timer and performs no archive, stop, delete, prune, GitHub, Linear, Slack, or other network action.
+
+Configure repositories with repeated `--repo PATH`; `/` is the default capacity target and repeated
+`--filesystem PATH` overrides it. Snapshot state defaults to
+`$XDG_STATE_HOME/agent-deck/maintenance-collector.json` (or
+`~/.local/state/agent-deck/maintenance-collector.json`). `--fixture FILE` is the isolated strict-input
+mode used by tests. Scheduling and report-only custodian behavior are separate, later packets.
+
 ## Architecture
 
 - **chezmoi** manages dotfiles and clones the private repo via `.chezmoiexternal.toml`

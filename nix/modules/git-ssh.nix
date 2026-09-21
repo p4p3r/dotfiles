@@ -77,10 +77,12 @@
 
   # ---------------------------------------------------------------------------
   # SSH (home-manager 25.11 layout)
-  #   programs.ssh.{addKeysToAgent,controlMaster,controlPath,controlPersist,
-  #     serverAliveInterval,serverAliveCountMax} are deprecated at top level.
-  #   Move them into programs.ssh.matchBlocks."*". enableDefaultConfig = false
-  #   stops HM from injecting its own defaults that would conflict.
+  #   programs.ssh.matchBlocks is a deprecated alias for programs.ssh.settings.
+  #   Blocks are now freeform attrsets keyed by Host/Match pattern, holding raw
+  #   OpenSSH directive names (HostName, ServerAliveInterval, ForwardAgent, …) —
+  #   no camelCase options and no extraOptions escape hatch. Values: bool →
+  #   yes/no, int → number, string verbatim. DAG ordering via lib.hm.dag still
+  #   applies. enableDefaultConfig = false stops HM injecting its own "*".
   # ---------------------------------------------------------------------------
   programs.ssh = {
     enable = true;
@@ -91,8 +93,8 @@
       (lib.optionals pkgs.stdenv.isDarwin [ "~/.orbstack/ssh/config" ])
       ++ [ "~/.ssh/config.d/*" ];
 
-    matchBlocks = {
-      # Sandbox EC2 boxes (172.16.1.x), reached over the Tailscale subnet route.
+    settings = {
+      # Sandbox EC2 boxes (172.19.x), reached over the Tailscale subnet route.
       # agent-deck connects to these BY IP with its own mux socket
       # (/tmp/agent-deck-ssh/%r@%h:%p). When the Tailscale route flaps, a mux
       # master's TCP dies but the master process lingers as a zombie — every new
@@ -101,43 +103,35 @@
       # dead master self-exit in ~45s (vs 180s under the "*" defaults) so the
       # socket frees and the next connect rebuilds a healthy, reusable master;
       # ConnectTimeout fails a genuinely-unreachable box fast instead of hanging.
-      # Ordered before "*" so these win the first-match on serverAlive*.
-      "172.16.1.*" = lib.hm.dag.entryBefore [ "*" ] {
-        serverAliveInterval = 15;
-        serverAliveCountMax = 3;
-        extraOptions.ConnectTimeout = "5";
+      # Ordered before "*" so these win the first-match on ServerAlive*.
+      "172.19.*" = lib.hm.dag.entryBefore [ "*" ] {
+        ServerAliveInterval = 15;
+        ServerAliveCountMax = 3;
+        ConnectTimeout = 5;
       };
 
       # Home Assistant host
       "antioche-ha.local" = {
-        hostname = "antioche-ha.local";
-        user = "hassio";
-        forwardAgent = true;
+        HostName = "antioche-ha.local";
+        User = "hassio";
+        ForwardAgent = true;
       };
 
-      "github.com" = {
-        # SSH keys managed by 1Password SSH agent
-        # No identityFile needed - 1Password provides keys
-      };
+      # SSH keys managed by 1Password SSH agent — no IdentityFile needed.
+      "github.com" = { };
+      "gitlab.com" = { };
 
-      "gitlab.com" = {
-      };
-
-      # Wildcard: defaults that used to live at programs.ssh.* top level, plus
-      # the existing extraOptions.
+      # Wildcard: defaults that used to live at programs.ssh.* top level.
       "*" = {
-        addKeysToAgent = "yes";
-        controlMaster = "auto";
-        controlPath = "~/.ssh/control-%C";
-        controlPersist = "10m";
-        serverAliveInterval = 60;
-        serverAliveCountMax = 3;
-
-        extraOptions = {
-          PubkeyAcceptedKeyTypes = "ssh-ed25519,ssh-rsa";
-        } // lib.optionalAttrs pkgs.stdenv.isDarwin {
-          IdentityAgent = ''"~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"'';
-        };
+        AddKeysToAgent = "yes";
+        ControlMaster = "auto";
+        ControlPath = "~/.ssh/control-%C";
+        ControlPersist = "10m";
+        ServerAliveInterval = 60;
+        ServerAliveCountMax = 3;
+        PubkeyAcceptedKeyTypes = "ssh-ed25519,ssh-rsa";
+      } // lib.optionalAttrs pkgs.stdenv.isDarwin {
+        IdentityAgent = ''"~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"'';
       };
     };
   };

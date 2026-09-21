@@ -17,9 +17,6 @@
       "osx-cross/avr"
       "qmk/qmk"
 
-      # Agent Deck (AI agent session manager)
-      "asheshgoplani/tap"
-
       # Others
       "nikitabobko/tap"
       "FelixKratz/formulae"
@@ -41,7 +38,8 @@
       "sketchybar"
       "cirruslabs/cli/tart"
       "softnet"
-      "asheshgoplani/tap/agent-deck"
+      # agent-deck now installed from GitHub releases (latest) via flake.nix
+      # postActivation — the tap formula lags upstream. ~/.local/bin wins PATH.
       "mutagen-io/mutagen/mutagen"
       # pipx: provisions PyPI CLI tools into ~/.local/bin. Sourced from brew
       # (not nix) on purpose: brew's Python is stable across nix rebuilds, so

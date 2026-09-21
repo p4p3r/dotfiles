@@ -148,6 +148,51 @@
                 fi
               ' || true
             fi
+
+            # agent-deck — latest GitHub release. The Homebrew tap
+            # (asheshgoplani/tap) lags upstream releases, so the version is
+            # managed here instead of via brew. ~/.local/bin precedes
+            # /opt/homebrew/bin on PATH, so this binary wins over any brew copy.
+            # Resolves the latest release each rebuild and re-fetches only when
+            # the installed version differs; checksum-verified before install.
+            echo "Checking agent-deck (latest GitHub release)..."
+            sudo -u ${user} -H bash -c '
+              export PATH=${pkgs.curl}/bin:${pkgs.gnutar}/bin:${pkgs.gzip}/bin:${pkgs.gnused}/bin:${pkgs.gnugrep}/bin:${pkgs.coreutils}/bin:$PATH
+              mkdir -p "$HOME/.local/bin"
+              latest="$(curl -fsSL https://api.github.com/repos/asheshgoplani/agent-deck/releases/latest \
+                | sed -n "s/.*\"tag_name\": *\"v\{0,1\}\([^\"]*\)\".*/\1/p" | head -1)"
+              if [ -z "$latest" ]; then
+                echo "WARN: could not resolve agent-deck latest version (non-fatal)"
+                exit 0
+              fi
+              installed="$("$HOME/.local/bin/agent-deck" --version 2>/dev/null | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -1)"
+              if [ "$installed" = "$latest" ]; then
+                exit 0
+              fi
+              echo "Installing agent-deck v$latest (was: ''${installed:-none})..."
+              case "$(uname -m)" in
+                arm64|aarch64) ad_arch="arm64" ;;
+                x86_64)        ad_arch="amd64" ;;
+                *)             ad_arch="$(uname -m)" ;;
+              esac
+              base="https://github.com/asheshgoplani/agent-deck/releases/download/v$latest"
+              tarball="agent-deck_''${latest}_darwin_''${ad_arch}.tar.gz"
+              tmp="$(mktemp -d)"
+              if curl -fsSL "$base/$tarball" -o "$tmp/ad.tar.gz" \
+                 && curl -fsSL "$base/checksums.txt" -o "$tmp/checksums.txt"; then
+                want="$(grep "$tarball" "$tmp/checksums.txt" | cut -d" " -f1)"
+                got="$(sha256sum "$tmp/ad.tar.gz" | cut -d" " -f1)"
+                if [ -n "$want" ] && [ "$want" = "$got" ]; then
+                  tar -xzC "$HOME/.local/bin" -f "$tmp/ad.tar.gz" agent-deck
+                  echo "agent-deck v$latest installed."
+                else
+                  echo "WARN: agent-deck checksum mismatch (want=$want got=$got); skipped"
+                fi
+              else
+                echo "WARN: agent-deck download failed (non-fatal)"
+              fi
+              rm -rf "$tmp"
+            ' || true
           '';
 
           home-manager.useGlobalPkgs = true;

@@ -8,6 +8,10 @@ function nix_switch --description "Build and activate the system configuration (
 
     if test (uname) = Darwin
         echo "Switching to $flake (darwin) ..."
+        # Capture the HM profile generation count BEFORE the whole switch (see
+        # the note at the re-activate step below for why this must precede
+        # darwin-rebuild, not just the re-run).
+        set -l hm_before (count /Users/$USER/.local/state/nix/profiles/home-manager-*-link 2>/dev/null)
         set -l rebuild_log (mktemp)
         sudo env USER=$USER darwin-rebuild switch --flake $flake $override --impure $argv 2>&1 | tee $rebuild_log
         set -l rebuild_status $pipestatus[1]
@@ -32,14 +36,17 @@ function nix_switch --description "Build and activate the system configuration (
         end
         rm -f $rebuild_log
 
-        # Capture the home-manager profile generation count BEFORE re-running
-        # HM activate. We verify AFTER that the count grew — that proves the
-        # user-level activation actually fired and the ~/.local/bin/foo
-        # symlinks point at the new generation. Without this check, a silent
-        # failure leaves stale user-level state (saw this happen on 2026-05-16,
-        # where the system gen bumped to 78 but the HM profile stayed at 42
-        # because nix-darwin's `launchctl asuser` step apparently no-op'd).
-        set -l hm_before (count /Users/$USER/.local/state/nix/profiles/home-manager-*-link 2>/dev/null)
+        # hm_before was captured up top, BEFORE darwin-rebuild — deliberately.
+        # darwin-rebuild activates HM itself, so sampling here (after it) would
+        # make the no-op re-activate below look like "no growth" on every
+        # successful run and fire a false NOTE. Spanning the whole switch means
+        # a real change shows growth (silent) and only a genuine no-op / failed
+        # activation stays flat. We verify AFTER that the count grew — that
+        # proves user-level activation fired and the ~/.local/bin/foo symlinks
+        # point at the new generation. Without this check, a silent failure
+        # leaves stale user-level state (saw this on 2026-05-16, where the
+        # system gen bumped to 78 but the HM profile stayed at 42 because
+        # nix-darwin's `launchctl asuser` step apparently no-op'd).
 
         # nix-darwin's switch can leave /run/current-system pointing at an older
         # generation while /nix/var/nix/profiles/system is already bumped to the

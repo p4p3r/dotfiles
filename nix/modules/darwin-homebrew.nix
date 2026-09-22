@@ -20,7 +20,6 @@
       # Others
       "nikitabobko/tap"
       "FelixKratz/formulae"
-      "cirruslabs/cli"
     ];
 
     brews = [
@@ -36,8 +35,6 @@
       "dfu-programmer"
       "mdloader"
       "sketchybar"
-      "cirruslabs/cli/tart"
-      "softnet"
       # agent-deck now installed from GitHub releases (latest) via flake.nix
       # postActivation — the tap formula lags upstream. ~/.local/bin wins PATH.
       "mutagen-io/mutagen/mutagen"

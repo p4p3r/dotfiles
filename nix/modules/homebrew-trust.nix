@@ -26,7 +26,6 @@ let
 
   trustedTaps = [
     "asheshgoplani/tap"     # agent-deck
-    "cirruslabs/cli"        # tart, softnet
     "felixkratz/formulae"   # sketchybar
     "mutagen-io/mutagen"    # mutagen
     "nikitabobko/tap"       # aerospace

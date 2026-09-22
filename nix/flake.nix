@@ -100,14 +100,15 @@
           system.activationScripts.postActivation.text = ''
             # Global npm installs — user-scoped to ~/.npm-global/{lib,bin}
             # - @openai/codex: OpenAI Codex CLI
-            # - @zed-industries/*-acp: ACP bridges so Zed can talk to Codex / Claude Code
+            # - @agentclientprotocol/*-acp: ACP bridges so Zed can talk to Codex / Claude Code
             echo "Installing global npm packages..."
             sudo -u ${user} -H bash -c '
               export PATH=${pkgs.nodejs_22}/bin:$PATH
               export NPM_CONFIG_PREFIX=$HOME/.npm-global
               mkdir -p "$NPM_CONFIG_PREFIX"
               npm install -g @openai/codex || true
-              npm install -g @zed-industries/codex-acp || true
+              npm uninstall -g @zed-industries/codex-acp 2>/dev/null || true  # renamed -> @agentclientprotocol
+              npm install -g @agentclientprotocol/codex-acp || true
               npm install -g @agentclientprotocol/claude-agent-acp || true
             '
 

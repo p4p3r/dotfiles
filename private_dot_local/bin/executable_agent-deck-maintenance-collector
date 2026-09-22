@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -17,12 +18,13 @@ import tempfile
 from typing import Any, Callable
 
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 FIXTURE_VERSION = 1
-EVENT_VERSION = 1
+EVENT_VERSION = 2
 MAX_INPUT_BYTES = 4_194_304
 MAX_STATE_BYTES = 1_048_576
 MAX_COMMAND_BYTES = 4_194_304
+MAX_GENERATION = 9_223_372_036_854_775_807
 COMMAND_TIMEOUT_SECONDS = 15.0
 PATH_LIMIT = 4_096
 
@@ -36,6 +38,7 @@ EXIT_STATE_ERROR = 70
 SESSION_ID_RE = re.compile(r"^[0-9a-f]{8,20}-[0-9]{9,20}$")
 PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 HEX_24_RE = re.compile(r"^[a-z_]+:[0-9a-f]{24}$")
+INSTANCE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
 
 SOURCE_STATUSES = {"OK", "UNAVAILABLE", "MALFORMED"}
@@ -154,9 +157,20 @@ def exact_fields(value: Any, fields: set[str], *, state: bool) -> dict[str, Any]
     return value
 
 
-def strict_int(value: Any, *, minimum: int = 0, state: bool = False) -> int:
+def strict_int(
+    value: Any,
+    *,
+    minimum: int = 0,
+    maximum: int | None = None,
+    state: bool = False,
+) -> int:
     error = StateError if state else InputError
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or (maximum is not None and value > maximum)
+    ):
         raise error("invalid integer")
     return value
 
@@ -781,11 +795,27 @@ def fingerprint(observations: dict[str, Any], candidates: list[dict[str, Any]]) 
     return hashlib.sha256(encoded).hexdigest()
 
 
+def new_instance_id() -> str:
+    try:
+        instance_id = secrets.token_hex(16)
+    except (OSError, RuntimeError) as exc:
+        raise StateError("cannot create collector identity") from exc
+    if INSTANCE_ID_RE.fullmatch(instance_id) is None:
+        raise StateError("invalid generated collector identity")
+    return instance_id
+
+
 def new_state(
-    observations: dict[str, Any], candidates: list[dict[str, Any]]
+    observations: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    *,
+    collector_instance_id: str,
+    generation: int,
 ) -> dict[str, Any]:
     return {
         "format_version": FORMAT_VERSION,
+        "collector_instance_id": collector_instance_id,
+        "generation": generation,
         "observations": observations,
         "candidates": candidates,
         "fingerprint": fingerprint(observations, candidates),
@@ -873,11 +903,24 @@ def expected_candidates_from_observations(
 def validate_state(value: Any) -> dict[str, Any]:
     top = exact_fields(
         value,
-        {"format_version", "observations", "candidates", "fingerprint"},
+        {
+            "format_version",
+            "collector_instance_id",
+            "generation",
+            "observations",
+            "candidates",
+            "fingerprint",
+        },
         state=True,
     )
     if strict_int(top["format_version"], state=True) != FORMAT_VERSION:
         raise StateError("unsupported state version")
+    collector_instance_id = bounded_string(
+        top["collector_instance_id"], maximum=32, state=True
+    )
+    if INSTANCE_ID_RE.fullmatch(collector_instance_id) is None:
+        raise StateError("invalid collector identity")
+    strict_int(top["generation"], maximum=MAX_GENERATION, state=True)
     observations = exact_fields(
         top["observations"],
         {"agent_deck", "git_repositories", "filesystems", "sessions", "worktrees"},
@@ -1135,6 +1178,9 @@ def build_event(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
     return {
         "event_version": EVENT_VERSION,
         "event_type": "MAINTENANCE_CHANGE",
+        "collector_instance_id": old["collector_instance_id"],
+        "old_generation": old["generation"],
+        "new_generation": new["generation"],
         "old_fingerprint": old["fingerprint"],
         "new_fingerprint": new["fingerprint"],
         "changes": {"added": added, "removed": removed, "changed": changed},
@@ -1209,8 +1255,6 @@ def main(argv: list[str]) -> int:
         observations, candidates, degraded = normalize_observation(
             collected, args.warn_percent, args.critical_percent
         )
-        candidate_state = new_state(observations, candidates)
-        validate_state(candidate_state)
     except InputError:
         sys.stderr.write("ERROR: INVALID_INPUT\n")
         return EXIT_INVALID_INPUT
@@ -1224,7 +1268,30 @@ def main(argv: list[str]) -> int:
         sys.stderr.write("ERROR: INVALID_STATE\n")
         return EXIT_STATE_ERROR
 
-    changed = prior is not None and prior["fingerprint"] != candidate_state["fingerprint"]
+    current_fingerprint = fingerprint(observations, candidates)
+    changed = prior is not None and prior["fingerprint"] != current_fingerprint
+    try:
+        if prior is None:
+            collector_instance_id = new_instance_id()
+            generation = 0
+        else:
+            collector_instance_id = prior["collector_instance_id"]
+            generation = prior["generation"]
+            if changed:
+                if generation == MAX_GENERATION:
+                    raise StateError("collector generation exhausted")
+                generation += 1
+        candidate_state = new_state(
+            observations,
+            candidates,
+            collector_instance_id=collector_instance_id,
+            generation=generation,
+        )
+        validate_state(candidate_state)
+    except StateError:
+        sys.stderr.write("ERROR: INVALID_STATE\n")
+        return EXIT_STATE_ERROR
+
     try:
         if prior != candidate_state:
             write_state_atomic(state_path, candidate_state, args.test_fail_write)

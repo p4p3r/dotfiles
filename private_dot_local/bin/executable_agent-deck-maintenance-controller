@@ -1,0 +1,1452 @@
+#!/usr/bin/env python3
+"""Single-writer, report-only maintenance trigger controller for Agent Deck."""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+from typing import Any, Iterator
+
+
+FORMAT_VERSION = 2
+EVENT_VERSION = 2
+MAX_STATE_BYTES = 1_048_576
+MAX_COMMAND_BYTES = 4_194_304
+MAX_CHARTER_BYTES = 131_072
+MAX_HISTORY = 64
+MAX_GENERATION = 9_223_372_036_854_775_807
+PATH_LIMIT = 4_096
+
+EXIT_OK = 0
+EXIT_INVALID_INPUT = 64
+EXIT_STATE_ERROR = 70
+EXIT_BUSY = 75
+EXIT_COLLECTOR_FAILED = 76
+EXIT_NOT_VERIFIED = 77
+EXIT_TEST_INTERRUPTED = 78
+
+SESSION_ID_RE = re.compile(r"^[0-9a-f]{8,20}-[0-9]{9,20}$")
+ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+INSTANCE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
+TOKEN_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+RFC3339_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+)
+
+TOP_FIELDS = {
+    "format_version",
+    "host_alias",
+    "profile_alias",
+    "survey_interval_seconds",
+    "lifecycle_state",
+    "owner_kind",
+    "owner_session_id",
+    "unverified_session_id",
+    "collector_instance_id",
+    "collector_generation",
+    "collector_fingerprint",
+    "next_full_survey_at",
+    "last_checked_at",
+    "active_trigger",
+    "pending_due_trigger",
+    "recent_triggers",
+    "session_observed_at",
+    "session_status",
+    "reason_code",
+    "handoff_ref",
+    "handoff_digest",
+    "report_ref",
+    "report_digest",
+    "retention_code",
+    "state_digest",
+}
+TRIGGER_FIELDS = {"id", "digest", "kind", "disposition", "claimed_at"}
+LIFECYCLE_STATES = {"ADMITTED", "ACTIVE", "ESCALATED"}
+OWNER_KINDS = {"CONDUCTOR", "SESSION"}
+SESSION_STATUSES = {
+    "NONE",
+    "RUNNING",
+    "QUEUED",
+    "WAITING",
+    "IDLE",
+    "ERROR",
+    "STOPPED",
+    "UNKNOWN",
+}
+SESSION_STATUS_MAP = {
+    "running": "RUNNING",
+    "queued": "QUEUED",
+    "waiting": "WAITING",
+    "idle": "IDLE",
+    "error": "ERROR",
+    "stopped": "STOPPED",
+}
+SESSION_SUBSTATES = {
+    "",
+    "running",
+    "idle-at-empty-prompt",
+    "model-unavailable",
+    "auth-401",
+    "usage-limit",
+}
+TRIGGER_KINDS = {"COLLECTOR_CHANGE", "FULL_SURVEY"}
+TRIGGER_DISPOSITIONS = {
+    "BASELINED",
+    "CLAIMED",
+    "SUBMITTED",
+    "NOT_VERIFIED",
+    "PENDING",
+    "DEFERRED_ACTIVE_OWNER",
+    "COALESCED_FULL_SURVEY",
+}
+REASON_CODES = {
+    "BASELINE",
+    "NO_TRIGGER",
+    "DUPLICATE_TRIGGER",
+    "TRIGGER_CLAIMED",
+    "DUE_PENDING_OWNER",
+    "OWNER_ACTIVE",
+    "ACTIVE_OWNER",
+    "OWNER_NOT_VERIFIED",
+    "OWNER_TERMINAL_UNVERIFIED",
+    "CLAIM_RECOVERY_REQUIRED",
+    "COLLECTOR_FAILED",
+    "COLLECTOR_EVENT_INVALID",
+    "CHARTER_UNAVAILABLE",
+    "LAUNCH_NOT_VERIFIED",
+    "LAUNCH_ID_UNVERIFIED",
+    "DELIVERY_NOT_VERIFIED",
+    "TRIGGER_SUBMITTED",
+}
+EVENT_KINDS = {"SESSION", "WORKTREE", "FILESYSTEM", "SOURCE"}
+HEALTH_BANDS = {"ABSENT", "NORMAL", "WARN", "CRITICAL", "UNKNOWN"}
+
+
+class ControllerError(Exception):
+    """Sanitized invalid input or state failure."""
+
+
+class StateWriteNotVerified(ControllerError):
+    """A state replacement whose durable outcome cannot be claimed."""
+
+
+class BusyError(ControllerError):
+    """The single-writer lock is already held."""
+
+
+class DuplicateKeyError(ValueError):
+    """A parsed JSON object contains a duplicate key."""
+
+
+class CommandFailure(Exception):
+    """A bounded subprocess did not provide usable evidence."""
+
+
+def no_duplicate_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateKeyError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def reject_json_constant(_value: str) -> None:
+    raise ValueError("non-finite JSON number")
+
+
+def parse_json_bytes(raw: bytes) -> Any:
+    try:
+        return json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=no_duplicate_object,
+            parse_constant=reject_json_constant,
+        )
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        DuplicateKeyError,
+        ValueError,
+    ) as exc:
+        raise ControllerError("invalid JSON") from exc
+
+
+def exact_object(value: Any, fields: set[str], label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ControllerError(f"invalid {label} shape")
+    return value
+
+
+def bounded_string(value: Any, maximum: int, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > maximum
+        or "\x00" in value
+    ):
+        raise ControllerError(f"invalid {label}")
+    return value
+
+
+def bounded_generation(value: Any, label: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > MAX_GENERATION
+    ):
+        raise ControllerError(f"invalid {label}")
+    return value
+
+
+def validate_collector_instance_id(value: Any, label: str) -> str:
+    rendered = bounded_string(value, 32, label)
+    if INSTANCE_ID_RE.fullmatch(rendered) is None:
+        raise ControllerError(f"invalid {label}")
+    return rendered
+
+
+def parse_rfc3339(value: Any, label: str) -> datetime:
+    rendered = bounded_string(value, 20, label)
+    if RFC3339_RE.fullmatch(rendered) is None:
+        raise ControllerError(f"invalid {label}")
+    try:
+        return datetime.strptime(rendered, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except (ValueError, OverflowError) as exc:
+        raise ControllerError(f"invalid {label}") from exc
+
+
+def render_time(value: datetime) -> str:
+    return value.astimezone(timezone.utc).replace(microsecond=0).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def current_time(value: str | None) -> tuple[datetime, str]:
+    if value is None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        return now, render_time(now)
+    parsed = parse_rfc3339(value, "clock")
+    return parsed, render_time(parsed)
+
+
+def canonical_json(value: Any) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+
+
+def digest(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def state_digest(state: dict[str, Any]) -> str:
+    material = {key: value for key, value in state.items() if key != "state_digest"}
+    return digest(canonical_json(material))
+
+
+def validate_optional_digest(value: Any, label: str) -> str | None:
+    if value is None:
+        return None
+    rendered = bounded_string(value, 64, label)
+    if HEX_64_RE.fullmatch(rendered) is None:
+        raise ControllerError(f"invalid {label}")
+    return rendered
+
+
+def validate_optional_ref(value: Any, label: str) -> str | None:
+    if value is None:
+        return None
+    rendered = bounded_string(value, 128, label)
+    if ALIAS_RE.fullmatch(rendered) is None:
+        raise ControllerError(f"invalid {label}")
+    return rendered
+
+
+def validate_trigger(value: Any) -> dict[str, Any]:
+    item = exact_object(value, TRIGGER_FIELDS, "trigger")
+    trigger_id = bounded_string(item["id"], 80, "trigger ID")
+    if not (
+        trigger_id.startswith("change:") or trigger_id.startswith("survey:")
+    ) or HEX_64_RE.fullmatch(trigger_id.split(":", 1)[1]) is None:
+        raise ControllerError("invalid trigger ID")
+    trigger_digest = bounded_string(item["digest"], 64, "trigger digest")
+    if HEX_64_RE.fullmatch(trigger_digest) is None:
+        raise ControllerError("invalid trigger digest")
+    kind = bounded_string(item["kind"], 32, "trigger kind")
+    disposition = bounded_string(item["disposition"], 32, "trigger disposition")
+    if kind not in TRIGGER_KINDS or disposition not in TRIGGER_DISPOSITIONS:
+        raise ControllerError("invalid trigger enum")
+    parse_rfc3339(item["claimed_at"], "trigger timestamp")
+    return item
+
+
+def validate_state(
+    value: Any,
+    *,
+    host_alias: str,
+    profile_alias: str,
+    survey_interval_seconds: int,
+) -> dict[str, Any]:
+    state = exact_object(value, TOP_FIELDS, "controller state")
+    version = state["format_version"]
+    if isinstance(version, bool) or not isinstance(version, int) or version != FORMAT_VERSION:
+        raise ControllerError("unsupported state version")
+    if state["host_alias"] != host_alias or state["profile_alias"] != profile_alias:
+        raise ControllerError("state owner alias mismatch")
+    if state["survey_interval_seconds"] != survey_interval_seconds:
+        raise ControllerError("state survey interval mismatch")
+    if state["lifecycle_state"] not in LIFECYCLE_STATES:
+        raise ControllerError("invalid lifecycle state")
+    if state["owner_kind"] not in OWNER_KINDS:
+        raise ControllerError("invalid owner kind")
+    owner = state["owner_session_id"]
+    if owner is not None and (
+        not isinstance(owner, str) or SESSION_ID_RE.fullmatch(owner) is None
+    ):
+        raise ControllerError("invalid owner session ID")
+    unverified = state["unverified_session_id"]
+    if unverified is not None and (
+        not isinstance(unverified, str)
+        or SESSION_ID_RE.fullmatch(unverified) is None
+    ):
+        raise ControllerError("invalid unverified session ID")
+    if state["owner_kind"] == "SESSION" and owner is None:
+        raise ControllerError("session owner is missing")
+    if state["owner_kind"] == "CONDUCTOR" and owner is not None:
+        raise ControllerError("conductor state carries a session owner")
+    if state["lifecycle_state"] == "ACTIVE" and state["owner_kind"] != "SESSION":
+        raise ControllerError("active lifecycle has no verified session owner")
+    validate_collector_instance_id(
+        state["collector_instance_id"], "collector instance ID"
+    )
+    bounded_generation(state["collector_generation"], "collector generation")
+    if validate_optional_digest(
+        state["collector_fingerprint"], "collector fingerprint"
+    ) is None:
+        raise ControllerError("collector fingerprint is missing")
+    parse_rfc3339(state["next_full_survey_at"], "next full survey")
+    parse_rfc3339(state["last_checked_at"], "last checked timestamp")
+    if state["session_observed_at"] is not None:
+        parse_rfc3339(state["session_observed_at"], "session observation timestamp")
+    if state["session_status"] not in SESSION_STATUSES:
+        raise ControllerError("invalid session status")
+    if state["reason_code"] not in REASON_CODES:
+        raise ControllerError("invalid reason code")
+    if state["retention_code"] != "RETAIN":
+        raise ControllerError("invalid retention code")
+    validate_optional_ref(state["handoff_ref"], "handoff reference")
+    validate_optional_digest(state["handoff_digest"], "handoff digest")
+    validate_optional_ref(state["report_ref"], "report reference")
+    validate_optional_digest(state["report_digest"], "report digest")
+    if (state["handoff_ref"] is None) != (state["handoff_digest"] is None):
+        raise ControllerError("incomplete handoff reference")
+    if (state["report_ref"] is None) != (state["report_digest"] is None):
+        raise ControllerError("incomplete report reference")
+
+    active = state["active_trigger"]
+    if active is not None:
+        validate_trigger(active)
+        if active["disposition"] not in {"CLAIMED", "SUBMITTED", "NOT_VERIFIED"}:
+            raise ControllerError("invalid active trigger disposition")
+    pending = state["pending_due_trigger"]
+    if pending is not None:
+        validate_trigger(pending)
+        if pending["kind"] != "FULL_SURVEY" or pending["disposition"] != "PENDING":
+            raise ControllerError("invalid pending due trigger")
+        expected_pending = survey_trigger(
+            host_alias=host_alias,
+            profile_alias=profile_alias,
+            due_at=state["next_full_survey_at"],
+        )
+        if (
+            pending["id"] != expected_pending["id"]
+            or pending["digest"] != expected_pending["digest"]
+        ):
+            raise ControllerError("pending due trigger does not match cadence")
+    history = state["recent_triggers"]
+    if not isinstance(history, list) or len(history) > MAX_HISTORY:
+        raise ControllerError("invalid trigger history")
+    seen: set[str] = set()
+    for item in history:
+        validate_trigger(item)
+        if item["id"] in seen:
+            raise ControllerError("duplicate trigger history")
+        seen.add(item["id"])
+    if active is not None:
+        matches = [item for item in history if item["id"] == active["id"]]
+        if len(matches) != 1 or matches[0] != active:
+            raise ControllerError("active trigger is not canonical")
+    if pending is not None:
+        matches = [item for item in history if item["id"] == pending["id"]]
+        if len(matches) != 1 or matches[0] != pending:
+            raise ControllerError("pending due trigger is not canonical")
+        if active is not None and pending["id"] == active["id"]:
+            raise ControllerError("pending due trigger is active")
+    stored = bounded_string(state["state_digest"], 64, "state digest")
+    if HEX_64_RE.fullmatch(stored) is None or stored != state_digest(state):
+        raise ControllerError("state digest mismatch")
+    return state
+
+
+def new_state(
+    *,
+    host_alias: str,
+    profile_alias: str,
+    survey_interval_seconds: int,
+    now: datetime,
+    now_text: str,
+    baseline_trigger: dict[str, Any] | None,
+    collector_instance: str,
+    collector_generation: int,
+    collector_fingerprint: str,
+) -> dict[str, Any]:
+    history: list[dict[str, Any]] = []
+    if baseline_trigger is not None:
+        baseline = dict(baseline_trigger)
+        baseline["disposition"] = "BASELINED"
+        baseline["claimed_at"] = now_text
+        history.append(baseline)
+    state = {
+        "format_version": FORMAT_VERSION,
+        "host_alias": host_alias,
+        "profile_alias": profile_alias,
+        "survey_interval_seconds": survey_interval_seconds,
+        "lifecycle_state": "ADMITTED",
+        "owner_kind": "CONDUCTOR",
+        "owner_session_id": None,
+        "unverified_session_id": None,
+        "collector_instance_id": collector_instance,
+        "collector_generation": collector_generation,
+        "collector_fingerprint": collector_fingerprint,
+        "next_full_survey_at": render_time(
+            now + timedelta(seconds=survey_interval_seconds)
+        ),
+        "last_checked_at": now_text,
+        "active_trigger": None,
+        "pending_due_trigger": None,
+        "recent_triggers": history,
+        "session_observed_at": None,
+        "session_status": "NONE",
+        "reason_code": "BASELINE",
+        "handoff_ref": None,
+        "handoff_digest": None,
+        "report_ref": None,
+        "report_digest": None,
+        "retention_code": "RETAIN",
+        "state_digest": "0" * 64,
+    }
+    state["state_digest"] = state_digest(state)
+    return state
+
+
+def require_private_directory(path: Path, *, create: bool) -> None:
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            ancestor = current.lstat()
+        except FileNotFoundError:
+            break
+        except OSError as exc:
+            raise ControllerError("cannot inspect state directory ancestry") from exc
+        if stat.S_ISLNK(ancestor.st_mode):
+            raise ControllerError("state directory ancestry is unsafe")
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        if not create:
+            raise ControllerError("state directory is missing")
+        try:
+            path.mkdir(mode=0o700, parents=True, exist_ok=False)
+            path.chmod(0o700)
+            info = path.lstat()
+        except (FileExistsError, OSError) as exc:
+            raise ControllerError("cannot create private state directory") from exc
+    except OSError as exc:
+        raise ControllerError("cannot inspect state directory") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ControllerError("state directory type is unsafe")
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        raise ControllerError("state directory permissions are unsafe")
+
+
+def require_private_regular(path: Path) -> os.stat_result | None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ControllerError("cannot inspect state file") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ControllerError("state file type is unsafe")
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600:
+        raise ControllerError("state file permissions are unsafe")
+    if info.st_size > MAX_STATE_BYTES:
+        raise ControllerError("state exceeds size limit")
+    return info
+
+
+def read_private_file(path: Path, expected: os.stat_result) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ControllerError("cannot open state") from exc
+    try:
+        current = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino)
+        ):
+            raise ControllerError("state changed during open")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(65_536, MAX_STATE_BYTES + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_STATE_BYTES:
+                raise ControllerError("state exceeds size limit")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except OSError as exc:
+        raise ControllerError("cannot read state") from exc
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def state_lock(path: Path) -> Iterator[None]:
+    require_private_directory(path.parent, create=True)
+    lock_path = path.with_name(path.name + ".lock")
+    existing = require_private_regular(lock_path)
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise ControllerError("cannot open state lock") from exc
+    try:
+        current = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_uid != os.geteuid()
+            or stat.S_IMODE(current.st_mode) != 0o600
+        ):
+            raise ControllerError("state lock is unsafe")
+        if existing is not None and (
+            existing.st_dev,
+            existing.st_ino,
+        ) != (current.st_dev, current.st_ino):
+            raise ControllerError("state lock changed during open")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise BusyError("controller is already running") from exc
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def load_state(
+    path: Path,
+    *,
+    host_alias: str,
+    profile_alias: str,
+    survey_interval_seconds: int,
+) -> dict[str, Any] | None:
+    existing = require_private_regular(path)
+    if existing is None:
+        return None
+    raw = read_private_file(path, existing)
+    return validate_state(
+        parse_json_bytes(raw),
+        host_alias=host_alias,
+        profile_alias=profile_alias,
+        survey_interval_seconds=survey_interval_seconds,
+    )
+
+
+def load_collector_checkpoint(path: Path) -> dict[str, Any]:
+    existing = require_private_regular(path)
+    if existing is None:
+        raise ControllerError("collector checkpoint is missing")
+    snapshot = exact_object(
+        parse_json_bytes(read_private_file(path, existing)),
+        {
+            "format_version",
+            "collector_instance_id",
+            "generation",
+            "observations",
+            "candidates",
+            "fingerprint",
+        },
+        "collector checkpoint",
+    )
+    version = snapshot["format_version"]
+    if isinstance(version, bool) or not isinstance(version, int) or version != EVENT_VERSION:
+        raise ControllerError("unsupported collector checkpoint")
+    instance = validate_collector_instance_id(
+        snapshot["collector_instance_id"], "collector checkpoint instance ID"
+    )
+    generation = bounded_generation(
+        snapshot["generation"], "collector checkpoint generation"
+    )
+    fingerprint = bounded_string(
+        snapshot["fingerprint"], 64, "collector checkpoint fingerprint"
+    )
+    if HEX_64_RE.fullmatch(fingerprint) is None:
+        raise ControllerError("invalid collector checkpoint fingerprint")
+    if not isinstance(snapshot["observations"], dict) or not isinstance(
+        snapshot["candidates"], list
+    ):
+        raise ControllerError("invalid collector checkpoint payload")
+    return {
+        "collector_instance_id": instance,
+        "generation": generation,
+        "fingerprint": fingerprint,
+    }
+
+
+class AtomicWriter:
+    def __init__(self, fail_stage: str | None) -> None:
+        self.fail_stage = fail_stage
+        self.used_failure = False
+
+    def write(self, path: Path, state: dict[str, Any]) -> None:
+        state["state_digest"] = state_digest(state)
+        validate_state(
+            state,
+            host_alias=state["host_alias"],
+            profile_alias=state["profile_alias"],
+            survey_interval_seconds=state["survey_interval_seconds"],
+        )
+        payload = (
+            json.dumps(state, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+        ).encode("ascii")
+        if len(payload) > MAX_STATE_BYTES:
+            raise StateWriteNotVerified("state exceeds size limit")
+        require_private_directory(path.parent, create=False)
+        require_private_regular(path)
+        fail_stage = None if self.used_failure else self.fail_stage
+        descriptor = -1
+        temporary: str | None = None
+        replaced = False
+        try:
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+            )
+            os.fchmod(descriptor, 0o600)
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("short write")
+                view = view[written:]
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            if fail_stage == "before-replace":
+                self.used_failure = True
+                raise StateWriteNotVerified("injected pre-replace failure")
+            os.replace(temporary, path)
+            temporary = None
+            replaced = True
+            if fail_stage == "after-replace":
+                self.used_failure = True
+                raise StateWriteNotVerified("injected post-replace failure")
+            directory_fd = os.open(
+                path.parent,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            current = path.lstat()
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_uid != os.geteuid()
+                or stat.S_IMODE(current.st_mode) != 0o600
+            ):
+                raise StateWriteNotVerified("post-write state verification failed")
+        except StateWriteNotVerified:
+            raise
+        except OSError as exc:
+            message = "state durability unknown" if replaced else "state write failed"
+            raise StateWriteNotVerified(message) from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+
+
+def run_bounded(
+    argv: list[str], *, timeout: float, stdin: bytes | None = None
+) -> subprocess.CompletedProcess[bytes]:
+    try:
+        result = subprocess.run(
+            argv,
+            input=stdin,
+            stdin=None if stdin is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=timeout,
+            shell=False,
+        )
+    except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired, OSError) as exc:
+        raise CommandFailure("command unavailable") from exc
+    if len(result.stdout) > MAX_COMMAND_BYTES or len(result.stderr) > MAX_COMMAND_BYTES:
+        raise CommandFailure("command output exceeded bound")
+    return result
+
+
+def validate_candidate(item: Any, *, changed: bool) -> None:
+    fields = (
+        {"id", "old_reason_codes", "new_reason_codes"}
+        if changed
+        else {"id", "kind", "reason_codes"}
+    )
+    candidate = exact_object(item, fields, "event candidate")
+    bounded_string(candidate["id"], 128, "candidate ID")
+    if changed:
+        lists = (candidate["old_reason_codes"], candidate["new_reason_codes"])
+    else:
+        if candidate["kind"] not in EVENT_KINDS:
+            raise ControllerError("invalid candidate kind")
+        lists = (candidate["reason_codes"],)
+    for reasons in lists:
+        if not isinstance(reasons, list) or not reasons:
+            raise ControllerError("invalid event reasons")
+        rendered = []
+        for reason in reasons:
+            token = bounded_string(reason, 64, "event reason")
+            if TOKEN_RE.fullmatch(token) is None:
+                raise ControllerError("invalid event reason")
+            rendered.append(token)
+        if rendered != sorted(set(rendered)):
+            raise ControllerError("noncanonical event reasons")
+
+
+def validate_change_event(raw: bytes) -> dict[str, Any]:
+    event = exact_object(
+        parse_json_bytes(raw),
+        {
+            "event_version",
+            "event_type",
+            "collector_instance_id",
+            "old_generation",
+            "new_generation",
+            "old_fingerprint",
+            "new_fingerprint",
+            "changes",
+            "health_transitions",
+        },
+        "collector event",
+    )
+    if (
+        isinstance(event["event_version"], bool)
+        or not isinstance(event["event_version"], int)
+        or event["event_version"] != EVENT_VERSION
+        or event["event_type"] != "MAINTENANCE_CHANGE"
+    ):
+        raise ControllerError("unsupported collector event")
+    validate_collector_instance_id(
+        event["collector_instance_id"], "collector instance ID"
+    )
+    old_generation = bounded_generation(event["old_generation"], "old generation")
+    new_generation = bounded_generation(event["new_generation"], "new generation")
+    if new_generation != old_generation + 1:
+        raise ControllerError("collector generations are not consecutive")
+    for field in ("old_fingerprint", "new_fingerprint"):
+        value = bounded_string(event[field], 64, field)
+        if HEX_64_RE.fullmatch(value) is None:
+            raise ControllerError("invalid collector fingerprint")
+    if event["old_fingerprint"] == event["new_fingerprint"]:
+        raise ControllerError("collector fingerprints did not change")
+    changes = exact_object(
+        event["changes"], {"added", "changed", "removed"}, "event changes"
+    )
+    for field in ("added", "removed"):
+        if not isinstance(changes[field], list):
+            raise ControllerError("invalid event candidates")
+        for item in changes[field]:
+            validate_candidate(item, changed=False)
+    if not isinstance(changes["changed"], list):
+        raise ControllerError("invalid changed candidates")
+    for item in changes["changed"]:
+        validate_candidate(item, changed=True)
+    transitions = event["health_transitions"]
+    if not isinstance(transitions, list):
+        raise ControllerError("invalid health transitions")
+    for raw_transition in transitions:
+        transition = exact_object(
+            raw_transition, {"id", "old", "new"}, "health transition"
+        )
+        bounded_string(transition["id"], 64, "filesystem ID")
+        if transition["old"] not in HEALTH_BANDS or transition["new"] not in HEALTH_BANDS:
+            raise ControllerError("invalid filesystem band")
+    if not any(changes[field] for field in ("added", "changed", "removed")) and not transitions:
+        raise ControllerError("collector event contains no change evidence")
+    return event
+
+
+def event_trigger(event: dict[str, Any]) -> dict[str, Any]:
+    material = (
+        "COLLECTOR_CHANGE\0"
+        + event["collector_instance_id"]
+        + "\0"
+        + str(event["old_generation"])
+        + "\0"
+        + str(event["new_generation"])
+        + "\0"
+        + event["old_fingerprint"]
+        + "\0"
+        + event["new_fingerprint"]
+    ).encode("ascii")
+    trigger_digest = digest(material)
+    return {
+        "id": f"change:{trigger_digest}",
+        "digest": trigger_digest,
+        "kind": "COLLECTOR_CHANGE",
+        "disposition": "CLAIMED",
+        "claimed_at": "1970-01-01T00:00:00Z",
+    }
+
+
+def survey_trigger(
+    *, host_alias: str, profile_alias: str, due_at: str
+) -> dict[str, Any]:
+    material = f"FULL_SURVEY\0{host_alias}\0{profile_alias}\0{due_at}".encode("ascii")
+    trigger_digest = digest(material)
+    return {
+        "id": f"survey:{trigger_digest}",
+        "digest": trigger_digest,
+        "kind": "FULL_SURVEY",
+        "disposition": "CLAIMED",
+        "claimed_at": "1970-01-01T00:00:00Z",
+    }
+
+
+def run_collector(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
+    command = [
+        args.collector,
+        "--state",
+        str(args.collector_state),
+        "--profile",
+        args.profile,
+        "--agent-deck",
+        args.agent_deck,
+        "--git",
+        args.git,
+        "--warn-percent",
+        str(args.warn_percent),
+        "--critical-percent",
+        str(args.critical_percent),
+    ]
+    for repository in args.repo:
+        command.extend(["--repo", repository])
+    for filesystem in args.filesystem:
+        command.extend(["--filesystem", filesystem])
+    try:
+        result = run_bounded(command, timeout=args.collector_timeout)
+    except CommandFailure:
+        return None, None, "COLLECTOR_FAILED"
+    if result.returncode in (0, 20):
+        expected_stderr = b"" if result.returncode == 0 else b"STATUS: COLLECTION_DEGRADED\n"
+        if result.stdout or result.stderr != expected_stderr:
+            return None, None, "COLLECTOR_EVENT_INVALID"
+        try:
+            checkpoint = load_collector_checkpoint(args.collector_state)
+        except ControllerError:
+            return None, None, "COLLECTOR_EVENT_INVALID"
+        return None, checkpoint, None
+    if result.returncode not in (10, 30):
+        return None, None, "COLLECTOR_FAILED"
+    expected_stderr = b"" if result.returncode == 10 else b"STATUS: COLLECTION_DEGRADED\n"
+    if result.stderr != expected_stderr:
+        return None, None, "COLLECTOR_EVENT_INVALID"
+    if len(result.stdout.splitlines()) != 1:
+        return None, None, "COLLECTOR_EVENT_INVALID"
+    try:
+        event = validate_change_event(result.stdout)
+        checkpoint = load_collector_checkpoint(args.collector_state)
+    except ControllerError:
+        return None, None, "COLLECTOR_EVENT_INVALID"
+    if checkpoint != {
+        "collector_instance_id": event["collector_instance_id"],
+        "generation": event["new_generation"],
+        "fingerprint": event["new_fingerprint"],
+    }:
+        return None, None, "COLLECTOR_EVENT_INVALID"
+    return event, checkpoint, None
+
+
+def parse_json_command(raw: bytes) -> dict[str, Any]:
+    value = parse_json_bytes(raw)
+    if not isinstance(value, dict):
+        raise ControllerError("invalid command response")
+    return value
+
+
+def poll_owner(args: argparse.Namespace, owner: str) -> str:
+    command = [args.agent_deck, "-p", args.profile, "session", "show", owner, "--json"]
+    try:
+        result = run_bounded(command, timeout=args.agent_timeout)
+    except CommandFailure as exc:
+        raise ControllerError("owner poll failed") from exc
+    if result.returncode != 0:
+        raise ControllerError("owner poll failed")
+    payload = parse_json_command(result.stdout)
+    if payload.get("id") != owner:
+        raise ControllerError("owner identity mismatch")
+    raw_status = payload.get("status")
+    if not isinstance(raw_status, str) or raw_status not in SESSION_STATUS_MAP:
+        raise ControllerError("owner status unknown")
+    raw_substate = payload.get("substate", "")
+    if not isinstance(raw_substate, str) or raw_substate not in SESSION_SUBSTATES:
+        raise ControllerError("owner substate unknown")
+    return SESSION_STATUS_MAP[raw_status]
+
+
+def read_charter(path: Path) -> str:
+    try:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise OSError("unsafe charter")
+        if info.st_size > MAX_CHARTER_BYTES:
+            raise OSError("charter too large")
+        raw = path.read_bytes()
+        if len(raw) > MAX_CHARTER_BYTES:
+            raise OSError("charter too large")
+        return raw.decode("utf-8", errors="strict")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ControllerError("charter unavailable") from exc
+
+
+def prompt_for_trigger(
+    args: argparse.Namespace, trigger: dict[str, Any], *, include_charter: bool
+) -> bytes:
+    lines = []
+    if include_charter:
+        lines.append(read_charter(args.charter).rstrip())
+        lines.append("")
+    else:
+        lines.append("Continue under the report-only fleet custodian charter already loaded.")
+    lines.extend(
+        [
+            "MAINTENANCE_TRIGGER_VERSION: 1",
+            f"TRIGGER_ID: {trigger['id']}",
+            f"TRIGGER_KIND: {trigger['kind']}",
+            f"HOST_ALIAS: {args.host_alias}",
+            f"PROFILE_ALIAS: {args.profile}",
+            "The event body is intentionally unavailable. Fetch current evidence yourself.",
+            "Configured repository roots (transient scope only): "
+            + json.dumps(args.repo, ensure_ascii=True),
+            "Configured filesystem roots (transient scope only): "
+            + json.dumps(args.filesystem, ensure_ascii=True),
+        ]
+    )
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def update_trigger(
+    state: dict[str, Any], trigger_id: str, disposition: str
+) -> None:
+    if disposition not in TRIGGER_DISPOSITIONS:
+        raise ControllerError("invalid trigger transition")
+    updated = None
+    for item in state["recent_triggers"]:
+        if item["id"] == trigger_id:
+            item["disposition"] = disposition
+            updated = dict(item)
+            break
+    if updated is None:
+        raise ControllerError("trigger is missing")
+    state["active_trigger"] = updated
+
+
+def remember_trigger(state: dict[str, Any], trigger: dict[str, Any]) -> None:
+    if any(item["id"] == trigger["id"] for item in state["recent_triggers"]):
+        raise ControllerError("trigger already exists")
+    state["recent_triggers"].append(dict(trigger))
+    if len(state["recent_triggers"]) > MAX_HISTORY:
+        protected_ids = {
+            item["id"]
+            for item in (state["active_trigger"], state["pending_due_trigger"])
+            if item is not None
+        }
+        newest_unprotected = [
+            item
+            for item in reversed(state["recent_triggers"])
+            if item["id"] not in protected_ids
+        ][: MAX_HISTORY - len(protected_ids)]
+        retained_ids = protected_ids | {item["id"] for item in newest_unprotected}
+        state["recent_triggers"] = [
+            item for item in state["recent_triggers"] if item["id"] in retained_ids
+        ]
+
+
+def launch_custodian(
+    args: argparse.Namespace,
+    state: dict[str, Any],
+    trigger: dict[str, Any],
+    now_text: str,
+    writer: AtomicWriter,
+) -> int:
+    try:
+        prompt = prompt_for_trigger(args, trigger, include_charter=True)
+    except ControllerError:
+        update_trigger(state, trigger["id"], "NOT_VERIFIED")
+        state["lifecycle_state"] = "ESCALATED"
+        state["reason_code"] = "CHARTER_UNAVAILABLE"
+        writer.write(args.state, state)
+        return EXIT_NOT_VERIFIED
+    command = [
+        args.agent_deck,
+        "-p",
+        args.profile,
+        "launch",
+        args.workdir,
+        "--no-parent",
+        "--cmd",
+        "codex --dangerously-bypass-approvals-and-sandbox",
+        "--effort",
+        "xhigh",
+        "--title",
+        "fleet-custodian",
+        "--message-file",
+        "-",
+        "--json",
+    ]
+    try:
+        result = run_bounded(command, timeout=args.agent_timeout, stdin=prompt)
+    except CommandFailure:
+        result = None
+    if result is None or result.returncode != 0:
+        update_trigger(state, trigger["id"], "NOT_VERIFIED")
+        state["lifecycle_state"] = "ESCALATED"
+        state["reason_code"] = "LAUNCH_NOT_VERIFIED"
+        writer.write(args.state, state)
+        return EXIT_NOT_VERIFIED
+    try:
+        payload = parse_json_command(result.stdout)
+        owner = payload.get("session_id")
+        if payload.get("success") is not True:
+            raise ControllerError("launch did not report success")
+        if not isinstance(owner, str) or SESSION_ID_RE.fullmatch(owner) is None:
+            raise ControllerError("launch omitted immutable ID")
+        legacy_id = payload.get("id")
+        if legacy_id is not None and legacy_id != owner:
+            raise ControllerError("launch IDs disagree")
+    except ControllerError:
+        update_trigger(state, trigger["id"], "NOT_VERIFIED")
+        state["lifecycle_state"] = "ESCALATED"
+        state["reason_code"] = "LAUNCH_NOT_VERIFIED"
+        writer.write(args.state, state)
+        return EXIT_NOT_VERIFIED
+
+    state["unverified_session_id"] = owner
+    state["reason_code"] = "LAUNCH_ID_UNVERIFIED"
+    writer.write(args.state, state)
+    try:
+        observed = poll_owner(args, owner)
+    except ControllerError:
+        update_trigger(state, trigger["id"], "NOT_VERIFIED")
+        state["lifecycle_state"] = "ESCALATED"
+        state["session_status"] = "UNKNOWN"
+        state["session_observed_at"] = now_text
+        state["reason_code"] = "OWNER_NOT_VERIFIED"
+        writer.write(args.state, state)
+        return EXIT_NOT_VERIFIED
+
+    state["owner_kind"] = "SESSION"
+    state["owner_session_id"] = owner
+    state["unverified_session_id"] = None
+    state["lifecycle_state"] = "ACTIVE"
+    state["session_status"] = observed
+    state["session_observed_at"] = now_text
+    update_trigger(state, trigger["id"], "SUBMITTED")
+    if observed in {"ERROR", "STOPPED"}:
+        state["lifecycle_state"] = "ESCALATED"
+        state["reason_code"] = "OWNER_TERMINAL_UNVERIFIED"
+        writer.write(args.state, state)
+        return EXIT_NOT_VERIFIED
+    state["reason_code"] = "TRIGGER_SUBMITTED"
+    writer.write(args.state, state)
+    return EXIT_OK
+
+
+def wake_owner(
+    args: argparse.Namespace,
+    state: dict[str, Any],
+    trigger: dict[str, Any],
+    writer: AtomicWriter,
+) -> int:
+    owner = state["owner_session_id"]
+    if not isinstance(owner, str):
+        raise ControllerError("missing verified owner")
+    try:
+        prompt = prompt_for_trigger(args, trigger, include_charter=False)
+        result = run_bounded(
+            [
+                args.agent_deck,
+                "-p",
+                args.profile,
+                "session",
+                "send",
+                owner,
+                "--message-file",
+                "-",
+                "--json",
+                "--timeout",
+                f"{int(args.agent_timeout)}s",
+            ],
+            timeout=args.agent_timeout + 5,
+            stdin=prompt,
+        )
+        if result.returncode != 0:
+            raise ControllerError("delivery command failed")
+        payload = parse_json_command(result.stdout)
+        if (
+            payload.get("success") is not True
+            or payload.get("session_id") != owner
+            or payload.get("delivery") != "submitted"
+            or payload.get("skipped") is True
+        ):
+            raise ControllerError("delivery was not verified")
+    except (CommandFailure, ControllerError):
+        update_trigger(state, trigger["id"], "NOT_VERIFIED")
+        state["lifecycle_state"] = "ESCALATED"
+        state["reason_code"] = "DELIVERY_NOT_VERIFIED"
+        writer.write(args.state, state)
+        return EXIT_NOT_VERIFIED
+    update_trigger(state, trigger["id"], "SUBMITTED")
+    state["reason_code"] = "TRIGGER_SUBMITTED"
+    writer.write(args.state, state)
+    return EXIT_OK
+
+
+def claim_trigger(
+    state: dict[str, Any], trigger: dict[str, Any], *, now_text: str
+) -> None:
+    claimed = dict(trigger)
+    claimed["claimed_at"] = now_text
+    claimed["disposition"] = "CLAIMED"
+    existing = [
+        item for item in state["recent_triggers"] if item["id"] == claimed["id"]
+    ]
+    if existing:
+        if (
+            len(existing) != 1
+            or state["pending_due_trigger"] is None
+            or existing[0] != state["pending_due_trigger"]
+        ):
+            raise ControllerError("trigger claim is not pending")
+        existing[0].update(claimed)
+        state["pending_due_trigger"] = None
+    else:
+        remember_trigger(state, claimed)
+    state["active_trigger"] = dict(claimed)
+    state["reason_code"] = "TRIGGER_CLAIMED"
+    state["last_checked_at"] = now_text
+
+
+def process_tick(args: argparse.Namespace, writer: AtomicWriter) -> int:
+    now, now_text = current_time(args.now)
+    interval_seconds = args.full_survey_hours * 3600
+    with state_lock(args.state):
+        state = load_state(
+            args.state,
+            host_alias=args.host_alias,
+            profile_alias=args.profile,
+            survey_interval_seconds=interval_seconds,
+        )
+        event, checkpoint, collector_error = run_collector(args)
+        if collector_error is not None:
+            if state is not None and collector_error != "COLLECTOR_EVENT_INVALID":
+                state["last_checked_at"] = now_text
+                state["reason_code"] = collector_error
+                writer.write(args.state, state)
+            raise CommandFailure(collector_error)
+
+        event_candidate = event_trigger(event) if event is not None else None
+        if checkpoint is None:
+            raise CommandFailure("COLLECTOR_EVENT_INVALID")
+        if state is None:
+            state = new_state(
+                host_alias=args.host_alias,
+                profile_alias=args.profile,
+                survey_interval_seconds=interval_seconds,
+                now=now,
+                now_text=now_text,
+                baseline_trigger=event_candidate,
+                collector_instance=checkpoint["collector_instance_id"],
+                collector_generation=checkpoint["generation"],
+                collector_fingerprint=checkpoint["fingerprint"],
+            )
+            writer.write(args.state, state)
+            return EXIT_OK
+
+        if event is None:
+            checkpoint_is_current = checkpoint == {
+                "collector_instance_id": state["collector_instance_id"],
+                "generation": state["collector_generation"],
+                "fingerprint": state["collector_fingerprint"],
+            }
+        else:
+            checkpoint_is_current = (
+                event["collector_instance_id"] == state["collector_instance_id"]
+                and event["old_generation"] == state["collector_generation"]
+                and event["new_generation"] == event["old_generation"] + 1
+                and event["old_fingerprint"] == state["collector_fingerprint"]
+            )
+        if not checkpoint_is_current:
+            raise CommandFailure("COLLECTOR_EVENT_INVALID")
+
+        state["last_checked_at"] = now_text
+        active = state["active_trigger"]
+        if active is not None and active["disposition"] == "CLAIMED":
+            state["lifecycle_state"] = "ESCALATED"
+            state["reason_code"] = "CLAIM_RECOVERY_REQUIRED"
+            writer.write(args.state, state)
+            return EXIT_NOT_VERIFIED
+
+        observed = "NONE"
+        if state["owner_kind"] == "SESSION":
+            owner = state["owner_session_id"]
+            try:
+                observed = poll_owner(args, owner)
+            except ControllerError:
+                state["lifecycle_state"] = "ESCALATED"
+                state["session_status"] = "UNKNOWN"
+                state["session_observed_at"] = now_text
+                state["reason_code"] = "OWNER_NOT_VERIFIED"
+                writer.write(args.state, state)
+                return EXIT_NOT_VERIFIED
+            state["session_status"] = observed
+            state["session_observed_at"] = now_text
+            if observed in {"ERROR", "STOPPED"}:
+                state["lifecycle_state"] = "ESCALATED"
+                state["reason_code"] = "OWNER_TERMINAL_UNVERIFIED"
+                writer.write(args.state, state)
+                return EXIT_NOT_VERIFIED
+
+        if state["lifecycle_state"] == "ESCALATED":
+            writer.write(args.state, state)
+            return EXIT_NOT_VERIFIED
+
+        is_pending_due = False
+        if event_candidate is not None:
+            if any(
+                item["id"] == event_candidate["id"]
+                for item in state["recent_triggers"]
+            ):
+                raise CommandFailure("COLLECTOR_EVENT_INVALID")
+            state["collector_generation"] = event["new_generation"]
+            state["collector_fingerprint"] = event["new_fingerprint"]
+
+        trigger = None
+        if state["pending_due_trigger"] is not None:
+            trigger = dict(state["pending_due_trigger"])
+            is_pending_due = True
+            if event_candidate is not None:
+                coalesced = dict(event_candidate)
+                coalesced["claimed_at"] = now_text
+                coalesced["disposition"] = "COALESCED_FULL_SURVEY"
+                remember_trigger(state, coalesced)
+        elif event_candidate is not None:
+            trigger = event_candidate
+        else:
+            due_at = state["next_full_survey_at"]
+            if now >= parse_rfc3339(due_at, "next full survey"):
+                trigger = survey_trigger(
+                    host_alias=args.host_alias,
+                    profile_alias=args.profile,
+                    due_at=due_at,
+                )
+        if trigger is None:
+            state["reason_code"] = "NO_TRIGGER"
+            writer.write(args.state, state)
+            return EXIT_OK
+
+        if not is_pending_due and any(
+            item["id"] == trigger["id"] for item in state["recent_triggers"]
+        ):
+            state["reason_code"] = "DUPLICATE_TRIGGER"
+            writer.write(args.state, state)
+            return EXIT_OK
+
+        if state["owner_kind"] == "SESSION" and observed in {"RUNNING", "QUEUED"}:
+            if trigger["kind"] == "FULL_SURVEY":
+                if not is_pending_due:
+                    pending = dict(trigger)
+                    pending["claimed_at"] = now_text
+                    pending["disposition"] = "PENDING"
+                    remember_trigger(state, pending)
+                    state["pending_due_trigger"] = dict(pending)
+                state["reason_code"] = "DUE_PENDING_OWNER"
+            else:
+                deferred = dict(trigger)
+                deferred["claimed_at"] = now_text
+                deferred["disposition"] = "DEFERRED_ACTIVE_OWNER"
+                remember_trigger(state, deferred)
+                state["reason_code"] = "ACTIVE_OWNER"
+            writer.write(args.state, state)
+            return EXIT_OK
+
+        if trigger["kind"] == "FULL_SURVEY":
+            due_at = parse_rfc3339(
+                state["next_full_survey_at"], "next full survey"
+            )
+            state["next_full_survey_at"] = render_time(
+                due_at + timedelta(seconds=interval_seconds)
+            )
+        claim_trigger(state, trigger, now_text=now_text)
+        writer.write(args.state, state)
+        if args.test_stop_after_claim:
+            return EXIT_TEST_INTERRUPTED
+        if state["owner_kind"] == "SESSION":
+            return wake_owner(args, state, trigger, writer)
+        return launch_custodian(args, state, trigger, now_text, writer)
+
+
+def absolute_path(value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path.absolute()
+
+
+def default_state_path(name: str) -> Path:
+    raw = os.environ.get("XDG_STATE_HOME")
+    base = Path(raw) if raw else Path.home() / ".local" / "state"
+    return base / "agent-deck" / name
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Single-writer hourly maintenance control tick. Unchanged ticks start no agent "
+            "turn; every custodian result is report-only and never cleanup authority."
+        )
+    )
+    parser.add_argument("--state", help="private host-local controller state")
+    parser.add_argument("--collector-state", help="private collector snapshot")
+    parser.add_argument(
+        "--collector", default="agent-deck-maintenance-collector", help="collector executable"
+    )
+    parser.add_argument("--agent-deck", default="agent-deck", help="Agent Deck executable")
+    parser.add_argument("--git", default="git", help="git executable for the collector")
+    parser.add_argument("--charter", required=True, help="report-only custodian charter")
+    parser.add_argument("--workdir", required=True, help="custodian launch directory")
+    parser.add_argument("--host-alias", required=True, help="bounded declared host alias")
+    parser.add_argument("--profile", default="default", help="Agent Deck profile alias")
+    parser.add_argument("--repo", action="append", default=[], help="collector repository root")
+    parser.add_argument(
+        "--filesystem", action="append", default=None, help="collector filesystem root"
+    )
+    parser.add_argument("--warn-percent", type=int, default=80)
+    parser.add_argument("--critical-percent", type=int, default=90)
+    parser.add_argument("--full-survey-hours", type=int, default=24)
+    parser.add_argument("--collector-timeout", type=float, default=120.0)
+    parser.add_argument("--agent-timeout", type=float, default=600.0)
+    parser.add_argument("--now", help="inject an RFC3339 UTC clock for deterministic tests")
+    parser.add_argument(
+        "--test-fail-write",
+        choices=("before-replace", "after-replace"),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--test-stop-after-claim", action="store_true", help=argparse.SUPPRESS)
+    return parser
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if ALIAS_RE.fullmatch(args.host_alias) is None or ALIAS_RE.fullmatch(args.profile) is None:
+        raise ControllerError("invalid host or profile alias")
+    if (
+        isinstance(args.full_survey_hours, bool)
+        or not 1 <= args.full_survey_hours <= 8_760
+        or isinstance(args.warn_percent, bool)
+        or isinstance(args.critical_percent, bool)
+        or not 0 <= args.warn_percent < args.critical_percent <= 100
+    ):
+        raise ControllerError("invalid threshold or survey interval")
+    for timeout in (args.collector_timeout, args.agent_timeout):
+        if not math.isfinite(timeout) or timeout <= 0 or timeout > 3_600:
+            raise ControllerError("invalid command timeout")
+    args.state = absolute_path(
+        args.state or str(default_state_path("maintenance-controller.json"))
+    )
+    args.collector_state = absolute_path(
+        args.collector_state or str(default_state_path("maintenance-collector.json"))
+    )
+    args.charter = absolute_path(args.charter)
+    args.workdir = str(absolute_path(args.workdir))
+    if not Path(args.workdir).is_dir():
+        raise ControllerError("work directory is unavailable")
+    args.repo = [str(absolute_path(value)) for value in args.repo]
+    args.filesystem = [
+        str(absolute_path(value)) for value in (args.filesystem or ["/"])
+    ]
+    all_paths = [args.workdir, *args.repo, *args.filesystem]
+    if any(len(value) > PATH_LIMIT or "\x00" in value for value in all_paths):
+        raise ControllerError("configured path is invalid")
+    if len(args.repo) != len(set(args.repo)) or len(args.filesystem) != len(
+        set(args.filesystem)
+    ):
+        raise ControllerError("duplicate configured path")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        validate_args(args)
+        writer = AtomicWriter(args.test_fail_write)
+        return process_tick(args, writer)
+    except BusyError:
+        sys.stderr.write("STATUS: CONTROLLER_BUSY\n")
+        return EXIT_BUSY
+    except StateWriteNotVerified:
+        sys.stderr.write("ERROR: STATE_WRITE_NOT_VERIFIED\n")
+        return EXIT_STATE_ERROR
+    except CommandFailure as exc:
+        error = (
+            "COLLECTOR_EVENT_INVALID"
+            if str(exc) == "COLLECTOR_EVENT_INVALID"
+            else "COLLECTOR_FAILED"
+        )
+        sys.stderr.write(f"ERROR: {error}\n")
+        return EXIT_COLLECTOR_FAILED
+    except ControllerError:
+        sys.stderr.write("ERROR: INVALID_STATE_OR_INPUT\n")
+        return EXIT_STATE_ERROR
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

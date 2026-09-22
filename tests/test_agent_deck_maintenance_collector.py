@@ -20,6 +20,7 @@ REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "private_dot_local/bin/executable_agent-deck-maintenance-collector"
 MAX_INPUT_BYTES = 4_194_304
 MAX_STATE_BYTES = 1_048_576
+MAX_GENERATION = 9_223_372_036_854_775_807
 
 
 def session(
@@ -166,7 +167,9 @@ class CollectorCase(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "")
         state = self.read_state()
-        self.assertEqual(state["format_version"], 1)
+        self.assertEqual(state["format_version"], 2)
+        self.assertRegex(state["collector_instance_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(state["generation"], 0)
         self.assertEqual(state["candidates"], [])
         self.assertEqual(stat.S_IMODE(self.state.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(self.root.stat().st_mode), 0o700)
@@ -213,25 +216,45 @@ class CollectorCase(unittest.TestCase):
 
     def test_candidate_add_change_and_remove_each_emit_one_event(self) -> None:
         self.assertEqual(self.run_collector(fixture()).returncode, 0)
+        baseline = self.read_state()
+        instance_id = baseline["collector_instance_id"]
 
         added = self.run_collector(fixture(sessions=[session(status="error", substate="")]))
         self.assertEqual(added.returncode, 10, added.stderr)
         add_event = self.event(added)
+        self.assertEqual(add_event["event_version"], 2)
         self.assertEqual(add_event["event_type"], "MAINTENANCE_CHANGE")
+        self.assertEqual(add_event["collector_instance_id"], instance_id)
+        self.assertEqual(add_event["old_generation"], 0)
+        self.assertEqual(add_event["new_generation"], 1)
         self.assertEqual(len(add_event["changes"]["added"]), 1)
         self.assertEqual(add_event["changes"]["removed"], [])
         self.assertNotEqual(add_event["old_fingerprint"], add_event["new_fingerprint"])
+        first_changed = self.read_state()
+        self.assertEqual(first_changed["collector_instance_id"], instance_id)
+        self.assertEqual(first_changed["generation"], 1)
+
+        stable = self.run_collector(
+            fixture(sessions=[session(status="error", substate="")])
+        )
+        self.assertEqual(stable.returncode, 0, stable.stderr)
+        self.assertEqual(stable.stdout, "")
+        self.assertEqual(self.read_state(), first_changed)
 
         changed = self.run_collector(
             fixture(sessions=[session(status="waiting", substate="auth-401")])
         )
         self.assertEqual(changed.returncode, 10, changed.stderr)
         change_event = self.event(changed)
+        self.assertEqual(change_event["old_generation"], 1)
+        self.assertEqual(change_event["new_generation"], 2)
         self.assertEqual(len(change_event["changes"]["changed"]), 1)
 
         removed = self.run_collector(fixture())
         self.assertEqual(removed.returncode, 10, removed.stderr)
         remove_event = self.event(removed)
+        self.assertEqual(remove_event["old_generation"], 2)
+        self.assertEqual(remove_event["new_generation"], 3)
         self.assertEqual(remove_event["changes"]["added"], [])
         self.assertEqual(len(remove_event["changes"]["removed"]), 1)
 
@@ -362,6 +385,18 @@ class CollectorCase(unittest.TestCase):
         wrong_type = dict(valid)
         wrong_type["format_version"] = True
         invalid_states.append(json.dumps(wrong_type))
+        for version in (1, 3):
+            wrong_version = dict(valid)
+            wrong_version["format_version"] = version
+            invalid_states.append(json.dumps(wrong_version))
+        for instance_id in (None, "0" * 31, "G" * 32):
+            wrong_identity = dict(valid)
+            wrong_identity["collector_instance_id"] = instance_id
+            invalid_states.append(json.dumps(wrong_identity))
+        for generation in (True, -1, MAX_GENERATION + 1, "0"):
+            wrong_generation = dict(valid)
+            wrong_generation["generation"] = generation
+            invalid_states.append(json.dumps(wrong_generation))
         nested_wrong_type = json.loads(json.dumps(valid))
         nested_wrong_type["observations"]["agent_deck"]["status"] = []
         invalid_states.append(json.dumps(nested_wrong_type))
@@ -375,8 +410,8 @@ class CollectorCase(unittest.TestCase):
         ]
         self.recompute_fingerprint(fabricated_candidate)
         invalid_states.append(json.dumps(fabricated_candidate))
-        invalid_states.append('{"format_version":1,"format_version":1}')
-        invalid_states.append('{"format_version":1,"observations":NaN}')
+        invalid_states.append('{"format_version":2,"format_version":2}')
+        invalid_states.append('{"format_version":2,"observations":NaN}')
 
         for raw in invalid_states:
             with self.subTest(raw=raw[:40]):
@@ -395,6 +430,22 @@ class CollectorCase(unittest.TestCase):
         broad = self.run_collector(fixture())
         self.assertEqual(broad.returncode, 70)
         self.assertEqual(broad.stdout, "")
+
+    def test_generation_overflow_rejects_change_without_rewrite_or_event(self) -> None:
+        self.assertEqual(self.run_collector(fixture()).returncode, 0)
+        state = self.read_state()
+        state["generation"] = MAX_GENERATION
+        self.state.write_text(json.dumps(state), encoding="utf-8")
+        self.state.chmod(0o600)
+        before = self.state.read_bytes()
+
+        result = self.run_collector(
+            fixture(sessions=[session(status="error", substate="")])
+        )
+        self.assertEqual(result.returncode, 70)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "ERROR: INVALID_STATE\n")
+        self.assertEqual(self.state.read_bytes(), before)
 
     def test_atomic_failures_emit_no_event_or_success_claim(self) -> None:
         self.assertEqual(self.run_collector(fixture()).returncode, 0)
@@ -447,10 +498,13 @@ class CollectorCase(unittest.TestCase):
             set(event),
             {
                 "changes",
+                "collector_instance_id",
                 "event_type",
                 "event_version",
                 "health_transitions",
+                "new_generation",
                 "new_fingerprint",
+                "old_generation",
                 "old_fingerprint",
             },
         )

@@ -8,6 +8,7 @@ in {
   # Import shell configuration
   imports = [
     ./agent-cli-updates.nix
+    ./agent-deck-maintenance.nix
     ./shell/fish.nix
   ];
 

@@ -1,0 +1,817 @@
+#!/usr/bin/env python3
+"""Offline, behavior-based qualification for an Agent Deck source tree."""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from typing import Any
+
+
+PASS = "PASS"
+FAIL = "FAIL"
+NOT_VERIFIED = "NOT_VERIFIED"
+EXIT_BY_VERDICT = {PASS: 0, FAIL: 1, NOT_VERIFIED: 2}
+REQUIRED_SOURCE_PATHS = (
+    "go.mod",
+    "cmd/agent-deck",
+    "internal/tmux/detector.go",
+    "internal/session/conductor_bridge.py",
+)
+SANDBOX_ENV_PATHS = (
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "GOCACHE",
+    "GOTMPDIR",
+    "AGENT_DECK_CONDUCTOR_DIR",
+    "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR",
+    "XDG_RUNTIME_DIR",
+)
+BUSY_TEST_IDS = (
+    "TestReleaseQualificationCodexBusyProvenance",
+    "TestReleaseQualificationCodexBusyProvenance/quoted_status_phrase_is_prose",
+    "TestReleaseQualificationCodexBusyProvenance/parenthesized_phrase_in_prose_is_not_status",
+    "TestReleaseQualificationCodexBusyProvenance/valid_occurrence_after_quoted_occurrence_is_busy",
+    "TestReleaseQualificationCodexBusyProvenance/repeated_valid_statuses_remain_busy",
+)
+EXPECTED_RUNTIME_CASE_IDS = (
+    "metadata-selected-codex",
+    "missing-meta.json",
+    "malformed",
+    "unreadable",
+    "invalid_utf8",
+    "invalid_runtime",
+)
+
+
+class CommandResult:
+    def __init__(
+        self,
+        *,
+        returncode: int | None,
+        stdout: str = "",
+        stderr: str = "",
+        problem: str | None = None,
+        elapsed_seconds: float = 0.0,
+    ) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.problem = problem
+        self.elapsed_seconds = round(elapsed_seconds, 3)
+
+
+def _inside(root: Path, path: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+    except ValueError:
+        return False
+    return True
+
+
+def _write_json(payload: dict[str, Any]) -> None:
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _fixture_dir() -> Path:
+    override = os.environ.get("AGENT_DECK_RELEASE_QUALIFICATION_FIXTURES", "")
+    if override:
+        return Path(override).expanduser().resolve()
+    script = Path(__file__).resolve()
+    return script.parent.parent / "share" / "agent-deck-release-qualification"
+
+
+def _run(
+    argv: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout: float,
+    stdin: str | None = None,
+) -> CommandResult:
+    started = time.monotonic()
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=cwd,
+            env=env,
+            input=stdin,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        return CommandResult(
+            returncode=None,
+            problem=f"missing executable: {exc.filename}",
+            elapsed_seconds=time.monotonic() - started,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return CommandResult(
+            returncode=None,
+            stdout=exc.stdout or "",
+            stderr=exc.stderr or "",
+            problem=f"timed out after {timeout:g}s",
+            elapsed_seconds=time.monotonic() - started,
+        )
+    return CommandResult(
+        returncode=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+        elapsed_seconds=time.monotonic() - started,
+    )
+
+
+def _source_issues(source: Path) -> list[str]:
+    issues: list[str] = []
+    if not source.is_dir():
+        return ["candidate source is not a directory"]
+    for relative in REQUIRED_SOURCE_PATHS:
+        if not (source / relative).exists():
+            issues.append(f"candidate source lacks {relative}")
+    return issues
+
+
+def _copy_source(source: Path, destination: Path) -> None:
+    ignored = shutil.ignore_patterns(
+        ".git",
+        ".worktrees",
+        "node_modules",
+        "build",
+        "dist",
+        ".next",
+    )
+    shutil.copytree(source, destination, symlinks=True, ignore=ignored)
+    for path in destination.rglob("*"):
+        if path.is_symlink() and not _inside(destination, path):
+            raise ValueError(f"candidate contains escaping symlink: {path.relative_to(destination)}")
+
+
+def _safe_extract_tar(archive: Path, destination: Path) -> None:
+    destination.mkdir(parents=True)
+    with tarfile.open(archive, mode="r:") as bundle:
+        for member in bundle.getmembers():
+            target = destination / member.name
+            if not _inside(destination, target):
+                raise ValueError(f"archive member escapes candidate tree: {member.name}")
+            if member.issym():
+                link_target = target.parent / member.linkname
+                if not _inside(destination, link_target):
+                    raise ValueError(f"archive link escapes candidate tree: {member.name}")
+            if member.islnk():
+                link_target = destination / member.linkname
+                if not _inside(destination, link_target):
+                    raise ValueError(f"archive link escapes candidate tree: {member.name}")
+        bundle.extractall(destination, filter="data")
+
+
+def _materialize_candidate(
+    args: argparse.Namespace,
+    *,
+    root: Path,
+    env: dict[str, str],
+) -> tuple[Path | None, dict[str, Any], str | None]:
+    destination = root / "candidate"
+    if args.source:
+        source = Path(args.source).expanduser().resolve()
+        issues = _source_issues(source)
+        if issues:
+            return None, {"kind": "source-tree", "issues": issues}, "; ".join(issues)
+        try:
+            _copy_source(source, destination)
+        except (OSError, ValueError) as exc:
+            return None, {"kind": "source-tree"}, f"could not copy candidate: {exc}"
+        identity = {"kind": "source-tree", "label": source.name}
+        return destination, identity, None
+
+    repo = Path(args.repo).expanduser().resolve()
+    ref = args.ref
+    resolve = _run(
+        [args.git, "-C", str(repo), "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"],
+        cwd=root,
+        env=env,
+        timeout=args.timeout_seconds,
+    )
+    if resolve.problem:
+        return None, {"kind": "git-ref", "ref": ref}, resolve.problem
+    commit = resolve.stdout.strip()
+    if resolve.returncode != 0 or not re.fullmatch(r"[0-9a-fA-F]{40,64}", commit):
+        detail = (resolve.stderr or resolve.stdout).strip()
+        return None, {"kind": "git-ref", "ref": ref}, f"could not resolve candidate ref: {detail}"
+
+    archive = root / "candidate.tar"
+    archived = _run(
+        [args.git, "-C", str(repo), "archive", "--format=tar", f"--output={archive}", commit],
+        cwd=root,
+        env=env,
+        timeout=args.timeout_seconds,
+    )
+    if archived.problem:
+        return None, {"kind": "git-ref", "ref": ref, "commit": commit}, archived.problem
+    if archived.returncode != 0:
+        return None, {"kind": "git-ref", "ref": ref, "commit": commit}, "git archive failed"
+    try:
+        _safe_extract_tar(archive, destination)
+    except (OSError, tarfile.TarError, ValueError) as exc:
+        return None, {"kind": "git-ref", "ref": ref, "commit": commit}, f"archive extraction failed: {exc}"
+    issues = _source_issues(destination)
+    if issues:
+        return None, {"kind": "git-ref", "ref": ref, "commit": commit}, "; ".join(issues)
+    return destination, {"kind": "git-ref", "ref": ref, "commit": commit.lower()}, None
+
+
+def _sandbox_env(root: Path, original_env: dict[str, str], go_mod_cache: str) -> dict[str, str]:
+    paths = {
+        "HOME": root / "home",
+        "XDG_CONFIG_HOME": root / "xdg" / "config",
+        "XDG_DATA_HOME": root / "xdg" / "data",
+        "XDG_STATE_HOME": root / "xdg" / "state",
+        "XDG_CACHE_HOME": root / "xdg" / "cache",
+        "TMPDIR": root / "tmp",
+        "TMP": root / "tmp",
+        "TEMP": root / "tmp",
+        "GOCACHE": root / "go" / "build-cache",
+        "GOTMPDIR": root / "go" / "tmp",
+        "AGENT_DECK_CONDUCTOR_DIR": root / "conductor",
+        "CODEX_HOME": root / "home" / ".codex",
+        "CLAUDE_CONFIG_DIR": root / "home" / ".claude",
+        "XDG_RUNTIME_DIR": root / "xdg" / "runtime",
+    }
+    for path in set(paths.values()):
+        path.mkdir(parents=True, exist_ok=True)
+
+    def is_test_helper(name: str) -> bool:
+        upper = name.upper()
+        return (
+            "TEST_HELPER" in upper
+            or upper.startswith("GO_WANT_HELPER")
+            or upper.endswith("_HELPER")
+            or upper.endswith("_HELPER_PROCESS")
+        )
+
+    env = {key: value for key, value in original_env.items() if not is_test_helper(key)}
+    env.update({key: str(value) for key, value in paths.items()})
+    env.update(
+        {
+            "AGENT_DECK_TASK_ROOT": str(root),
+            "AGENTDECK_SKIP_UPDATE_CHECK": "1",
+            "AGENTDECK_PROFILE": "default",
+            "GOPROXY": "off",
+            "GOSUMDB": "off",
+            "GOTOOLCHAIN": "local",
+            "GOMODCACHE": go_mod_cache,
+            "GOENV": "off",
+            "GOFLAGS": "",
+            "GOWORK": "off",
+            "AGENT_DECK_ALLOW_OUTER_TMUX": "0",
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={root / 'no-session-bus'}",
+        }
+    )
+    escaped = [key for key in SANDBOX_ENV_PATHS if not _inside(root, Path(env[key]))]
+    if escaped:
+        raise ValueError(f"sandbox paths escape task root: {', '.join(escaped)}")
+    return env
+
+
+def _gate(name: str, verdict: str, summary: str, **details: Any) -> dict[str, Any]:
+    result: dict[str, Any] = {"name": name, "verdict": verdict, "summary": summary}
+    if details:
+        result["details"] = details
+    return result
+
+
+def _parse_busy_go_test_json(output: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Require positive go-test JSON proof for every injected test and subtest."""
+    lines = [line for line in output.splitlines() if line.strip()]
+    if not lines:
+        return None, "busy probe produced no JSON events"
+    events: list[dict[str, Any]] = []
+    for line_number, line in enumerate(lines, start=1):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            return None, f"busy probe JSON line {line_number} is malformed: {exc}"
+        if not isinstance(event, dict) or not isinstance(event.get("Action"), str):
+            return None, f"busy probe JSON line {line_number} is not a Go test event"
+        events.append(event)
+
+    package_starts = [
+        event["Package"]
+        for event in events
+        if event.get("Action") == "start" and isinstance(event.get("Package"), str)
+    ]
+    if len(package_starts) != 1:
+        return None, "busy probe did not start exactly one Go package"
+    package = package_starts[0]
+    expected = set(BUSY_TEST_IDS)
+    test_events = [event for event in events if isinstance(event.get("Test"), str)]
+    if any(event.get("Package") != package for event in test_events):
+        return None, "busy probe test events came from an unexpected Go package"
+    if {event["Test"] for event in test_events} != expected:
+        return None, "busy probe emitted events for unexpected or incomplete test IDs"
+    run_counts = Counter(
+        event.get("Test")
+        for event in events
+        if event.get("Action") == "run" and isinstance(event.get("Test"), str)
+    )
+    terminal = Counter()
+    failed: list[str] = []
+    skipped: list[str] = []
+    for event in events:
+        test_id = event.get("Test")
+        action = event.get("Action")
+        if not isinstance(test_id, str) or action not in ("pass", "fail", "skip"):
+            continue
+        terminal[test_id] += 1
+        if action == "fail":
+            failed.append(test_id)
+        elif action == "skip":
+            skipped.append(test_id)
+
+    if set(run_counts) != expected or any(run_counts[test_id] != 1 for test_id in expected):
+        return None, "busy probe did not run every exact injected test exactly once"
+    unexpected_terminal = set(terminal) - expected
+    if unexpected_terminal:
+        return None, "busy probe emitted unexpected test results"
+    if any(terminal[test_id] != 1 for test_id in expected):
+        return None, "busy probe did not finish every exact injected test exactly once"
+    if skipped:
+        return None, f"busy probe skipped required test(s): {', '.join(sorted(skipped))}"
+
+    package_actions = [
+        event.get("Action")
+        for event in events
+        if event.get("Package") == package and "Test" not in event and event.get("Action") in ("pass", "fail")
+    ]
+    expected_package_action = "fail" if failed else "pass"
+    if package_actions != [expected_package_action]:
+        return None, "busy probe package result is missing or inconsistent"
+    return (
+        {
+            "package": package,
+            "passed_tests": [test_id for test_id in BUSY_TEST_IDS if test_id not in failed],
+            "failed_tests": [test_id for test_id in BUSY_TEST_IDS if test_id in failed],
+        },
+        None,
+    )
+
+
+def _busy_gate(
+    candidate: Path,
+    fixture_dir: Path,
+    args: argparse.Namespace,
+    env: dict[str, str],
+) -> dict[str, Any]:
+    probe = fixture_dir / "codex_busy_probe_test.go"
+    if not probe.is_file():
+        return _gate("codex_busy_provenance", NOT_VERIFIED, "busy-provenance fixture is unavailable")
+    target = candidate / "internal" / "tmux" / "release_qualification_probe_test.go"
+    shutil.copyfile(probe, target)
+    try:
+        result = _run(
+            [
+                args.go,
+                "test",
+                "-json",
+                "-count=1",
+                "-run",
+                "^TestReleaseQualificationCodexBusyProvenance$",
+                "./internal/tmux",
+            ],
+            cwd=candidate,
+            env=env,
+            timeout=args.timeout_seconds,
+        )
+    finally:
+        target.unlink(missing_ok=True)
+    if result.problem:
+        return _gate("codex_busy_provenance", NOT_VERIFIED, result.problem)
+    proof, error = _parse_busy_go_test_json(result.stdout)
+    if error or proof is None:
+        return _gate(
+            "codex_busy_provenance",
+            NOT_VERIFIED,
+            error or "busy probe did not produce positive proof",
+            returncode=result.returncode,
+            tail=(result.stdout + result.stderr)[-1200:],
+        )
+    if proof["failed_tests"]:
+        return _gate(
+            "codex_busy_provenance",
+            FAIL,
+            "candidate behavior failed the Codex busy-provenance contract",
+            failed_tests=proof["failed_tests"],
+            elapsed_seconds=result.elapsed_seconds,
+        )
+    if result.returncode != 0:
+        return _gate(
+            "codex_busy_provenance",
+            NOT_VERIFIED,
+            "busy probe passed but Go exited unsuccessfully",
+            returncode=result.returncode,
+        )
+    return _gate(
+        "codex_busy_provenance",
+        PASS,
+        "quoted prose stays idle while a later valid repeated phrase stays busy",
+        passed_tests=proof["passed_tests"],
+        elapsed_seconds=result.elapsed_seconds,
+    )
+
+
+def _write_stub(path: Path, body: str) -> None:
+    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def _materialization_gate(
+    candidate: Path,
+    root: Path,
+    args: argparse.Namespace,
+    env: dict[str, str],
+) -> tuple[dict[str, Any], Path | None]:
+    binary = root / "bin" / "agent-deck"
+    binary.parent.mkdir()
+    built = _run(
+        [args.go, "build", "-trimpath", "-o", str(binary), "./cmd/agent-deck"],
+        cwd=candidate,
+        env=env,
+        timeout=args.timeout_seconds,
+    )
+    if built.problem:
+        return _gate("candidate_bridge_materialization", NOT_VERIFIED, built.problem), None
+    if built.returncode != 0 or not binary.is_file():
+        return (
+            _gate(
+                "candidate_bridge_materialization",
+                NOT_VERIFIED,
+                "candidate executable could not be built",
+                returncode=built.returncode,
+                tail=(built.stdout + built.stderr)[-1200:],
+            ),
+            None,
+        )
+
+    stubs = root / "stubs"
+    stubs.mkdir()
+    _write_stub(stubs / "python3", "exit 1\n")
+    _write_stub(stubs / "pip3", "exit 1\n")
+    _write_stub(stubs / "systemctl", "exit 1\n")
+    setup_env = dict(env)
+    setup_env["PATH"] = os.pathsep.join([str(stubs), os.environ.get("PATH", "/usr/bin:/bin")])
+    config_dir = Path(env["XDG_CONFIG_HOME"]) / "agent-deck"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config = config_dir / "config.toml"
+    config.write_text(
+        "[conductor]\n"
+        f'dir = {json.dumps(env["AGENT_DECK_CONDUCTOR_DIR"])}\n'
+        "heartbeat_interval = 0\n"
+        "[conductor.slack]\n"
+        'bot_token = "fixture-bot-token"\n'
+        'app_token = "fixture-app-token"\n'
+        'channel_id = "fixture-channel"\n',
+        encoding="utf-8",
+    )
+    materialized = Path(env["AGENT_DECK_CONDUCTOR_DIR"]) / "bridge.py"
+    materialized.parent.mkdir(parents=True, exist_ok=True)
+    sentinel = b"older installed bridge fixture\n"
+    materialized.write_bytes(sentinel)
+    setup = _run(
+        [str(binary), "conductor", "setup", "qualification", "--agent", "codex", "--no-heartbeat", "--json"],
+        cwd=root,
+        env=setup_env,
+        timeout=args.timeout_seconds,
+        stdin="\n",
+    )
+    if setup.problem:
+        return _gate("candidate_bridge_materialization", NOT_VERIFIED, setup.problem), None
+    if setup.returncode != 0:
+        return (
+            _gate(
+                "candidate_bridge_materialization",
+                NOT_VERIFIED,
+                "isolated candidate setup did not complete",
+                returncode=setup.returncode,
+                tail=(setup.stdout + setup.stderr)[-1200:],
+            ),
+            None,
+        )
+    if not materialized.is_file():
+        return _gate("candidate_bridge_materialization", FAIL, "candidate setup did not materialize bridge.py"), None
+    actual = materialized.read_bytes()
+    expected = (candidate / "internal" / "session" / "conductor_bridge.py").read_bytes()
+    if actual == sentinel:
+        return _gate("candidate_bridge_materialization", FAIL, "candidate retained the older bridge"), None
+    if actual != expected:
+        return (
+            _gate(
+                "candidate_bridge_materialization",
+                FAIL,
+                "materialized bridge does not correspond to the candidate source",
+                materialized_sha256=hashlib.sha256(actual).hexdigest(),
+                candidate_sha256=hashlib.sha256(expected).hexdigest(),
+            ),
+            None,
+        )
+    return (
+        _gate(
+            "candidate_bridge_materialization",
+            PASS,
+            "candidate executable replaced the older bridge with its own embedded bridge",
+            sha256=hashlib.sha256(actual).hexdigest(),
+            elapsed_seconds=round(built.elapsed_seconds + setup.elapsed_seconds, 3),
+        ),
+        materialized,
+    )
+
+
+def _validate_runtime_document(value: Any) -> str | None:
+    if not isinstance(value, dict) or set(value) != {"verdict", "summary", "cases"}:
+        return "runtime probe verdict document has the wrong fields"
+    verdict = value.get("verdict")
+    if verdict not in (PASS, FAIL, NOT_VERIFIED):
+        return "runtime probe emitted an invalid verdict"
+    if not isinstance(value.get("summary"), str) or not value["summary"].strip():
+        return "runtime probe summary is missing"
+    cases = value.get("cases")
+    if not isinstance(cases, list) or not cases:
+        return "runtime probe cases are missing"
+    names: list[str] = []
+    passed: list[bool] = []
+    for case in cases:
+        if not isinstance(case, dict) or set(case) != {"name", "passed"}:
+            return "runtime probe case has the wrong fields"
+        if not isinstance(case.get("name"), str) or type(case.get("passed")) is not bool:
+            return "runtime probe case has invalid field types"
+        names.append(case["name"])
+        passed.append(case["passed"])
+    if Counter(names) != Counter(EXPECTED_RUNTIME_CASE_IDS) or len(names) != len(EXPECTED_RUNTIME_CASE_IDS):
+        return "runtime probe case IDs are incomplete, duplicated, or unexpected"
+    all_passed = all(passed)
+    if verdict == PASS and not all_passed:
+        return "runtime probe PASS contradicts a failed case"
+    if verdict == FAIL and all_passed:
+        return "runtime probe FAIL contradicts all passing cases"
+    if verdict == NOT_VERIFIED:
+        return "runtime probe did not produce verified behavioral evidence"
+    return None
+
+
+def _parse_probe_json(output: str) -> tuple[dict[str, Any] | None, str | None]:
+    marker = "AGENT_DECK_RELEASE_QUALIFICATION="
+    lines = [line[len(marker) :] for line in output.splitlines() if line.startswith(marker)]
+    if len(lines) != 1:
+        return None, "runtime probe emitted missing or ambiguous structured output"
+    try:
+        value = json.loads(lines[0])
+    except json.JSONDecodeError as exc:
+        return None, f"runtime probe emitted malformed JSON: {exc}"
+    error = _validate_runtime_document(value)
+    if error:
+        return None, error
+    return value, None
+
+
+def _runtime_gate(
+    bridge: Path | None,
+    fixture_dir: Path,
+    candidate: Path,
+    root: Path,
+    args: argparse.Namespace,
+    env: dict[str, str],
+) -> dict[str, Any]:
+    if bridge is None:
+        return _gate(
+            "conductor_runtime_recreation",
+            NOT_VERIFIED,
+            "candidate bridge was not authoritatively materialized",
+        )
+    probe = fixture_dir / "runtime_recreation_probe.py"
+    if not probe.is_file():
+        return _gate("conductor_runtime_recreation", NOT_VERIFIED, "runtime fixture is unavailable")
+    probe_env = dict(env)
+    probe_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    result = _run(
+        [sys.executable, "-I", str(probe), str(bridge)],
+        cwd=candidate,
+        env=probe_env,
+        timeout=args.timeout_seconds,
+    )
+    if result.problem:
+        return _gate("conductor_runtime_recreation", NOT_VERIFIED, result.problem)
+    document, error = _parse_probe_json(result.stdout)
+    if error:
+        return _gate(
+            "conductor_runtime_recreation",
+            NOT_VERIFIED,
+            error,
+            returncode=result.returncode,
+            tail=(result.stdout + result.stderr)[-1200:],
+        )
+    if result.returncode != 0 and document["verdict"] != NOT_VERIFIED:
+        return _gate(
+            "conductor_runtime_recreation",
+            NOT_VERIFIED,
+            "runtime probe exit status contradicted its structured verdict",
+            returncode=result.returncode,
+        )
+    return _gate(
+        "conductor_runtime_recreation",
+        document["verdict"],
+        document.get("summary", "runtime recreation probe completed"),
+        cases=document.get("cases", []),
+        elapsed_seconds=result.elapsed_seconds,
+    )
+
+
+def _overall(checks: list[dict[str, Any]]) -> str:
+    verdicts = {check["verdict"] for check in checks}
+    if NOT_VERIFIED in verdicts:
+        return NOT_VERIFIED
+    if FAIL in verdicts:
+        return FAIL
+    return PASS
+
+
+def _self_test() -> int:
+    failures: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="agent-deck-release-qualification-self-test.") as tmp:
+        root = Path(tmp)
+        if _source_issues(root) == []:
+            failures.append("invalid source control was accepted")
+        document, error = _parse_probe_json("instrument noise")
+        if document is not None or error is None:
+            failures.append("malformed instrument output was accepted")
+        env = dict(os.environ)
+        missing = _run([str(root / "missing-tool")], cwd=root, env=env, timeout=1)
+        if missing.problem is None:
+            failures.append("missing tool control was accepted")
+        timed = _run(
+            [sys.executable, "-c", "import time; time.sleep(1)"],
+            cwd=root,
+            env=env,
+            timeout=0.01,
+        )
+        if timed.problem is None or "timed out" not in timed.problem:
+            failures.append("timeout instrument control was accepted")
+        outside = root.parent / "escape"
+        if _inside(root, outside):
+            failures.append("path escape control was accepted")
+    verdict = FAIL if failures else PASS
+    _write_json(
+        {
+            "schema_version": 1,
+            "verdict": verdict,
+            "summary": "self-test controls passed" if not failures else "self-test controls failed",
+            "failures": failures,
+        }
+    )
+    return EXIT_BY_VERDICT[verdict]
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Qualify an Agent Deck source tree without deployment or live state access."
+    )
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--source", help="explicit prepared candidate source tree")
+    source.add_argument("--repo", help="local Git repository containing --ref")
+    parser.add_argument("--ref", help="immutable tag or commit to archive from --repo")
+    parser.add_argument("--go", default="go", help="Go executable (default: go)")
+    parser.add_argument("--git", default="git", help="Git executable (default: git)")
+    parser.add_argument("--go-mod-cache", help="prewarmed module cache used with GOPROXY=off")
+    parser.add_argument("--timeout-seconds", type=float, default=600.0)
+    parser.add_argument("--keep-workdir", action="store_true")
+    parser.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
+    return parser
+
+
+def main() -> int:
+    args = _parser().parse_args()
+    if args.self_test:
+        return _self_test()
+    if not args.source and not args.repo:
+        _write_json({"schema_version": 1, "verdict": NOT_VERIFIED, "summary": "use --source or --repo with --ref"})
+        return EXIT_BY_VERDICT[NOT_VERIFIED]
+    if args.repo and not args.ref:
+        _write_json({"schema_version": 1, "verdict": NOT_VERIFIED, "summary": "--repo requires --ref"})
+        return EXIT_BY_VERDICT[NOT_VERIFIED]
+    if args.source and args.ref:
+        _write_json({"schema_version": 1, "verdict": NOT_VERIFIED, "summary": "--ref is only valid with --repo"})
+        return EXIT_BY_VERDICT[NOT_VERIFIED]
+    if args.timeout_seconds <= 0:
+        _write_json({"schema_version": 1, "verdict": NOT_VERIFIED, "summary": "timeout must be positive"})
+        return EXIT_BY_VERDICT[NOT_VERIFIED]
+
+    original_env = dict(os.environ)
+    go_path = shutil.which(args.go)
+    git_path = shutil.which(args.git)
+    required = [("go", go_path)] + ([("git", git_path)] if args.repo else [])
+    missing = [name for name, path in required if path is None]
+    if missing:
+        _write_json(
+            {
+                "schema_version": 1,
+                "verdict": NOT_VERIFIED,
+                "summary": f"missing required tool(s): {', '.join(missing)}",
+            }
+        )
+        return EXIT_BY_VERDICT[NOT_VERIFIED]
+    args.go = go_path
+    if git_path:
+        args.git = git_path
+
+    go_mod_cache = args.go_mod_cache
+    if not go_mod_cache:
+        _write_json(
+            {
+                "schema_version": 1,
+                "verdict": NOT_VERIFIED,
+                "summary": "--go-mod-cache is required for offline qualification",
+            }
+        )
+        return EXIT_BY_VERDICT[NOT_VERIFIED]
+    go_mod_cache_path = Path(go_mod_cache).expanduser().resolve()
+    if not go_mod_cache_path.is_dir():
+        _write_json(
+            {
+                "schema_version": 1,
+                "verdict": NOT_VERIFIED,
+                "summary": "the prewarmed Go module cache is unavailable",
+            }
+        )
+        return EXIT_BY_VERDICT[NOT_VERIFIED]
+
+    fixture_dir = _fixture_dir()
+    required_fixtures = ("codex_busy_probe_test.go", "runtime_recreation_probe.py")
+    unavailable = [name for name in required_fixtures if not (fixture_dir / name).is_file()]
+    if unavailable:
+        _write_json(
+            {
+                "schema_version": 1,
+                "verdict": NOT_VERIFIED,
+                "summary": f"missing fixture(s): {', '.join(unavailable)}",
+            }
+        )
+        return EXIT_BY_VERDICT[NOT_VERIFIED]
+
+    workdir = Path(tempfile.mkdtemp(prefix="agent-deck-release-qualification."))
+    try:
+        env = _sandbox_env(workdir, original_env, str(go_mod_cache_path))
+        candidate, identity, source_error = _materialize_candidate(args, root=workdir, env=env)
+        if source_error or candidate is None:
+            checks = [_gate("candidate_source", NOT_VERIFIED, source_error or "candidate unavailable")]
+        else:
+            checks = [_busy_gate(candidate, fixture_dir, args, env)]
+            materialization, bridge = _materialization_gate(candidate, workdir, args, env)
+            checks.append(materialization)
+            checks.append(_runtime_gate(bridge, fixture_dir, candidate, workdir, args, env))
+        verdict = _overall(checks)
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            "verdict": verdict,
+            "candidate": identity,
+            "offline": True,
+            "checks": checks,
+        }
+        if args.keep_workdir:
+            payload["retained_workdir"] = str(workdir)
+        _write_json(payload)
+        return EXIT_BY_VERDICT[verdict]
+    except Exception as exc:  # A harness fault is unavailable proof, never approval.
+        _write_json(
+            {
+                "schema_version": 1,
+                "verdict": NOT_VERIFIED,
+                "summary": f"qualification harness error: {type(exc).__name__}: {exc}",
+            }
+        )
+        return EXIT_BY_VERDICT[NOT_VERIFIED]
+    finally:
+        if not args.keep_workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

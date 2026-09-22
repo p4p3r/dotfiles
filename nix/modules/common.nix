@@ -160,8 +160,9 @@ in {
 
       echo "[postActivation] Installing global npm packages…"
       npm install -g @openai/codex || true
-      npm uninstall -g @zed-industries/codex-acp 2>/dev/null || true  # renamed -> @agentclientprotocol
+      npm uninstall -g @zed-industries/codex-acp 2>/dev/null || true      # renamed -> @agentclientprotocol
       npm install -g @agentclientprotocol/codex-acp || true
+      npm uninstall -g @zed-industries/claude-code-acp 2>/dev/null || true # renamed -> @agentclientprotocol
       npm install -g @agentclientprotocol/claude-agent-acp || true
 
       if [ ! -x "$HOME/.local/bin/claude" ]; then

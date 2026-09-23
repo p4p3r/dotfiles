@@ -267,6 +267,23 @@
         test -f "$service"
         test -f "$timer"
         ${pkgs.gnugrep}/bin/grep -F -- "--repo /project/100%%nice" "$service"
+        for directive in PrivateDevices ProtectClock ProtectKernelLogs ProtectKernelModules; do
+          if ${pkgs.gnugrep}/bin/grep -q "^$directive=" "$service"; then
+            echo "user service must not alter the capability bounding set via $directive" >&2
+            exit 1
+          fi
+        done
+        for setting in \
+          NoNewPrivileges=true \
+          ProtectControlGroups=true \
+          ProtectKernelTunables=true \
+          ProtectSystem=strict \
+          RestrictRealtime=true \
+          RestrictSUIDSGID=true \
+          LockPersonality=true \
+          SystemCallArchitectures=native; do
+          ${pkgs.gnugrep}/bin/grep -F -x -- "$setting" "$service"
+        done
         runtime_directory="$TMPDIR/systemd-runtime"
         mkdir -p "$runtime_directory"
         XDG_RUNTIME_DIR="$runtime_directory" \

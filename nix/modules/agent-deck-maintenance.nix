@@ -209,11 +209,12 @@ in
         StateDirectory = "agent-deck-maintenance";
         StateDirectoryMode = "0700";
         NoNewPrivileges = true;
-        PrivateDevices = true;
-        ProtectClock = true;
+        # These remain best-effort namespace protections in user managers.
+        # Do not add PrivateDevices, ProtectClock, ProtectKernelLogs, or
+        # ProtectKernelModules: systemd implements them by narrowing the
+        # capability bounding set, which an unprivileged user manager cannot
+        # do when usable user namespaces are unavailable.
         ProtectControlGroups = true;
-        ProtectKernelLogs = true;
-        ProtectKernelModules = true;
         ProtectKernelTunables = true;
         ProtectSystem = "strict";
         RestrictRealtime = true;

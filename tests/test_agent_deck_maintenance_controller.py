@@ -869,7 +869,7 @@ class ControllerCase(unittest.TestCase):
 
 
 class ModuleContractCase(unittest.TestCase):
-    def test_module_is_disabled_by_default_linux_only_and_hardened(self) -> None:
+    def test_module_is_disabled_by_default_linux_only_and_portably_hardened(self) -> None:
         text = MODULE.read_text(encoding="utf-8")
         self.assertIn("mkEnableOption", text)
         self.assertIn("pkgs.stdenv.isLinux", text)
@@ -877,7 +877,21 @@ class ModuleContractCase(unittest.TestCase):
         self.assertIn("Persistent = true", text)
         self.assertIn("UMask = \"0077\"", text)
         self.assertIn("NoNewPrivileges = true", text)
+        self.assertIn("ProtectControlGroups = true", text)
+        self.assertIn("ProtectKernelTunables = true", text)
         self.assertIn("ProtectSystem = \"strict\"", text)
+        self.assertIn("RestrictRealtime = true", text)
+        self.assertIn("RestrictSUIDSGID = true", text)
+        self.assertIn("LockPersonality = true", text)
+        self.assertIn('SystemCallArchitectures = "native"', text)
+        for directive in (
+            "PrivateDevices",
+            "ProtectClock",
+            "ProtectKernelLogs",
+            "ProtectKernelModules",
+        ):
+            with self.subTest(directive=directive):
+                self.assertNotIn(f"{directive} = true", text)
         self.assertIn("ConditionFileIsExecutable", text)
         self.assertIn("TimeoutStartSec", text)
         self.assertIn('lib.replaceStrings [ "%" ] [ "%%" ]', text)

@@ -170,10 +170,14 @@ programs.agent-deck-maintenance = {
 
 The resulting user timer runs hourly with overlap prevention in the controller. Its hardened
 oneshot has a private umask and state directory, explicit collector/Agent Deck/service timeouts,
-and no environment-file or secret projection. Enabling the module installs the exact controller,
-collector, and [report-only custodian charter](docs/agent-deck-fleet-custodian-charter.md) used by
-the unit. Nothing in this module activates cleanup: archive, delete, prune, stop, restart, cache
-reclamation, branch/worktree mutation, external writes, merge, and deploy remain forbidden.
+and no environment-file or secret projection. To remain portable across unprivileged user managers
+on hosts that restrict user namespaces, it intentionally omits `PrivateDevices`, `ProtectClock`,
+`ProtectKernelLogs`, and `ProtectKernelModules`; systemd implements each by narrowing the capability
+bounding set. The remaining process hardening stays enabled, while namespace protections remain
+best-effort according to host support. Enabling the module installs the exact controller, collector,
+and [report-only custodian charter](docs/agent-deck-fleet-custodian-charter.md) used by the unit.
+Nothing in this module activates cleanup: archive, delete, prune, stop, restart, cache reclamation,
+branch/worktree mutation, external writes, merge, and deploy remain forbidden.
 
 ## Architecture
 

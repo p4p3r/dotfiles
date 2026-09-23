@@ -116,9 +116,11 @@ bands. Its private host-local snapshot contains exact session IDs plus hashed re
 reason codes—never raw paths, titles, commands, branches, prompts, messages, transcripts, or
 provider bodies.
 
-The first valid run records a silent baseline. Later identical observations stay silent; a candidate
-add/remove/reason change or filesystem threshold-band transition emits exactly one compact JSON
-event. A candidate requests custodian inspection and never authorizes cleanup. The collector creates
+The first valid run records a silent baseline with a random fixed-format instance ID and generation
+zero. Later identical observations preserve both; each candidate add/remove/reason change or
+filesystem threshold-band transition increments the bounded generation once and emits exactly one
+compact JSON event carrying the instance ID and exact old/new generations. A candidate requests
+custodian inspection and never authorizes cleanup. The collector creates
 no timer and performs no archive, stop, delete, prune, GitHub, Linear, Slack, or other network action.
 
 Configure repositories with repeated `--repo PATH`; `/` is the default capacity target and repeated
@@ -126,6 +128,52 @@ Configure repositories with repeated `--repo PATH`; `/` is the default capacity 
 `$XDG_STATE_HOME/agent-deck/maintenance-collector.json` (or
 `~/.local/state/agent-deck/maintenance-collector.json`). `--fixture FILE` is the isolated strict-input
 mode used by tests. Scheduling and report-only custodian behavior are separate, later packets.
+
+## Report-only maintenance runtime
+
+`agent-deck-maintenance-controller` is the single-writer hourly control tick around the collector.
+Its first successful run records a baseline. Later unchanged and early ticks update only a bounded
+checked timestamp and start no agent turn. A strict collector event (exit `10` or `30`) or one due,
+durably unclaimed full-survey occurrence is claimed before the controller starts or wakes the one
+report-only custodian.
+
+The controller uses `agent-deck launch --json` and accepts only its explicit immutable
+`session_id`, verified by an exact `session show ID --json`. It never discovers an owner by title or
+global-list diff. A failed launch, mismatched or unknown exact-session observation, interrupted
+claim, or `session send` result without `delivery: submitted` remains visible as `NOT_VERIFIED` and
+never causes a replacement launch. Current Codex delivery can be reported as `unverified`; that is
+intentionally a fail-closed submission uncertainty, not a successful wake.
+
+Controller and collector state remain under the private local state directory. The controller file
+contains only a schema version, host/profile aliases, the current collector instance, generation,
+and fingerprint, stable trigger IDs and digests, bounded state and reason codes, UTC timestamps, an
+exact verified or unverified session ID, optional
+handoff/report references and digests, and a retention code. It never stores collector events,
+prompts, paths, titles, commands, branches, output, transcripts, provider bodies, arbitrary
+metadata, or secrets. Both files use owner-only modes, nonblocking single-writer locking, bounded
+strict JSON, atomic replacement, and file plus directory `fsync`.
+
+The generic Home Manager module is disabled by default and Linux-only. A host-specific layer may
+enable it without changing this public source:
+
+```nix
+programs.agent-deck-maintenance = {
+  enable = true;
+  hostAlias = "build-host";
+  profileAlias = "default";
+  workDirectory = "/home/example";
+  repositoryRoots = [ "/home/example/Code/project" ];
+  filesystemRoots = [ "/" ];
+  fullSurveyHours = 24;
+};
+```
+
+The resulting user timer runs hourly with overlap prevention in the controller. Its hardened
+oneshot has a private umask and state directory, explicit collector/Agent Deck/service timeouts,
+and no environment-file or secret projection. Enabling the module installs the exact controller,
+collector, and [report-only custodian charter](docs/agent-deck-fleet-custodian-charter.md) used by
+the unit. Nothing in this module activates cleanup: archive, delete, prune, stop, restart, cache
+reclamation, branch/worktree mutation, external writes, merge, and deploy remain forbidden.
 
 ## Architecture
 

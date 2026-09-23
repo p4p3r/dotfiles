@@ -237,6 +237,44 @@
         ];
       };
 
+    maintenanceRuntimeConfiguration = system:
+      home-manager.lib.homeManagerConfiguration {
+        pkgs = nixpkgs.legacyPackages.${system};
+        modules = [
+          ./modules/agent-deck-maintenance.nix
+          {
+            home.username = "maintenance-check";
+            home.homeDirectory = "/home/maintenance-check";
+            home.stateVersion = "24.05";
+            programs.agent-deck-maintenance = {
+              enable = true;
+              hostAlias = "maintenance-check";
+              workDirectory = "/home/maintenance-check";
+              repositoryRoots = [ "/project/100%nice" ];
+            };
+          }
+        ];
+      };
+
+    maintenanceRuntimeCheck = system:
+      let
+        pkgs = nixpkgs.legacyPackages.${system};
+        generation = (maintenanceRuntimeConfiguration system).activationPackage;
+      in
+      pkgs.runCommand "agent-deck-maintenance-runtime-check" { } ''
+        service="${generation}/home-files/.config/systemd/user/agent-deck-maintenance.service"
+        timer="${generation}/home-files/.config/systemd/user/agent-deck-maintenance.timer"
+        test -f "$service"
+        test -f "$timer"
+        ${pkgs.gnugrep}/bin/grep -F -- "--repo /project/100%%nice" "$service"
+        runtime_directory="$TMPDIR/systemd-runtime"
+        mkdir -p "$runtime_directory"
+        XDG_RUNTIME_DIR="$runtime_directory" \
+          ${pkgs.systemd}/bin/systemd-analyze verify \
+            --user --recursive-errors=no "$service" "$timer"
+        touch "$out"
+      '';
+
     # Linux profile list: from PROFILES env var when set
     # (e.g. `PROFILES=work home-manager switch --flake .#paper@linux --impure`).
     # Falls back to ["p4p3r"] for parity with mkHome's default.
@@ -281,6 +319,7 @@
 
       # Build the Linux Home Manager activation packages (does NOT switch)
       x86_64-linux.hm-build  = self.homeConfigurations."${username}@linux-x86_64".activationPackage;
+      x86_64-linux.maintenance-runtime = maintenanceRuntimeCheck "x86_64-linux";
       aarch64-linux.hm-build = self.homeConfigurations."${username}@linux-aarch64".activationPackage;
     };
 

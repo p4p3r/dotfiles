@@ -8,6 +8,8 @@ The gate exercises behavior rather than searching for implementation strings:
 
 - Codex pane classification rejects quoted `esc to interrupt` prose while
   accepting a later, structurally valid repeated occurrence.
+- Fresh local Codex launch accepts exactly one first turn, returns its exact
+  instance identity, and retains that identity when acceptance is uncertain.
 - A freshly recreated conductor uses the runtime selected by its metadata and
   refuses absent, malformed, unreadable, invalid-UTF-8, or unsupported metadata.
 - The candidate executable replaces an older bridge fixture, the resulting

@@ -70,8 +70,28 @@ ACCEPTANCE_ONLY_GATES = (
         "cmd/agent-deck/main.go",
         "acceptanceOnlyDiagnostics := acceptanceOnlyCommandRequested(os.Args[1:])",
     ),
+    (
+        "cmd/agent-deck/launch_cmd.go",
+        'fs.Bool("acceptance-only", false,',
+    ),
+    (
+        "cmd/agent-deck/launch_cmd.go",
+        "result := runFreshLaunchAcceptance(&liveFreshLaunchAcceptanceOps{",
+    ),
+    (
+        "cmd/agent-deck/launch_acceptance.go",
+        "target.SendKeysAndEnterPrivate(o.message)",
+    ),
+    (
+        "cmd/agent-deck/launch_acceptance.go",
+        "return retainFreshLaunchInstance(ops.AcceptedVerdict(delivery), instanceID)",
+    ),
 )
 
+ACCEPTANCE_ONLY_DIAGNOSTIC_BOUNDARY = (
+    "cmd/agent-deck/main.go",
+    "acceptanceOnlyDiagnostics := acceptanceOnlyCommandRequested(os.Args[1:])",
+)
 ACCEPTANCE_ONLY_STARTUP_PROBE = ("cmd/agent-deck/main.go", "ensureTmuxOnPath()")
 
 
@@ -317,7 +337,8 @@ update_agent_deck
             source = Path(temp) / "source"
             self._write_release_source(source)
             main_path, startup_probe = ACCEPTANCE_ONLY_STARTUP_PROBE
-            boundary = ACCEPTANCE_ONLY_GATES[-1][1]
+            boundary_path, boundary = ACCEPTANCE_ONLY_DIAGNOSTIC_BOUNDARY
+            self.assertEqual(main_path, boundary_path)
             main = source / main_path
             text = main.read_text(encoding="utf-8")
             main.write_text(

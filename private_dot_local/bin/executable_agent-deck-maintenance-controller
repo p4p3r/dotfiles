@@ -938,11 +938,29 @@ def parse_json_command(raw: bytes) -> dict[str, Any]:
     return value
 
 
-def validate_acceptance_result(raw: bytes, owner: str) -> None:
+def parse_acceptance_result(raw: bytes) -> dict[str, Any]:
     if len(raw) > MAX_ACCEPTANCE_BYTES:
         raise ControllerError("acceptance result is oversized")
+    payload = parse_json_bytes(raw)
+    if not isinstance(payload, dict):
+        raise ControllerError("acceptance result is not an object")
+    return payload
+
+
+def recover_acceptance_instance_id(raw: bytes) -> str | None:
+    try:
+        payload = parse_acceptance_result(raw)
+    except ControllerError:
+        return None
+    owner = payload.get("instance_id")
+    if not isinstance(owner, str) or SESSION_ID_RE.fullmatch(owner) is None:
+        return None
+    return owner
+
+
+def validate_acceptance_result(raw: bytes, owner: str) -> None:
     payload = exact_object(
-        parse_json_bytes(raw), ACCEPTANCE_FIELDS, "acceptance result"
+        parse_acceptance_result(raw), ACCEPTANCE_FIELDS, "acceptance result"
     )
     if (
         type(payload["schema_version"]) is not int
@@ -1122,38 +1140,39 @@ def launch_custodian(
         "xhigh",
         "--title",
         "fleet-custodian",
+        "--message-file",
+        "-",
+        "--acceptance-only",
         "--json",
     ]
     try:
-        result = run_bounded(command, timeout=args.agent_timeout)
+        result = run_bounded(
+            command,
+            timeout=args.agent_timeout + 30,
+            stdin=prompt,
+        )
     except CommandFailure:
         result = None
-    if result is None or result.returncode != 0:
-        update_trigger(state, trigger["id"], "NOT_VERIFIED")
-        state["lifecycle_state"] = "ESCALATED"
-        state["reason_code"] = "LAUNCH_NOT_VERIFIED"
+
+    owner = None if result is None else recover_acceptance_instance_id(result.stdout)
+    if owner is not None:
+        state["unverified_session_id"] = owner
+        state["reason_code"] = "LAUNCH_ID_UNVERIFIED"
         writer.write(args.state, state)
-        return EXIT_NOT_VERIFIED
+
     try:
-        payload = parse_json_command(result.stdout)
-        owner = payload.get("session_id")
-        if payload.get("success") is not True:
-            raise ControllerError("launch did not report success")
-        if not isinstance(owner, str) or SESSION_ID_RE.fullmatch(owner) is None:
-            raise ControllerError("launch omitted immutable ID")
-        legacy_id = payload.get("id")
-        if legacy_id is not None and legacy_id != owner:
-            raise ControllerError("launch IDs disagree")
+        if result is None or result.returncode != 0 or result.stderr or owner is None:
+            raise ControllerError("launch acceptance was not exact")
+        validate_acceptance_result(result.stdout, owner)
     except ControllerError:
         update_trigger(state, trigger["id"], "NOT_VERIFIED")
         state["lifecycle_state"] = "ESCALATED"
-        state["reason_code"] = "LAUNCH_NOT_VERIFIED"
+        state["reason_code"] = (
+            "DELIVERY_NOT_VERIFIED" if owner is not None else "LAUNCH_NOT_VERIFIED"
+        )
         writer.write(args.state, state)
         return EXIT_NOT_VERIFIED
 
-    state["unverified_session_id"] = owner
-    state["reason_code"] = "LAUNCH_ID_UNVERIFIED"
-    writer.write(args.state, state)
     try:
         observed = poll_owner(args, owner)
     except ControllerError:
@@ -1177,8 +1196,10 @@ def launch_custodian(
         state["reason_code"] = "OWNER_TERMINAL_UNVERIFIED"
         writer.write(args.state, state)
         return EXIT_NOT_VERIFIED
+    update_trigger(state, trigger["id"], "SUBMITTED")
+    state["reason_code"] = "TRIGGER_SUBMITTED"
     writer.write(args.state, state)
-    return submit_trigger(args, state, trigger, owner, prompt, writer)
+    return EXIT_OK
 
 
 def submit_trigger(

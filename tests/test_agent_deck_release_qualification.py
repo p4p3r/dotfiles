@@ -69,6 +69,9 @@ class ReleaseQualificationHarnessTest(unittest.TestCase):
         for relative in ("cmd/agent-deck", "internal/tmux", "internal/session"):
             (source / relative).mkdir(parents=True, exist_ok=True)
         (source / "go.mod").write_text("module fixture.invalid/agent-deck\n", encoding="utf-8")
+        (source / "cmd/agent-deck/launch_acceptance.go").write_text(
+            "package main\n", encoding="utf-8"
+        )
         (source / "internal/tmux/detector.go").write_text("package tmux\n", encoding="utf-8")
         (source / "internal/session/conductor_bridge.py").write_text("# fixture\n", encoding="utf-8")
         return source
@@ -120,8 +123,14 @@ class ReleaseQualificationHarnessTest(unittest.TestCase):
                 str(cache),
             )
         busy = next(check for check in payload["checks"] if check["name"] == "codex_busy_provenance")
+        launch = next(
+            check
+            for check in payload["checks"]
+            if check["name"] == "fresh_launch_acceptance"
+        )
         self.assertEqual(completed.returncode, 2, completed.stderr)
         self.assertEqual(busy["verdict"], "NOT_VERIFIED")
+        self.assertEqual(launch["verdict"], "NOT_VERIFIED")
 
     def test_busy_json_requires_every_exact_test_to_pass(self) -> None:
         with tempfile.TemporaryDirectory(prefix="busy-json-control.") as tmp:
@@ -153,6 +162,31 @@ class ReleaseQualificationHarnessTest(unittest.TestCase):
         proof, error = parse("\n".join(json.dumps(event) for event in skipped))
         self.assertIsNone(proof)
         self.assertIn(target, error)
+
+    def test_fresh_launch_json_requires_every_exact_test_to_pass(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="launch-json-control.") as tmp:
+            namespace = self.harness_namespace(Path(tmp))
+        parse = namespace["_parse_launch_go_test_json"]
+        expected = namespace["FRESH_LAUNCH_TEST_IDS"]
+        package = "fixture.invalid/agent-deck/cmd/agent-deck"
+
+        events = [{"Action": "start", "Package": package}]
+        for test_id in expected:
+            events.append({"Action": "run", "Package": package, "Test": test_id})
+            events.append({"Action": "pass", "Package": package, "Test": test_id})
+        events.append({"Action": "pass", "Package": package})
+        proof, error = parse("\n".join(json.dumps(event) for event in events))
+        self.assertIsNone(error)
+        self.assertEqual(proof["passed_tests"], list(expected))
+
+        missing = [
+            event
+            for event in events
+            if event.get("Test") != expected[-1]
+        ]
+        proof, error = parse("\n".join(json.dumps(event) for event in missing))
+        self.assertIsNone(proof)
+        self.assertIn("unexpected or incomplete", error)
 
     def test_sandbox_drops_inherited_test_helpers(self) -> None:
         with tempfile.TemporaryDirectory(prefix="helper-env-control.") as tmp:

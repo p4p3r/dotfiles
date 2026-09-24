@@ -179,6 +179,22 @@ let
           'acceptanceOnlyDiagnostics := acceptanceOnlyCommandRequested(os.Args[1:])' \
           'ensureTmuxOnPath()' \
           "pre-startup acceptance-only diagnostic boundary" || gate_ok=1
+        check_agent_deck_feature "$source_dir" \
+          "cmd/agent-deck/launch_cmd.go" \
+          'fs.Bool("acceptance-only", false,' \
+          "fresh-launch acceptance-only CLI flag" || gate_ok=1
+        check_agent_deck_feature "$source_dir" \
+          "cmd/agent-deck/launch_cmd.go" \
+          'result := runFreshLaunchAcceptance(&liveFreshLaunchAcceptanceOps{' \
+          "fresh-launch exact acceptance protocol" || gate_ok=1
+        check_agent_deck_feature "$source_dir" \
+          "cmd/agent-deck/launch_acceptance.go" \
+          'target.SendKeysAndEnterPrivate(o.message)' \
+          "fresh-launch private prompt transport" || gate_ok=1
+        check_agent_deck_feature "$source_dir" \
+          "cmd/agent-deck/launch_acceptance.go" \
+          'return retainFreshLaunchInstance(ops.AcceptedVerdict(delivery), instanceID)' \
+          "fresh-launch immutable identity retention" || gate_ok=1
 
         return "$gate_ok"
       }

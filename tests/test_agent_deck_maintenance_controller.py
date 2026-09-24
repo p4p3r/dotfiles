@@ -163,6 +163,89 @@ class ControllerCase(unittest.TestCase):
                     with open(os.environ["PROMPT_LOG"], "a", encoding="utf-8") as handle:
                         handle.write(json.dumps(prompt) + "\\n")
 
+                def emit_acceptance(session_id):
+                    acceptance_case = os.environ.get("ACCEPTANCE_CASE", "accepted")
+                    if acceptance_case in ("legacy-delivered", "legacy-unverified"):
+                        delivery = (
+                            "delivered"
+                            if acceptance_case == "legacy-delivered"
+                            else "unverified"
+                        )
+                        sys.stdout.write(json.dumps({{
+                            "success": True,
+                            "session_id": session_id,
+                            "delivery": delivery,
+                            "message": os.environ.get("PRIVATE_SENTINEL", "PRIVATE-BODY"),
+                        }}))
+                        raise SystemExit(0)
+                    if acceptance_case == "indeterminate":
+                        sys.stdout.write(json.dumps({{
+                            "schema_version": 1,
+                            "success": False,
+                            "acceptance": "indeterminate",
+                            "code": "ACCEPTANCE_INDETERMINATE",
+                            "instance_id": session_id,
+                            "delivery": "delivered",
+                            "submitted": False,
+                        }}))
+                        raise SystemExit(1)
+                    if acceptance_case == "ambiguous":
+                        sys.stdout.write(
+                            '{{"schema_version":1,"success":false,'
+                            '"acceptance":"indeterminate",'
+                            '"code":"ACCEPTANCE_INDETERMINATE",'
+                            '"instance_id":"' + session_id + '",'
+                            '"instance_id":"{OTHER_OWNER}"}}'
+                        )
+                        raise SystemExit(1)
+                    if acceptance_case == "missing-id":
+                        sys.stdout.write(json.dumps({{
+                            "schema_version": 1,
+                            "success": False,
+                            "acceptance": "not_accepted",
+                            "code": "INVALID_OPTIONS",
+                        }}))
+                        raise SystemExit(1)
+                    if acceptance_case == "malformed":
+                        sys.stdout.write(json.dumps({{
+                            "schema_version": 1,
+                            "success": "not-a-boolean",
+                            "instance_id": session_id,
+                        }}))
+                        raise SystemExit(1)
+                    if acceptance_case == "invalid-json":
+                        sys.stdout.write("{{not-json")
+                        raise SystemExit(1)
+                    accepted_turn = {{
+                        "receipt_id": "{RECEIPT_ID}",
+                        "instance_id": session_id,
+                        "codex_session_id": "{CODEX_SESSION}",
+                        "turn_generation": "{CODEX_SESSION}:{TURN_ID}",
+                        "accepted_at": "2026-09-20T01:00:00.123456789Z",
+                    }}
+                    payload = {{
+                        "schema_version": 1,
+                        "success": True,
+                        "acceptance": "accepted",
+                        "instance_id": session_id,
+                        "delivery": "submitted",
+                        "submitted": True,
+                        "accepted_turn_kind": "codex_rollout",
+                        "accepted_turn": accepted_turn,
+                    }}
+                    if acceptance_case == "mismatched-owner":
+                        accepted_turn["instance_id"] = "{OTHER_OWNER}"
+                    elif acceptance_case == "mismatched-session":
+                        accepted_turn["codex_session_id"] = "22222222-3333-4444-8555-666666666666"
+                    elif acceptance_case == "mismatched-generation":
+                        accepted_turn["turn_generation"] = "{CODEX_SESSION}:../not-exact"
+                    elif acceptance_case == "body-bearing":
+                        payload["message"] = os.environ.get("PRIVATE_SENTINEL", "PRIVATE-BODY")
+                    elif acceptance_case == "oversized":
+                        payload["padding"] = "X" * 3000
+                    sys.stdout.write(json.dumps(payload))
+                    raise SystemExit(0)
+
                 mode = os.environ.get("AGENT_MODE", "ok")
                 if "launch" in argv:
                     if mode == "launch-failure":
@@ -172,15 +255,7 @@ class ControllerCase(unittest.TestCase):
                         sys.stdout.write(os.environ.get("PRIVATE_SENTINEL", "PRIVATE-BODY"))
                         raise SystemExit(0)
                     session_id = os.environ.get("LAUNCH_ID", "{OWNER}")
-                    payload = {{
-                        "success": True,
-                        "id": session_id,
-                        "session_id": session_id,
-                        "message": os.environ.get("PRIVATE_SENTINEL", "PRIVATE-BODY"),
-                        "path": "/private/path",
-                    }}
-                    sys.stdout.write(json.dumps(payload))
-                    raise SystemExit(0)
+                    emit_acceptance(session_id)
 
                 if "show" in argv:
                     session_id = argv[argv.index("show") + 1]
@@ -206,65 +281,9 @@ class ControllerCase(unittest.TestCase):
                     if mode == "send-failure":
                         sys.stderr.write(os.environ.get("PRIVATE_SENTINEL", "PRIVATE-BODY"))
                         raise SystemExit(1)
-                    acceptance_case = os.environ.get("ACCEPTANCE_CASE", "accepted")
                     if mode == "send-unverified":
-                        acceptance_case = "legacy-unverified"
-                    if acceptance_case in ("legacy-delivered", "legacy-unverified"):
-                        delivery = (
-                            "delivered"
-                            if acceptance_case == "legacy-delivered"
-                            else "unverified"
-                        )
-                        sys.stdout.write(json.dumps({{
-                            "success": True,
-                            "session_id": session_id,
-                            "delivery": delivery,
-                            "message": os.environ.get("PRIVATE_SENTINEL", "PRIVATE-BODY"),
-                        }}))
-                        raise SystemExit(0)
-                    if acceptance_case == "indeterminate":
-                        sys.stdout.write(json.dumps({{
-                            "schema_version": 1,
-                            "success": False,
-                            "acceptance": "indeterminate",
-                            "code": "ACCEPTANCE_INDETERMINATE",
-                            "delivery": "delivered",
-                            "submitted": False,
-                        }}))
-                        raise SystemExit(1)
-                    if acceptance_case == "malformed":
-                        sys.stdout.write("{{not-json")
-                        raise SystemExit(0)
-                    accepted_turn = {{
-                        "receipt_id": "{RECEIPT_ID}",
-                        "instance_id": session_id,
-                        "codex_session_id": "{CODEX_SESSION}",
-                        "turn_generation": "{CODEX_SESSION}:{TURN_ID}",
-                        "accepted_at": "2026-09-20T01:00:00.123456789Z",
-                    }}
-                    payload = {{
-                        "schema_version": 1,
-                        "success": True,
-                        "acceptance": "accepted",
-                        "instance_id": session_id,
-                        "delivery": "submitted",
-                        "submitted": True,
-                        "accepted_turn_kind": "codex_rollout",
-                        "accepted_turn": accepted_turn,
-                    }}
-                    if acceptance_case == "mismatched-owner":
-                        payload["instance_id"] = "{OTHER_OWNER}"
-                        accepted_turn["instance_id"] = "{OTHER_OWNER}"
-                    elif acceptance_case == "mismatched-session":
-                        accepted_turn["codex_session_id"] = "22222222-3333-4444-8555-666666666666"
-                    elif acceptance_case == "mismatched-generation":
-                        accepted_turn["turn_generation"] = "{CODEX_SESSION}:../not-exact"
-                    elif acceptance_case == "body-bearing":
-                        payload["message"] = os.environ.get("PRIVATE_SENTINEL", "PRIVATE-BODY")
-                    elif acceptance_case == "oversized":
-                        payload["padding"] = "X" * 3000
-                    sys.stdout.write(json.dumps(payload))
-                    raise SystemExit(0)
+                        os.environ["ACCEPTANCE_CASE"] = "legacy-unverified"
+                    emit_acceptance(session_id)
                 raise SystemExit(64)
                 """
             ),
@@ -406,18 +425,15 @@ class ControllerCase(unittest.TestCase):
         calls = self.agent_calls()
         self.assertEqual(len([row for row in calls if "launch" in row]), 1)
         self.assertEqual(len([row for row in calls if "show" in row]), 1)
-        self.assertEqual(len([row for row in calls if "send" in row]), 1)
+        self.assertEqual(len([row for row in calls if "send" in row]), 0)
         launch = calls[0]
         self.assertEqual(launch[:2], ["-p", "test-profile"])
         self.assertIn("--no-parent", launch)
-        self.assertNotIn("--message-file", launch)
+        self.assertIn("--message-file", launch)
+        self.assertEqual(launch[launch.index("--message-file") + 1], "-")
+        self.assertEqual(launch.count("--acceptance-only"), 1)
         self.assertIn("--json", launch)
         self.assertNotIn("SHOULD_NOT_EXIST", launch)
-        send = next(row for row in calls if "send" in row)
-        send_at = send.index("send")
-        self.assertEqual(send[send_at + 1], OWNER)
-        self.assertIn("--acceptance-only", send)
-        self.assertIn("--message-file", send)
         state = self.state_json()
         self.assertEqual(state["owner_kind"], "SESSION")
         self.assertEqual(state["owner_session_id"], OWNER)
@@ -426,19 +442,35 @@ class ControllerCase(unittest.TestCase):
         self.assertEqual(state["active_trigger"]["disposition"], "SUBMITTED")
         self.assertEqual(stat.S_IMODE(self.state.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(self.root.stat().st_mode), 0o700)
-        prompt = json.loads(self.prompt_log.read_text().splitlines()[0])
+        prompt_lines = self.prompt_log.read_text().splitlines()
+        self.assertEqual(len(prompt_lines), 1)
+        prompt = json.loads(prompt_lines[0])
         self.assertIn("KEEP", prompt)
         self.assertIn("NOT_VERIFIED", prompt)
         self.assertIn("never", prompt.lower())
+
+    def test_accepted_launch_requires_exact_created_owner_before_submission(self) -> None:
+        result = self.launch_change(env={"AGENT_MODE": "show-mismatch"})
+        self.assertNotEqual(result.returncode, 0)
+        calls = self.agent_calls()
+        self.assertEqual(len([row for row in calls if "launch" in row]), 1)
+        self.assertEqual(len([row for row in calls if "show" in row]), 1)
+        self.assertEqual(len([row for row in calls if "send" in row]), 0)
+        state = self.state_json()
+        self.assertIsNone(state["owner_session_id"])
+        self.assertEqual(state["unverified_session_id"], OWNER)
+        self.assertEqual(state["active_trigger"]["disposition"], "NOT_VERIFIED")
+        self.assertEqual(state["reason_code"], "OWNER_NOT_VERIFIED")
 
     def test_launch_success_without_accepted_turn_never_submits_or_retries(self) -> None:
         result = self.launch_change(env={"ACCEPTANCE_CASE": "indeterminate"})
         self.assertNotEqual(result.returncode, 0)
         calls = self.agent_calls()
         self.assertEqual(len([row for row in calls if "launch" in row]), 1)
-        self.assertEqual(len([row for row in calls if "send" in row]), 1)
+        self.assertEqual(len([row for row in calls if "send" in row]), 0)
         state = self.state_json()
-        self.assertEqual(state["owner_session_id"], OWNER)
+        self.assertIsNone(state["owner_session_id"])
+        self.assertEqual(state["unverified_session_id"], OWNER)
         self.assertEqual(state["active_trigger"]["disposition"], "NOT_VERIFIED")
         self.assertEqual(state["reason_code"], "DELIVERY_NOT_VERIFIED")
 
@@ -469,7 +501,7 @@ class ControllerCase(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         calls = self.agent_calls()
         self.assertEqual(len([row for row in calls if "launch" in row]), 1)
-        self.assertEqual(len([row for row in calls if "send" in row]), 2)
+        self.assertEqual(len([row for row in calls if "send" in row]), 1)
         self.assertEqual(
             self.state_json()["active_trigger"]["disposition"], "NOT_VERIFIED"
         )
@@ -488,7 +520,7 @@ class ControllerCase(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.agent_calls()
         sends = [row for row in calls if "send" in row]
-        self.assertEqual(len(sends), 2)
+        self.assertEqual(len(sends), 1)
         for send in sends:
             send_at = send.index("send")
             self.assertEqual(send[send_at + 1], OWNER)
@@ -499,14 +531,18 @@ class ControllerCase(unittest.TestCase):
         self.assertEqual(state["reason_code"], "TRIGGER_SUBMITTED")
 
     def test_invalid_acceptance_receipts_fail_closed_without_replacement(self) -> None:
-        for acceptance_case in (
-            "mismatched-owner",
-            "mismatched-session",
-            "mismatched-generation",
-            "malformed",
-            "oversized",
-            "body-bearing",
-        ):
+        cases = {
+            "ambiguous": None,
+            "missing-id": None,
+            "mismatched-owner": OWNER,
+            "mismatched-session": OWNER,
+            "mismatched-generation": OWNER,
+            "malformed": OWNER,
+            "invalid-json": None,
+            "oversized": None,
+            "body-bearing": OWNER,
+        }
+        for acceptance_case, retained_id in cases.items():
             with self.subTest(acceptance_case=acceptance_case):
                 self.reset_runtime()
                 result = self.launch_change(
@@ -518,9 +554,10 @@ class ControllerCase(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 calls = self.agent_calls()
                 self.assertEqual(len([row for row in calls if "launch" in row]), 1)
-                self.assertEqual(len([row for row in calls if "send" in row]), 1)
+                self.assertEqual(len([row for row in calls if "send" in row]), 0)
                 state = self.state_json()
-                self.assertEqual(state["owner_session_id"], OWNER)
+                self.assertIsNone(state["owner_session_id"])
+                self.assertEqual(state["unverified_session_id"], retained_id)
                 self.assertEqual(
                     state["active_trigger"]["disposition"], "NOT_VERIFIED"
                 )
@@ -558,7 +595,7 @@ class ControllerCase(unittest.TestCase):
         self.assertNotEqual(replay.returncode, 0)
         after = self.agent_calls()
         self.assertEqual(len([row for row in after if "launch" in row]), 1)
-        self.assertEqual(len([row for row in after if "send" in row]), 1)
+        self.assertEqual(len([row for row in after if "send" in row]), 0)
         self.assertEqual(len(after), len(before))
         self.assertEqual(self.state.read_bytes(), state_before)
         self.assertEqual(replay.stderr, "ERROR: COLLECTOR_EVENT_INVALID\n")
@@ -645,7 +682,7 @@ class ControllerCase(unittest.TestCase):
         self.assertEqual(state["pending_due_trigger"]["kind"], "FULL_SURVEY")
         self.assertEqual(state["pending_due_trigger"]["disposition"], "PENDING")
         self.assertEqual(state["next_full_survey_at"], DUE_AT)
-        self.assertEqual(len([row for row in self.agent_calls() if "send" in row]), 1)
+        self.assertEqual(len([row for row in self.agent_calls() if "send" in row]), 0)
 
         delivered = self.run_controller(
             now="2026-09-21T01:00:00Z",
@@ -665,7 +702,7 @@ class ControllerCase(unittest.TestCase):
             {item["disposition"] for item in state["recent_triggers"]},
         )
         self.assertEqual(state["next_full_survey_at"], "2026-09-22T00:00:00Z")
-        self.assertEqual(len([row for row in self.agent_calls() if "send" in row]), 2)
+        self.assertEqual(len([row for row in self.agent_calls() if "send" in row]), 1)
 
         later = self.run_controller(
             now="2026-09-21T02:00:00Z",
@@ -675,7 +712,7 @@ class ControllerCase(unittest.TestCase):
             },
         )
         self.assertEqual(later.returncode, 0, later.stderr)
-        self.assertEqual(len([row for row in self.agent_calls() if "send" in row]), 2)
+        self.assertEqual(len([row for row in self.agent_calls() if "send" in row]), 1)
 
     def test_no_change_event_evidence_is_rejected_and_visible(self) -> None:
         cases = {
@@ -859,7 +896,7 @@ class ControllerCase(unittest.TestCase):
         self.assertEqual(active.returncode, 0, active.stderr)
         calls = self.agent_calls()
         self.assertEqual(len([row for row in calls if "launch" in row]), 1)
-        self.assertEqual(len([row for row in calls if "send" in row]), 1)
+        self.assertEqual(len([row for row in calls if "send" in row]), 0)
         self.assertEqual(self.state_json()["reason_code"], "ACTIVE_OWNER")
 
     def test_unknown_or_bogus_exact_owner_fails_closed(self) -> None:
@@ -925,7 +962,7 @@ class ControllerCase(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         calls = self.agent_calls()
         self.assertEqual(len([row for row in calls if "launch" in row]), 1)
-        self.assertEqual(len([row for row in calls if "send" in row]), 2)
+        self.assertEqual(len([row for row in calls if "send" in row]), 1)
         state = self.state_json()
         self.assertEqual(state["lifecycle_state"], "ESCALATED")
         self.assertEqual(state["reason_code"], "DELIVERY_NOT_VERIFIED")

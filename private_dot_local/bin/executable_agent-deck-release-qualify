@@ -27,6 +27,7 @@ EXIT_BY_VERDICT = {PASS: 0, FAIL: 1, NOT_VERIFIED: 2}
 REQUIRED_SOURCE_PATHS = (
     "go.mod",
     "cmd/agent-deck",
+    "cmd/agent-deck/launch_acceptance.go",
     "internal/tmux/detector.go",
     "internal/session/conductor_bridge.py",
 )
@@ -52,6 +53,12 @@ BUSY_TEST_IDS = (
     "TestReleaseQualificationCodexBusyProvenance/parenthesized_phrase_in_prose_is_not_status",
     "TestReleaseQualificationCodexBusyProvenance/valid_occurrence_after_quoted_occurrence_is_busy",
     "TestReleaseQualificationCodexBusyProvenance/repeated_valid_statuses_remain_busy",
+)
+FRESH_LAUNCH_TEST_IDS = (
+    "TestReleaseQualificationFreshLaunchAcceptance",
+    "TestReleaseQualificationFreshLaunchAcceptance/accepted_exact_first_turn_once",
+    "TestReleaseQualificationFreshLaunchAcceptance/post_creation_uncertainty_retains_identity_without_retry",
+    "TestReleaseQualificationFreshLaunchAcceptance/invalid_input_rejected_before_spawn",
 )
 EXPECTED_RUNTIME_CASE_IDS = (
     "metadata-selected-codex",
@@ -301,19 +308,21 @@ def _gate(name: str, verdict: str, summary: str, **details: Any) -> dict[str, An
     return result
 
 
-def _parse_busy_go_test_json(output: str) -> tuple[dict[str, Any] | None, str | None]:
+def _parse_exact_go_test_json(
+    output: str, expected_ids: tuple[str, ...], probe_label: str
+) -> tuple[dict[str, Any] | None, str | None]:
     """Require positive go-test JSON proof for every injected test and subtest."""
     lines = [line for line in output.splitlines() if line.strip()]
     if not lines:
-        return None, "busy probe produced no JSON events"
+        return None, f"{probe_label} produced no JSON events"
     events: list[dict[str, Any]] = []
     for line_number, line in enumerate(lines, start=1):
         try:
             event = json.loads(line)
         except json.JSONDecodeError as exc:
-            return None, f"busy probe JSON line {line_number} is malformed: {exc}"
+            return None, f"{probe_label} JSON line {line_number} is malformed: {exc}"
         if not isinstance(event, dict) or not isinstance(event.get("Action"), str):
-            return None, f"busy probe JSON line {line_number} is not a Go test event"
+            return None, f"{probe_label} JSON line {line_number} is not a Go test event"
         events.append(event)
 
     package_starts = [
@@ -322,14 +331,14 @@ def _parse_busy_go_test_json(output: str) -> tuple[dict[str, Any] | None, str | 
         if event.get("Action") == "start" and isinstance(event.get("Package"), str)
     ]
     if len(package_starts) != 1:
-        return None, "busy probe did not start exactly one Go package"
+        return None, f"{probe_label} did not start exactly one Go package"
     package = package_starts[0]
-    expected = set(BUSY_TEST_IDS)
+    expected = set(expected_ids)
     test_events = [event for event in events if isinstance(event.get("Test"), str)]
     if any(event.get("Package") != package for event in test_events):
-        return None, "busy probe test events came from an unexpected Go package"
+        return None, f"{probe_label} test events came from an unexpected Go package"
     if {event["Test"] for event in test_events} != expected:
-        return None, "busy probe emitted events for unexpected or incomplete test IDs"
+        return None, f"{probe_label} emitted events for unexpected or incomplete test IDs"
     run_counts = Counter(
         event.get("Test")
         for event in events
@@ -350,14 +359,14 @@ def _parse_busy_go_test_json(output: str) -> tuple[dict[str, Any] | None, str | 
             skipped.append(test_id)
 
     if set(run_counts) != expected or any(run_counts[test_id] != 1 for test_id in expected):
-        return None, "busy probe did not run every exact injected test exactly once"
+        return None, f"{probe_label} did not run every exact injected test exactly once"
     unexpected_terminal = set(terminal) - expected
     if unexpected_terminal:
-        return None, "busy probe emitted unexpected test results"
+        return None, f"{probe_label} emitted unexpected test results"
     if any(terminal[test_id] != 1 for test_id in expected):
-        return None, "busy probe did not finish every exact injected test exactly once"
+        return None, f"{probe_label} did not finish every exact injected test exactly once"
     if skipped:
-        return None, f"busy probe skipped required test(s): {', '.join(sorted(skipped))}"
+        return None, f"{probe_label} skipped required test(s): {', '.join(sorted(skipped))}"
 
     package_actions = [
         event.get("Action")
@@ -366,14 +375,24 @@ def _parse_busy_go_test_json(output: str) -> tuple[dict[str, Any] | None, str | 
     ]
     expected_package_action = "fail" if failed else "pass"
     if package_actions != [expected_package_action]:
-        return None, "busy probe package result is missing or inconsistent"
+        return None, f"{probe_label} package result is missing or inconsistent"
     return (
         {
             "package": package,
-            "passed_tests": [test_id for test_id in BUSY_TEST_IDS if test_id not in failed],
-            "failed_tests": [test_id for test_id in BUSY_TEST_IDS if test_id in failed],
+            "passed_tests": [test_id for test_id in expected_ids if test_id not in failed],
+            "failed_tests": [test_id for test_id in expected_ids if test_id in failed],
         },
         None,
+    )
+
+
+def _parse_busy_go_test_json(output: str) -> tuple[dict[str, Any] | None, str | None]:
+    return _parse_exact_go_test_json(output, BUSY_TEST_IDS, "busy probe")
+
+
+def _parse_launch_go_test_json(output: str) -> tuple[dict[str, Any] | None, str | None]:
+    return _parse_exact_go_test_json(
+        output, FRESH_LAUNCH_TEST_IDS, "fresh-launch probe"
     )
 
 
@@ -435,6 +454,78 @@ def _busy_gate(
         "codex_busy_provenance",
         PASS,
         "quoted prose stays idle while a later valid repeated phrase stays busy",
+        passed_tests=proof["passed_tests"],
+        elapsed_seconds=result.elapsed_seconds,
+    )
+
+
+def _fresh_launch_gate(
+    candidate: Path,
+    fixture_dir: Path,
+    args: argparse.Namespace,
+    env: dict[str, str],
+) -> dict[str, Any]:
+    probe = fixture_dir / "fresh_launch_acceptance_probe_test.go"
+    if not probe.is_file():
+        return _gate(
+            "fresh_launch_acceptance",
+            NOT_VERIFIED,
+            "fresh-launch acceptance fixture is unavailable",
+        )
+    target = (
+        candidate
+        / "cmd"
+        / "agent-deck"
+        / "release_qualification_fresh_launch_probe_test.go"
+    )
+    shutil.copyfile(probe, target)
+    try:
+        result = _run(
+            [
+                args.go,
+                "test",
+                "-json",
+                "-count=1",
+                "-run",
+                "^TestReleaseQualificationFreshLaunchAcceptance$",
+                "./cmd/agent-deck",
+            ],
+            cwd=candidate,
+            env=env,
+            timeout=args.timeout_seconds,
+        )
+    finally:
+        target.unlink(missing_ok=True)
+    if result.problem:
+        return _gate("fresh_launch_acceptance", NOT_VERIFIED, result.problem)
+    proof, error = _parse_launch_go_test_json(result.stdout)
+    if error or proof is None:
+        return _gate(
+            "fresh_launch_acceptance",
+            NOT_VERIFIED,
+            error or "fresh-launch probe did not produce positive proof",
+            returncode=result.returncode,
+            tail=(result.stdout + result.stderr)[-1200:],
+        )
+    if proof["failed_tests"]:
+        return _gate(
+            "fresh_launch_acceptance",
+            FAIL,
+            "candidate behavior failed the fresh-launch acceptance contract",
+            failed_tests=proof["failed_tests"],
+            elapsed_seconds=result.elapsed_seconds,
+        )
+    if result.returncode != 0:
+        return _gate(
+            "fresh_launch_acceptance",
+            NOT_VERIFIED,
+            "fresh-launch probe passed but Go exited unsuccessfully",
+            returncode=result.returncode,
+        )
+    return _gate(
+        "fresh_launch_acceptance",
+        PASS,
+        "fresh launch accepts one exact first turn and retains uncertain identity",
         passed_tests=proof["passed_tests"],
         elapsed_seconds=result.elapsed_seconds,
     )
@@ -764,7 +855,11 @@ def main() -> int:
         return EXIT_BY_VERDICT[NOT_VERIFIED]
 
     fixture_dir = _fixture_dir()
-    required_fixtures = ("codex_busy_probe_test.go", "runtime_recreation_probe.py")
+    required_fixtures = (
+        "codex_busy_probe_test.go",
+        "fresh_launch_acceptance_probe_test.go",
+        "runtime_recreation_probe.py",
+    )
     unavailable = [name for name in required_fixtures if not (fixture_dir / name).is_file()]
     if unavailable:
         _write_json(
@@ -783,7 +878,10 @@ def main() -> int:
         if source_error or candidate is None:
             checks = [_gate("candidate_source", NOT_VERIFIED, source_error or "candidate unavailable")]
         else:
-            checks = [_busy_gate(candidate, fixture_dir, args, env)]
+            checks = [
+                _busy_gate(candidate, fixture_dir, args, env),
+                _fresh_launch_gate(candidate, fixture_dir, args, env),
+            ]
             materialization, bridge = _materialization_gate(candidate, workdir, args, env)
             checks.append(materialization)
             checks.append(_runtime_gate(bridge, fixture_dir, candidate, workdir, args, env))

@@ -137,14 +137,15 @@ checked timestamp and start no agent turn. A strict collector event (exit `10` o
 durably unclaimed full-survey occurrence is claimed before the controller starts or wakes the one
 report-only custodian.
 
-The controller uses `agent-deck launch --json` only to create an unprompted custodian and obtain its
-explicit immutable `session_id`, verified by an exact `session show ID --json`. It then submits the
-trigger exactly once with `session send ID --acceptance-only --message-file -`—the same path used to
-wake an existing owner—and records `SUBMITTED` only for the bounded, body-free receipt that binds
-the exact owner, Codex session, and accepted turn generation. It never discovers an owner by title
-or global-list diff. Launch success, status, pane state, process arguments, output bodies, legacy
-delivery fields, malformed or mismatched receipts, interrupted claims, and indeterminate delivery
-remain `NOT_VERIFIED`; none causes a retry or replacement launch.
+The controller creates a fresh custodian and submits its initial charter/trigger exactly once with
+`agent-deck launch --acceptance-only --message-file -`. Existing owners are woken with
+`session send ID --acceptance-only --message-file -`. It records `SUBMITTED` only for the bounded,
+body-free receipt that binds the exact immutable owner, Codex session, and accepted turn generation,
+followed by an exact `session show ID --json`. A post-creation failure retains the receipt's bounded
+instance ID as unverified recovery evidence. It never discovers an owner by title or global-list
+diff. Launch success, status, pane state, process arguments, output bodies, legacy delivery fields,
+malformed or mismatched receipts, interrupted claims, and indeterminate delivery remain
+`NOT_VERIFIED`; none causes a retry, separate send, or replacement launch.
 
 Controller and collector state remain under the private local state directory. The controller file
 contains only a schema version, host/profile aliases, the current collector instance, generation,

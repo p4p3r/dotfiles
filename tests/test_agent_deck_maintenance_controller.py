@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -28,6 +29,9 @@ DUE_AT = "2026-09-21T00:00:00Z"
 MAX_STATE_BYTES = 1_048_576
 MAX_GENERATION = 9_223_372_036_854_775_807
 COLLECTOR_INSTANCE = "0123456789abcdef0123456789abcdef"
+CODEX_SESSION = "11111111-2222-4333-8444-555555555555"
+TURN_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+RECEIPT_ID = "99999999-8888-4777-8666-555555555555"
 
 
 def fingerprint(label: str) -> str:
@@ -199,16 +203,67 @@ class ControllerCase(unittest.TestCase):
 
                 if "send" in argv:
                     session_id = argv[argv.index("send") + 1]
-                    delivery = "unverified" if mode == "send-unverified" else "submitted"
                     if mode == "send-failure":
                         sys.stderr.write(os.environ.get("PRIVATE_SENTINEL", "PRIVATE-BODY"))
                         raise SystemExit(1)
-                    sys.stdout.write(json.dumps({{
+                    acceptance_case = os.environ.get("ACCEPTANCE_CASE", "accepted")
+                    if mode == "send-unverified":
+                        acceptance_case = "legacy-unverified"
+                    if acceptance_case in ("legacy-delivered", "legacy-unverified"):
+                        delivery = (
+                            "delivered"
+                            if acceptance_case == "legacy-delivered"
+                            else "unverified"
+                        )
+                        sys.stdout.write(json.dumps({{
+                            "success": True,
+                            "session_id": session_id,
+                            "delivery": delivery,
+                            "message": os.environ.get("PRIVATE_SENTINEL", "PRIVATE-BODY"),
+                        }}))
+                        raise SystemExit(0)
+                    if acceptance_case == "indeterminate":
+                        sys.stdout.write(json.dumps({{
+                            "schema_version": 1,
+                            "success": False,
+                            "acceptance": "indeterminate",
+                            "code": "ACCEPTANCE_INDETERMINATE",
+                            "delivery": "delivered",
+                            "submitted": False,
+                        }}))
+                        raise SystemExit(1)
+                    if acceptance_case == "malformed":
+                        sys.stdout.write("{{not-json")
+                        raise SystemExit(0)
+                    accepted_turn = {{
+                        "receipt_id": "{RECEIPT_ID}",
+                        "instance_id": session_id,
+                        "codex_session_id": "{CODEX_SESSION}",
+                        "turn_generation": "{CODEX_SESSION}:{TURN_ID}",
+                        "accepted_at": "2026-09-20T01:00:00.123456789Z",
+                    }}
+                    payload = {{
+                        "schema_version": 1,
                         "success": True,
-                        "session_id": session_id,
-                        "delivery": delivery,
-                        "message": os.environ.get("PRIVATE_SENTINEL", "PRIVATE-BODY"),
-                    }}))
+                        "acceptance": "accepted",
+                        "instance_id": session_id,
+                        "delivery": "submitted",
+                        "submitted": True,
+                        "accepted_turn_kind": "codex_rollout",
+                        "accepted_turn": accepted_turn,
+                    }}
+                    if acceptance_case == "mismatched-owner":
+                        payload["instance_id"] = "{OTHER_OWNER}"
+                        accepted_turn["instance_id"] = "{OTHER_OWNER}"
+                    elif acceptance_case == "mismatched-session":
+                        accepted_turn["codex_session_id"] = "22222222-3333-4444-8555-666666666666"
+                    elif acceptance_case == "mismatched-generation":
+                        accepted_turn["turn_generation"] = "{CODEX_SESSION}:../not-exact"
+                    elif acceptance_case == "body-bearing":
+                        payload["message"] = os.environ.get("PRIVATE_SENTINEL", "PRIVATE-BODY")
+                    elif acceptance_case == "oversized":
+                        payload["padding"] = "X" * 3000
+                    sys.stdout.write(json.dumps(payload))
                     raise SystemExit(0)
                 raise SystemExit(64)
                 """
@@ -291,6 +346,18 @@ class ControllerCase(unittest.TestCase):
             return []
         return [json.loads(line) for line in self.agent_log.read_text().splitlines()]
 
+    def reset_runtime(self) -> None:
+        for path in (
+            self.state,
+            self.collector_state,
+            Path(str(self.state) + ".lock"),
+            self.agent_log,
+            self.collector_log,
+            self.prompt_log,
+        ):
+            if path.exists() or path.is_symlink():
+                path.unlink()
+
     def baseline(self) -> subprocess.CompletedProcess[str]:
         result = self.run_controller(now=BASELINE_AT)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -333,18 +400,24 @@ class ControllerCase(unittest.TestCase):
         self.assertEqual(state["collector_generation"], 1)
         self.assertEqual(state["collector_fingerprint"], fingerprint("b"))
 
-    def test_changed_event_claims_once_launches_and_verifies_exact_owner(self) -> None:
+    def test_changed_event_claims_once_and_requires_exact_acceptance(self) -> None:
         result = self.launch_change()
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.agent_calls()
         self.assertEqual(len([row for row in calls if "launch" in row]), 1)
         self.assertEqual(len([row for row in calls if "show" in row]), 1)
+        self.assertEqual(len([row for row in calls if "send" in row]), 1)
         launch = calls[0]
         self.assertEqual(launch[:2], ["-p", "test-profile"])
         self.assertIn("--no-parent", launch)
-        self.assertIn("--message-file", launch)
+        self.assertNotIn("--message-file", launch)
         self.assertIn("--json", launch)
         self.assertNotIn("SHOULD_NOT_EXIST", launch)
+        send = next(row for row in calls if "send" in row)
+        send_at = send.index("send")
+        self.assertEqual(send[send_at + 1], OWNER)
+        self.assertIn("--acceptance-only", send)
+        self.assertIn("--message-file", send)
         state = self.state_json()
         self.assertEqual(state["owner_kind"], "SESSION")
         self.assertEqual(state["owner_session_id"], OWNER)
@@ -357,6 +430,113 @@ class ControllerCase(unittest.TestCase):
         self.assertIn("KEEP", prompt)
         self.assertIn("NOT_VERIFIED", prompt)
         self.assertIn("never", prompt.lower())
+
+    def test_launch_success_without_accepted_turn_never_submits_or_retries(self) -> None:
+        result = self.launch_change(env={"ACCEPTANCE_CASE": "indeterminate"})
+        self.assertNotEqual(result.returncode, 0)
+        calls = self.agent_calls()
+        self.assertEqual(len([row for row in calls if "launch" in row]), 1)
+        self.assertEqual(len([row for row in calls if "send" in row]), 1)
+        state = self.state_json()
+        self.assertEqual(state["owner_session_id"], OWNER)
+        self.assertEqual(state["active_trigger"]["disposition"], "NOT_VERIFIED")
+        self.assertEqual(state["reason_code"], "DELIVERY_NOT_VERIFIED")
+
+        later = self.run_controller(now="2026-09-20T02:00:00Z")
+        self.assertNotEqual(later.returncode, 0)
+        later_calls = self.agent_calls()
+        self.assertEqual(
+            len([row for row in later_calls if "launch" in row]),
+            len([row for row in calls if "launch" in row]),
+        )
+        self.assertEqual(
+            len([row for row in later_calls if "send" in row]),
+            len([row for row in calls if "send" in row]),
+        )
+
+    def test_existing_owner_legacy_delivered_result_is_not_verified(self) -> None:
+        self.assertEqual(self.launch_change().returncode, 0)
+        result = self.run_controller(
+            now="2026-09-20T02:00:00Z",
+            collector_mode="changed",
+            env={
+                "ACCEPTANCE_CASE": "legacy-delivered",
+                "COLLECTOR_EVENT": json.dumps(change_event("c"), sort_keys=True),
+                "SESSION_STATUS": "waiting",
+                "SESSION_SUBSTATE": "idle-at-empty-prompt",
+            },
+        )
+        self.assertNotEqual(result.returncode, 0)
+        calls = self.agent_calls()
+        self.assertEqual(len([row for row in calls if "launch" in row]), 1)
+        self.assertEqual(len([row for row in calls if "send" in row]), 2)
+        self.assertEqual(
+            self.state_json()["active_trigger"]["disposition"], "NOT_VERIFIED"
+        )
+
+    def test_existing_owner_exact_receipt_submits_once_and_binds_owner(self) -> None:
+        self.assertEqual(self.launch_change().returncode, 0)
+        result = self.run_controller(
+            now="2026-09-20T02:00:00Z",
+            collector_mode="changed",
+            env={
+                "COLLECTOR_EVENT": json.dumps(change_event("c"), sort_keys=True),
+                "SESSION_STATUS": "waiting",
+                "SESSION_SUBSTATE": "idle-at-empty-prompt",
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.agent_calls()
+        sends = [row for row in calls if "send" in row]
+        self.assertEqual(len(sends), 2)
+        for send in sends:
+            send_at = send.index("send")
+            self.assertEqual(send[send_at + 1], OWNER)
+            self.assertEqual(send.count("--acceptance-only"), 1)
+        state = self.state_json()
+        self.assertEqual(state["owner_session_id"], OWNER)
+        self.assertEqual(state["active_trigger"]["disposition"], "SUBMITTED")
+        self.assertEqual(state["reason_code"], "TRIGGER_SUBMITTED")
+
+    def test_invalid_acceptance_receipts_fail_closed_without_replacement(self) -> None:
+        for acceptance_case in (
+            "mismatched-owner",
+            "mismatched-session",
+            "mismatched-generation",
+            "malformed",
+            "oversized",
+            "body-bearing",
+        ):
+            with self.subTest(acceptance_case=acceptance_case):
+                self.reset_runtime()
+                result = self.launch_change(
+                    env={
+                        "ACCEPTANCE_CASE": acceptance_case,
+                        "PRIVATE_SENTINEL": "SECRET-RECEIPT-BODY",
+                    }
+                )
+                self.assertNotEqual(result.returncode, 0)
+                calls = self.agent_calls()
+                self.assertEqual(len([row for row in calls if "launch" in row]), 1)
+                self.assertEqual(len([row for row in calls if "send" in row]), 1)
+                state = self.state_json()
+                self.assertEqual(state["owner_session_id"], OWNER)
+                self.assertEqual(
+                    state["active_trigger"]["disposition"], "NOT_VERIFIED"
+                )
+                rendered = self.state.read_text() + result.stdout + result.stderr
+                self.assertNotIn("SECRET-RECEIPT-BODY", rendered)
+                later = self.run_controller(now="2026-09-20T02:00:00Z")
+                self.assertNotEqual(later.returncode, 0)
+                later_calls = self.agent_calls()
+                self.assertEqual(
+                    len([row for row in later_calls if "launch" in row]),
+                    len([row for row in calls if "launch" in row]),
+                )
+                self.assertEqual(
+                    len([row for row in later_calls if "send" in row]),
+                    len([row for row in calls if "send" in row]),
+                )
 
     def test_due_occurrence_claims_once_and_launches(self) -> None:
         self.baseline()
@@ -378,7 +558,7 @@ class ControllerCase(unittest.TestCase):
         self.assertNotEqual(replay.returncode, 0)
         after = self.agent_calls()
         self.assertEqual(len([row for row in after if "launch" in row]), 1)
-        self.assertEqual(len([row for row in after if "send" in row]), 0)
+        self.assertEqual(len([row for row in after if "send" in row]), 1)
         self.assertEqual(len(after), len(before))
         self.assertEqual(self.state.read_bytes(), state_before)
         self.assertEqual(replay.stderr, "ERROR: COLLECTOR_EVENT_INVALID\n")
@@ -465,7 +645,7 @@ class ControllerCase(unittest.TestCase):
         self.assertEqual(state["pending_due_trigger"]["kind"], "FULL_SURVEY")
         self.assertEqual(state["pending_due_trigger"]["disposition"], "PENDING")
         self.assertEqual(state["next_full_survey_at"], DUE_AT)
-        self.assertEqual(len([row for row in self.agent_calls() if "send" in row]), 0)
+        self.assertEqual(len([row for row in self.agent_calls() if "send" in row]), 1)
 
         delivered = self.run_controller(
             now="2026-09-21T01:00:00Z",
@@ -485,7 +665,7 @@ class ControllerCase(unittest.TestCase):
             {item["disposition"] for item in state["recent_triggers"]},
         )
         self.assertEqual(state["next_full_survey_at"], "2026-09-22T00:00:00Z")
-        self.assertEqual(len([row for row in self.agent_calls() if "send" in row]), 1)
+        self.assertEqual(len([row for row in self.agent_calls() if "send" in row]), 2)
 
         later = self.run_controller(
             now="2026-09-21T02:00:00Z",
@@ -495,7 +675,7 @@ class ControllerCase(unittest.TestCase):
             },
         )
         self.assertEqual(later.returncode, 0, later.stderr)
-        self.assertEqual(len([row for row in self.agent_calls() if "send" in row]), 1)
+        self.assertEqual(len([row for row in self.agent_calls() if "send" in row]), 2)
 
     def test_no_change_event_evidence_is_rejected_and_visible(self) -> None:
         cases = {
@@ -679,7 +859,7 @@ class ControllerCase(unittest.TestCase):
         self.assertEqual(active.returncode, 0, active.stderr)
         calls = self.agent_calls()
         self.assertEqual(len([row for row in calls if "launch" in row]), 1)
-        self.assertEqual(len([row for row in calls if "send" in row]), 0)
+        self.assertEqual(len([row for row in calls if "send" in row]), 1)
         self.assertEqual(self.state_json()["reason_code"], "ACTIVE_OWNER")
 
     def test_unknown_or_bogus_exact_owner_fails_closed(self) -> None:
@@ -745,7 +925,7 @@ class ControllerCase(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         calls = self.agent_calls()
         self.assertEqual(len([row for row in calls if "launch" in row]), 1)
-        self.assertEqual(len([row for row in calls if "send" in row]), 1)
+        self.assertEqual(len([row for row in calls if "send" in row]), 2)
         state = self.state_json()
         self.assertEqual(state["lifecycle_state"], "ESCALATED")
         self.assertEqual(state["reason_code"], "DELIVERY_NOT_VERIFIED")
@@ -869,6 +1049,32 @@ class ControllerCase(unittest.TestCase):
 
 
 class ModuleContractCase(unittest.TestCase):
+    def test_public_maintenance_surface_contains_no_host_specific_material(self) -> None:
+        readme = (REPO / "README.md").read_text(encoding="utf-8")
+        section = readme.split("## Report-only maintenance runtime", 1)[1]
+        section = section.split("\n## ", 1)[0]
+        public_surface = "\n".join(
+            (
+                SCRIPT.read_text(encoding="utf-8"),
+                CHARTER.read_text(encoding="utf-8"),
+                section,
+            )
+        )
+        forbidden_patterns = {
+            "local user path": r"/(?:home|Users)/(?!example(?:/|\b))[^\s\"']+",
+            "private hostname": r"\b[a-z0-9][a-z0-9-]{1,62}\.(?:internal|local|lan|corp)\b",
+            "private repository label": r"\b[a-z0-9][a-z0-9._-]*-(?:private|internal)\b",
+            "provider or workspace ID": (
+                r"\b[TWCG](?=[A-Z0-9]{8,}\b)(?=[A-Z0-9]*[0-9])"
+                r"[A-Z0-9]{8,}\b"
+            ),
+            "provider token": r"(?:xox[baprs]-|gh[pousr]_|AKIA[0-9A-Z]{16})",
+        }
+        for label, pattern in forbidden_patterns.items():
+            with self.subTest(label=label):
+                flags = 0 if label == "provider or workspace ID" else re.IGNORECASE
+                self.assertIsNone(re.search(pattern, public_surface, flags))
+
     def test_module_is_disabled_by_default_linux_only_and_portably_hardened(self) -> None:
         text = MODULE.read_text(encoding="utf-8")
         self.assertIn("mkEnableOption", text)

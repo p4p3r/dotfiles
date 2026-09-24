@@ -102,6 +102,26 @@ let
         fi
       }
 
+      check_agent_deck_feature_before() {
+        local source_dir="$1"
+        local relative_path="$2"
+        local needle="$3"
+        local later_needle="$4"
+        local description="$5"
+        local needle_line later_line
+
+        if [[ ! -f "$source_dir/$relative_path" ]]; then
+          log "Agent Deck safety gate missing: $description ($relative_path)."
+          return 1
+        fi
+        needle_line="$(grep -Fnm1 -- "$needle" "$source_dir/$relative_path" | awk -F: 'NR == 1 { print $1 }')"
+        later_line="$(grep -Fnm1 -- "$later_needle" "$source_dir/$relative_path" | awk -F: 'NR == 1 { print $1 }')"
+        if [[ -z "$needle_line" || -z "$later_line" || "$needle_line" -ge "$later_line" ]]; then
+          log "Agent Deck safety gate missing: $description ($relative_path)."
+          return 1
+        fi
+      }
+
       agent_deck_release_is_safe() {
         local source_dir="$1"
         local gate_ok=0
@@ -134,6 +154,31 @@ let
           "internal/session/conductor_bridge.py" \
           '_resolve_secret(str(user_id' \
           "Slack user allowlist environment-reference resolution" || gate_ok=1
+        check_agent_deck_feature "$source_dir" \
+          "cmd/agent-deck/session_cmd.go" \
+          'fs.Bool("acceptance-only", false,' \
+          "generic acceptance-only CLI flag" || gate_ok=1
+        check_agent_deck_feature "$source_dir" \
+          "cmd/agent-deck/session_cmd.go" \
+          'type acceptanceOnlyResult struct {' \
+          "body-free acceptance-only result schema" || gate_ok=1
+        check_agent_deck_feature "$source_dir" \
+          "cmd/agent-deck/session_cmd.go" \
+          'acceptanceOnlySchemaVersion    = 1' \
+          "versioned acceptance-only result schema" || gate_ok=1
+        check_agent_deck_feature "$source_dir" \
+          "cmd/agent-deck/session_cmd.go" \
+          'acceptanceOnlyResultMaxBytes   = 2048' \
+          "2048-byte acceptance-only result bound" || gate_ok=1
+        check_agent_deck_feature "$source_dir" \
+          "cmd/agent-deck/session_cmd.go" \
+          'if len(raw)+1 > acceptanceOnlyResultMaxBytes {' \
+          "enforced acceptance-only result bound" || gate_ok=1
+        check_agent_deck_feature_before "$source_dir" \
+          "cmd/agent-deck/main.go" \
+          'acceptanceOnlyDiagnostics := acceptanceOnlyCommandRequested(os.Args[1:])' \
+          'ensureTmuxOnPath()' \
+          "pre-startup acceptance-only diagnostic boundary" || gate_ok=1
 
         return "$gate_ok"
       }

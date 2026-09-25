@@ -267,6 +267,13 @@
         test -f "$service"
         test -f "$timer"
         ${pkgs.gnugrep}/bin/grep -F -- "--repo /project/100%%nice" "$service"
+        # npm-installed agent launchers need Node even without an interactive shell.
+        service_path="$(${pkgs.gnused}/bin/sed -n 's/^Environment=PATH=//p' "$service")"
+        test -n "$service_path"
+        PATH="$service_path" ${pkgs.coreutils}/bin/env node --eval 'if (!process.versions.node) process.exit(1)'
+        for companion in agent-deck-maintenance-controller agent-deck-maintenance-collector; do
+          PATH="$service_path" "${generation}/home-path/bin/$companion" --help >/dev/null
+        done
         for directive in PrivateDevices ProtectClock ProtectKernelLogs ProtectKernelModules; do
           if ${pkgs.gnugrep}/bin/grep -q "^$directive=" "$service"; then
             echo "user service must not alter the capability bounding set via $directive" >&2

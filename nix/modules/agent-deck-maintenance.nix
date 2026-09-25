@@ -226,6 +226,7 @@ in
             lib.makeBinPath [
               pkgs.coreutils
               pkgs.git
+              pkgs.nodejs
             ]
           }")
         ];

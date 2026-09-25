@@ -271,6 +271,8 @@
         service_path="$(${pkgs.gnused}/bin/sed -n 's/^Environment=PATH=//p' "$service")"
         test -n "$service_path"
         PATH="$service_path" ${pkgs.coreutils}/bin/env node --eval 'if (!process.versions.node) process.exit(1)'
+        PATH="$service_path" ${pkgs.coreutils}/bin/env tmux -V
+        PATH="$service_path" ${pkgs.coreutils}/bin/env bash --version >/dev/null
         for companion in agent-deck-maintenance-controller agent-deck-maintenance-collector; do
           PATH="$service_path" "${generation}/home-path/bin/$companion" --help >/dev/null
         done

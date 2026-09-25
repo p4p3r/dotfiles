@@ -227,6 +227,8 @@ in
               pkgs.coreutils
               pkgs.git
               pkgs.nodejs
+              pkgs.tmux
+              pkgs.bash
             ]
           }")
         ];

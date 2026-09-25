@@ -188,6 +188,17 @@ class ReleaseQualificationHarnessTest(unittest.TestCase):
         self.assertIsNone(proof)
         self.assertIn("unexpected or incomplete", error)
 
+    def test_fresh_launch_probe_owns_schema_bound_and_real_transport(self) -> None:
+        probe = (FIXTURES / "fresh_launch_acceptance_probe_test.go").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("const releaseQualificationReceiptMaxBytes = 2048", probe)
+        self.assertIn("decoder.DisallowUnknownFields()", probe)
+        self.assertIn("(&liveFreshLaunchAcceptanceOps{", probe)
+        self.assertIn("}).SendOnce()", probe)
+        self.assertIn('counts["load-buffer"] != 1', probe)
+        self.assertNotIn("acceptanceOnlyResultMaxBytes", probe)
+
     def test_sandbox_drops_inherited_test_helpers(self) -> None:
         with tempfile.TemporaryDirectory(prefix="helper-env-control.") as tmp:
             root = Path(tmp)

@@ -59,6 +59,7 @@ FRESH_LAUNCH_TEST_IDS = (
     "TestReleaseQualificationFreshLaunchAcceptance/accepted_exact_first_turn_once",
     "TestReleaseQualificationFreshLaunchAcceptance/post_creation_uncertainty_retains_identity_without_retry",
     "TestReleaseQualificationFreshLaunchAcceptance/invalid_input_rejected_before_spawn",
+    "TestReleaseQualificationFreshLaunchAcceptance/actual_private_transport_once",
 )
 EXPECTED_RUNTIME_CASE_IDS = (
     "metadata-selected-codex",
@@ -525,7 +526,7 @@ def _fresh_launch_gate(
     return _gate(
         "fresh_launch_acceptance",
         PASS,
-        "fresh launch accepts one exact first turn and retains uncertain identity",
+        "fresh launch privately submits once, emits an exact bounded receipt, and retains uncertain identity",
         passed_tests=proof["passed_tests"],
         elapsed_seconds=result.elapsed_seconds,
     )

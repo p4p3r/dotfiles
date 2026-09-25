@@ -9,6 +9,14 @@ Code/p4p3r/dotfiles-private/**/devenv.lock
 # Prevent chezmoi from creating ~/nix/ in the home directory
 nix
 
+# Repository-only roots. Chezmoi matches the complete target-relative path, so
+# these do not ignore similarly named directories nested under managed paths.
+README.md
+docs
+docs/**
+tests
+tests/**
+
 # devenv artifacts
 .devenv
 .devenv.flake.nix

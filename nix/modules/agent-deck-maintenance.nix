@@ -229,6 +229,7 @@ in
               pkgs.nodejs
               pkgs.tmux
               pkgs.bash
+              pkgs.procps
             ]
           }")
         ];

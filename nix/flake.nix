@@ -273,6 +273,8 @@
         PATH="$service_path" ${pkgs.coreutils}/bin/env node --eval 'if (!process.versions.node) process.exit(1)'
         PATH="$service_path" ${pkgs.coreutils}/bin/env tmux -V
         PATH="$service_path" ${pkgs.coreutils}/bin/env bash --version >/dev/null
+        PATH="$service_path" ${pkgs.coreutils}/bin/env ps --version
+        PATH="$service_path" ${pkgs.coreutils}/bin/env pgrep --version
         for companion in agent-deck-maintenance-controller agent-deck-maintenance-collector; do
           PATH="$service_path" "${generation}/home-path/bin/$companion" --help >/dev/null
         done

@@ -131,8 +131,11 @@ mcp_default_scope = ""
   socket_wait_timeout = 0
 
 [updates]
-  auto_update = true
-  check_enabled = true
+  # The hourly agent-cli-update timer is the sole update owner. Agent Deck's
+  # built-in updater can replace the binary and bridge without restarting the
+  # long-lived bridge process, leaving an incompatible mixed-version pair.
+  auto_update = false
+  check_enabled = false
   check_interval_hours = 0
   notify_in_cli = false
 

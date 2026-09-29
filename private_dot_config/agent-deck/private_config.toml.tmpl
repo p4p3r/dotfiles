@@ -9,6 +9,12 @@
 # box.
 # Do not paste literal tokens back into this file.
 #
+# A named conductor opts into the source-only Slack v2 runtime only when both
+# AGENTDECK_CONDUCTOR_NAME and AGENTDECK_CONDUCTOR_BACKEND=slack-v2 are present
+# while chezmoi renders this template. Omitting both preserves the legacy
+# backend. The runtime resolves the exact $NAME references below after taking
+# its singleton lock; chezmoi must never substitute the credential values.
+#
 # NOTE (2026-09-05): this file is resolved XDG-FIRST -- its mere existence takes
 # precedence over the legacy ~/.agent-deck/config.toml, which is then ignored
 # entirely. So it must be COMPLETE, not a fragment. In particular
@@ -204,6 +210,28 @@ mcp_default_scope = ""
     user_id = 0
     listen_mode = ""
     ignore_replies_to_others = false
+
+{{ $namedConductor := env "AGENTDECK_CONDUCTOR_NAME" }}
+{{ $namedBackend := env "AGENTDECK_CONDUCTOR_BACKEND" }}
+{{ if ne (eq $namedConductor "") (eq $namedBackend "") }}
+{{ fail "AGENTDECK_CONDUCTOR_NAME and AGENTDECK_CONDUCTOR_BACKEND must be set together" }}
+{{ end }}
+{{ if and (ne $namedBackend "") (ne $namedBackend "slack-v2") }}
+{{ fail "AGENTDECK_CONDUCTOR_BACKEND supports only slack-v2 when set" }}
+{{ end }}
+{{ if and (ne $namedConductor "") (not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" $namedConductor)) }}
+{{ fail "AGENTDECK_CONDUCTOR_NAME is invalid" }}
+{{ end }}
+{{ if eq $namedBackend "slack-v2" }}
+[conductors.{{ $namedConductor | quote }}]
+  backend = "slack-v2"
+  [conductors.{{ $namedConductor | quote }}.slack_v2]
+    app_token = "$SLACK_APP_TOKEN"
+    bot_token = "$SLACK_BOT_TOKEN"
+    channel_id = "$SLACK_DECK_CHANNEL"
+    allowed_user_ids = ["$SLACK_DECK_USER"]
+    codex_executable = {{ printf "%s/.npm-global/bin/codex" .chezmoi.homeDir | quote }}
+{{ end }}
 
 [tmux]
   window_style_override = ""

@@ -5,6 +5,7 @@
   ...
 }:
 let
+  cfg = config.programs.agent-cli-update;
   updater = pkgs.writeShellApplication {
     name = "agent-cli-update";
     runtimeInputs = with pkgs; [
@@ -29,6 +30,7 @@ let
       state_dir="$HOME/.cache/agent-cli-update"
       restart_marker="$state_dir/restart-agent-deck-services"
       deferred_marker="$state_dir/deferred-agent-deck-release"
+      agent_deck_update_policy=${lib.escapeShellArg cfg.agentDeckPolicy}
       mkdir -p "$state_dir"
 
       exec 9>"$state_dir/update.lock"
@@ -206,6 +208,19 @@ let
         local release_json tag current latest highest
         local temp_dir source_dir before_sha after_sha
 
+        if [[ "$agent_deck_update_policy" == "pinned-custom" ]]; then
+          if ! rm -f "$restart_marker" "$deferred_marker"; then
+            log "ERROR: Could not clear stale Agent Deck update markers under pinned-custom policy."
+            return 1
+          fi
+          if [[ -e "$restart_marker" || -L "$restart_marker" || -e "$deferred_marker" || -L "$deferred_marker" ]]; then
+            log "ERROR: A stale Agent Deck update marker remains under pinned-custom policy."
+            return 1
+          fi
+          log "Agent Deck update policy is pinned-custom; skipping official release checks."
+          return 0
+        fi
+
         if [[ ! -x "$agent_deck" ]]; then
           log "ERROR: Agent Deck is missing at $agent_deck."
           return 1
@@ -284,6 +299,14 @@ let
 
       restart_agent_deck_services_when_idle() {
         local unit restarted=0
+        if [[ "$agent_deck_update_policy" == "pinned-custom" ]]; then
+          if [[ -e "$restart_marker" || -L "$restart_marker" || -e "$deferred_marker" || -L "$deferred_marker" ]]; then
+            log "ERROR: Refusing Agent Deck service restarts while a stale update marker remains under pinned-custom policy."
+            return 1
+          fi
+          log "Agent Deck service restarts are disabled under pinned-custom policy."
+          return 0
+        fi
         if [[ ! -e "$restart_marker" ]]; then
           return 0
         fi
@@ -307,38 +330,57 @@ let
         log "Agent Deck service refresh completed (active units restarted: $restarted)."
       }
 
+      run_updates() {
+        update_claude || result=1
+        update_codex || result=1
+        update_agent_deck || result=1
+        restart_agent_deck_services_when_idle || result=1
+      }
+
       log "Starting hourly CLI update check."
-      update_claude || result=1
-      update_codex || result=1
-      update_agent_deck || result=1
-      restart_agent_deck_services_when_idle || result=1
+      run_updates
       log "Hourly CLI update check finished with status $result."
       exit "$result"
     '';
   };
 in
 {
-  systemd.user.services.agent-cli-update = lib.mkIf pkgs.stdenv.isLinux {
-    Unit = {
-      Description = "Update Claude Code, Codex, and Agent Deck";
-      Wants = [ "network-online.target" ];
-      After = [ "network-online.target" ];
-    };
-    Service = {
-      Type = "oneshot";
-      ExecStart = "${updater}/bin/agent-cli-update";
-      TimeoutStartSec = "45m";
-    };
+  options.programs.agent-cli-update.agentDeckPolicy = lib.mkOption {
+    type = lib.types.enum [
+      "official"
+      "pinned-custom"
+    ];
+    default = "official";
+    description = ''
+      Agent Deck update ownership. The default official policy keeps release
+      auto-updates enabled; pinned-custom deterministically skips Agent Deck
+      release checks while Claude Code and Codex continue updating.
+    '';
   };
 
-  systemd.user.timers.agent-cli-update = lib.mkIf pkgs.stdenv.isLinux {
-    Unit.Description = "Hourly Claude Code, Codex, and Agent Deck updates";
-    Timer = {
-      OnCalendar = "hourly";
-      Persistent = true;
-      RandomizedDelaySec = "10m";
-      AccuracySec = "1m";
+  config = {
+    systemd.user.services.agent-cli-update = lib.mkIf pkgs.stdenv.isLinux {
+      Unit = {
+        Description = "Update Claude Code, Codex, and Agent Deck";
+        Wants = [ "network-online.target" ];
+        After = [ "network-online.target" ];
+      };
+      Service = {
+        Type = "oneshot";
+        ExecStart = "${updater}/bin/agent-cli-update";
+        TimeoutStartSec = "45m";
+      };
     };
-    Install.WantedBy = [ "timers.target" ];
+
+    systemd.user.timers.agent-cli-update = lib.mkIf pkgs.stdenv.isLinux {
+      Unit.Description = "Hourly Claude Code, Codex, and Agent Deck updates";
+      Timer = {
+        OnCalendar = "hourly";
+        Persistent = true;
+        RandomizedDelaySec = "10m";
+        AccuracySec = "1m";
+      };
+      Install.WantedBy = [ "timers.target" ];
+    };
   };
 }

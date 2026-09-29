@@ -132,6 +132,48 @@ class AgentDeckConfigCase(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("\n".join(needles) + "\n", encoding="utf-8")
 
+    @staticmethod
+    def _render_agent_deck_template(
+        root: Path, state_tag: str, *, conductor_name: str, backend: str
+    ) -> tuple[subprocess.CompletedProcess[str], dict]:
+        home = root / "home"
+        home.mkdir(exist_ok=True)
+        env = {
+            "HOME": str(home),
+            "PATH": os.environ["PATH"],
+            "USER": "synthetic-user",
+            "AGENTDECK_CONDUCTOR_NAME": conductor_name,
+            "AGENTDECK_CONDUCTOR_BACKEND": backend,
+            "SLACK_APP_TOKEN": "synthetic-app-token",
+            "SLACK_BOT_TOKEN": "synthetic-bot-token",
+            "SLACK_DECK_CHANNEL": "synthetic-channel",
+            "SLACK_DECK_USER": "synthetic-user-id",
+        }
+        result = subprocess.run(
+            [
+                CHEZMOI,
+                "--config",
+                str(root / f"config-{state_tag}.toml"),
+                "--cache",
+                str(root / f"cache-{state_tag}"),
+                "--persistent-state",
+                str(root / f"state-{state_tag}.boltdb"),
+                "--source",
+                str(REPO),
+                "--refresh-externals=never",
+                "execute-template",
+                "--file",
+                str(TEMPLATE),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=10,
+        )
+        parsed = tomllib.loads(result.stdout) if result.returncode == 0 else {}
+        return result, parsed
+
     def _run_release_gate(self, source: Path) -> subprocess.CompletedProcess[str]:
         functions = self._extract_updater_functions(
             "log",
@@ -216,6 +258,7 @@ set -u
 state_dir="$HOME/state"
 deferred_marker="$state_dir/deferred-agent-deck-release"
 restart_marker="$state_dir/restart-agent-deck-services"
+agent_deck_update_policy=official
 mkdir -p "$state_dir"
 {functions}
 update_agent_deck
@@ -238,6 +281,72 @@ update_agent_deck
             timeout=10,
         )
         return result, home / "state/deferred-agent-deck-release", update_sentinel
+
+    def _run_pinned_update_cycle(
+        self, root: Path, *, unremovable_marker: bool = False
+    ) -> tuple[subprocess.CompletedProcess[str], Path, Path, Path]:
+        claude_sentinel = root / "claude-called"
+        codex_sentinel = root / "codex-called"
+        systemctl_sentinel = root / "systemctl-called"
+        home = root / "home"
+        state = home / "state"
+        fake_bin = root / "fake-bin"
+        state.mkdir(parents=True)
+        fake_bin.mkdir()
+        restart_marker = state / "restart-agent-deck-services"
+        deferred_marker = state / "deferred-agent-deck-release"
+        if unremovable_marker:
+            restart_marker.mkdir()
+        else:
+            restart_marker.touch()
+        deferred_marker.touch()
+        (fake_bin / "systemctl").write_text(
+            '#!/bin/sh\ntouch "$TEST_SYSTEMCTL_SENTINEL"\nexit 97\n', encoding="utf-8"
+        )
+        (fake_bin / "pgrep").write_text(
+            '#!/bin/sh\ntouch "$TEST_SYSTEMCTL_SENTINEL"\nexit 97\n', encoding="utf-8"
+        )
+        (fake_bin / "systemctl").chmod(0o755)
+        (fake_bin / "pgrep").chmod(0o755)
+        functions = self._extract_updater_functions(
+            "log",
+            "update_agent_deck",
+            "restart_agent_deck_services_when_idle",
+            "run_updates",
+        )
+        script = f"""
+set -u
+state_dir="$HOME/state"
+deferred_marker="$state_dir/deferred-agent-deck-release"
+restart_marker="$state_dir/restart-agent-deck-services"
+agent_deck_update_policy=pinned-custom
+result=0
+mkdir -p "$state_dir"
+{functions}
+update_claude() {{ touch "$TEST_CLAUDE_SENTINEL"; }}
+update_codex() {{ touch "$TEST_CODEX_SENTINEL"; }}
+run_updates
+exit "$result"
+"""
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(home),
+                "PATH": f"{fake_bin}:{env['PATH']}",
+                "TEST_CLAUDE_SENTINEL": str(claude_sentinel),
+                "TEST_CODEX_SENTINEL": str(codex_sentinel),
+                "TEST_SYSTEMCTL_SENTINEL": str(systemctl_sentinel),
+            }
+        )
+        result = subprocess.run(
+            ["bash", "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=10,
+        )
+        return result, claude_sentinel, codex_sentinel, systemctl_sentinel
 
     def test_updater_and_template_share_managed_cli_destinations(self) -> None:
         updater = UPDATER.read_text(encoding="utf-8")
@@ -264,6 +373,8 @@ update_agent_deck
             env.update(
                 {
                     "HOME": str(home),
+                    "AGENTDECK_CONDUCTOR_BACKEND": "",
+                    "AGENTDECK_CONDUCTOR_NAME": "",
                     "SLACK_APP_TOKEN": "",
                     "SLACK_BOT_TOKEN": "",
                     "SLACK_DECK_CHANNEL": "",
@@ -295,6 +406,7 @@ update_agent_deck
             )
             self.assertEqual(0, result.returncode, result.stdout + result.stderr)
             config = tomllib.loads(result.stdout)
+            self.assertNotIn("conductors", config)
 
             for tool, relative_path in MANAGED_COMMANDS.items():
                 with self.subTest(tool=tool):
@@ -315,6 +427,143 @@ update_agent_deck
 
             updater = UPDATER.read_text(encoding="utf-8")
             self.assertIn("unset AGENTDECK_SKIP_UPDATE_CHECK", updater)
+
+    @unittest.skipUnless(CHEZMOI, "chezmoi is required for the render contract")
+    def test_slack_v2_opt_in_renders_only_exact_environment_references(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent-deck-slack-v2-config.") as temp:
+            root = Path(temp)
+            home = root / "home"
+            home.mkdir()
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(home),
+                    "AGENTDECK_CONDUCTOR_BACKEND": "slack-v2",
+                    "AGENTDECK_CONDUCTOR_NAME": "example-conductor",
+                    "SLACK_APP_TOKEN": "synthetic-app-token",
+                    "SLACK_BOT_TOKEN": "synthetic-bot-token",
+                    "SLACK_DECK_CHANNEL": "synthetic-channel",
+                    "SLACK_DECK_USER": "synthetic-user",
+                }
+            )
+            result = subprocess.run(
+                [
+                    CHEZMOI,
+                    "--config",
+                    str(root / "config.toml"),
+                    "--cache",
+                    str(root / "cache"),
+                    "--persistent-state",
+                    str(root / "state.boltdb"),
+                    "--source",
+                    str(REPO),
+                    "--refresh-externals=never",
+                    "execute-template",
+                    "--file",
+                    str(TEMPLATE),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=10,
+            )
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            config = tomllib.loads(result.stdout)
+            conductor = config["conductors"]["example-conductor"]
+            self.assertEqual("slack-v2", conductor["backend"])
+            self.assertEqual(
+                {
+                    "app_token": "$SLACK_APP_TOKEN",
+                    "bot_token": "$SLACK_BOT_TOKEN",
+                    "channel_id": "$SLACK_DECK_CHANNEL",
+                    "allowed_user_ids": ["$SLACK_DECK_USER"],
+                    "codex_executable": str(home / ".npm-global/bin/codex"),
+                },
+                conductor["slack_v2"],
+            )
+            # The legacy bridge intentionally renders its non-secret channel
+            # and user IDs. Credential values must never be rendered, while
+            # the v2 subtree above remains exact references for all four.
+            for synthetic in (
+                "synthetic-app-token",
+                "synthetic-bot-token",
+            ):
+                self.assertNotIn(synthetic, result.stdout)
+
+    @unittest.skipUnless(CHEZMOI, "chezmoi is required for the render contract")
+    def test_slack_v2_opt_in_survives_fresh_repeated_renders(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent-deck-slack-v2-repeat.") as temp:
+            root = Path(temp)
+            first, first_config = self._render_agent_deck_template(
+                root,
+                "first",
+                conductor_name="example-conductor",
+                backend="slack-v2",
+            )
+            second, second_config = self._render_agent_deck_template(
+                root,
+                "second",
+                conductor_name="example-conductor",
+                backend="slack-v2",
+            )
+            self.assertEqual(0, first.returncode, first.stdout + first.stderr)
+            self.assertEqual(0, second.returncode, second.stdout + second.stderr)
+            self.assertEqual(
+                first_config["conductors"]["example-conductor"],
+                second_config["conductors"]["example-conductor"],
+            )
+
+            absent, legacy_config = self._render_agent_deck_template(
+                root, "absent", conductor_name="", backend=""
+            )
+            self.assertEqual(0, absent.returncode, absent.stdout + absent.stderr)
+            self.assertNotIn("conductors", legacy_config)
+
+    def test_pinned_custom_policy_skips_agent_deck_but_keeps_other_updates(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent-deck-update-pinned.") as temp:
+            root = Path(temp)
+            result, claude_sentinel, codex_sentinel, systemctl_sentinel = (
+                self._run_pinned_update_cycle(root)
+            )
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertTrue(claude_sentinel.exists())
+            self.assertTrue(codex_sentinel.exists())
+            self.assertFalse(systemctl_sentinel.exists())
+            self.assertFalse((root / "home/state/restart-agent-deck-services").exists())
+            self.assertFalse((root / "home/state/deferred-agent-deck-release").exists())
+            self.assertIn(
+                "Agent Deck update policy is pinned-custom; skipping official release checks.",
+                result.stdout,
+            )
+            self.assertIn(
+                "Agent Deck service restarts are disabled under pinned-custom policy.",
+                result.stdout,
+            )
+
+    def test_pinned_custom_policy_fails_closed_on_unremovable_marker(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent-deck-update-pinned-failure.") as temp:
+            root = Path(temp)
+            result, claude_sentinel, codex_sentinel, systemctl_sentinel = (
+                self._run_pinned_update_cycle(root, unremovable_marker=True)
+            )
+            self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+            self.assertTrue(claude_sentinel.exists())
+            self.assertTrue(codex_sentinel.exists())
+            self.assertFalse(systemctl_sentinel.exists())
+            self.assertTrue((root / "home/state/restart-agent-deck-services").is_dir())
+            self.assertIn(
+                "ERROR: Could not clear stale Agent Deck update markers under pinned-custom policy.",
+                result.stdout,
+            )
+            self.assertIn(
+                "ERROR: Refusing Agent Deck service restarts while a stale update marker remains under pinned-custom policy.",
+                result.stdout,
+            )
+
+    def test_official_update_policy_remains_the_module_default(self) -> None:
+        module = UPDATER.read_text(encoding="utf-8")
+        self.assertIn('default = "official";', module)
 
     def test_updater_pins_each_acceptance_only_release_invariant(self) -> None:
         updater = UPDATER.read_text(encoding="utf-8")

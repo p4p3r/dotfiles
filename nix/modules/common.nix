@@ -100,6 +100,14 @@ in {
   home.file = lib.mkIf pkgs.stdenv.isLinux {
     ".docker/cli-plugins/docker-compose".source =
       "${pkgs.docker-compose}/libexec/docker/cli-plugins/docker-compose";
+    ".config/systemd/user/agent-deck-conductor-bridge.service.d/update-policy.conf".text = ''
+      [Service]
+      Environment=AGENTDECK_SKIP_UPDATE_CHECK=1
+    '';
+    ".config/systemd/user/agent-deck-transition-notifier.service.d/update-policy.conf".text = ''
+      [Service]
+      Environment=AGENTDECK_SKIP_UPDATE_CHECK=1
+    '';
   };
 
   home.sessionPath = [ "$HOME/.local/bin" "$HOME/.npm-global/bin" "$HOME/.opencode/bin" ];
@@ -108,6 +116,14 @@ in {
   # `npm install -g` fails. Point it at the user-owned prefix the activation
   # scripts already use, so manual updates (e.g. codex) work outside a rebuild.
   home.sessionVariables.NPM_CONFIG_PREFIX = "$HOME/.npm-global";
+
+  # Agent Deck's own long-running processes otherwise poll for releases and
+  # install them unattended. The hourly gated updater below is the sole update
+  # owner and explicitly clears this variable for its intentional update run.
+  home.sessionVariables.AGENTDECK_SKIP_UPDATE_CHECK = "1";
+  systemd.user.sessionVariables = lib.mkIf pkgs.stdenv.isLinux {
+    AGENTDECK_SKIP_UPDATE_CHECK = "1";
+  };
 
   # ----------------------------------------------------------------------------
   # Linux nix config + auto-gc.

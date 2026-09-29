@@ -302,6 +302,20 @@ update_agent_deck
                     self.assertTrue(Path(expected).is_absolute())
                     self.assertEqual(expected, config[tool]["command"])
 
+            for key in (
+                "auto_update",
+                "auto_update_remotes",
+                "auto_install",
+                "auto_restart",
+                "check_enabled",
+                "sweep_remotes",
+            ):
+                with self.subTest(update_setting=key):
+                    self.assertIs(False, config["updates"][key])
+
+            updater = UPDATER.read_text(encoding="utf-8")
+            self.assertIn("unset AGENTDECK_SKIP_UPDATE_CHECK", updater)
+
     def test_updater_pins_each_acceptance_only_release_invariant(self) -> None:
         updater = UPDATER.read_text(encoding="utf-8")
 

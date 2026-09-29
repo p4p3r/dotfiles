@@ -24,6 +24,7 @@ let
       export HOME="${config.home.homeDirectory}"
       export NPM_CONFIG_PREFIX="$HOME/.npm-global"
       export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+      unset AGENTDECK_SKIP_UPDATE_CHECK
 
       state_dir="$HOME/.cache/agent-cli-update"
       restart_marker="$state_dir/restart-agent-deck-services"

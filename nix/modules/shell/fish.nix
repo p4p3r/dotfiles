@@ -21,9 +21,11 @@
 
   # Same story for home.sessionVariables: HM only writes them into
   # hm-session-vars.sh (bash/zsh), so fish never sees them. Shim
-  # NPM_CONFIG_PREFIX so interactive `npm install -g` targets ~/.npm-global.
+  # NPM_CONFIG_PREFIX so interactive `npm install -g` targets ~/.npm-global,
+  # and keep Agent Deck's hidden updater out of interactive processes.
   home.file.".config/fish/conf.d/02-session-vars.fish".text = ''
     set -gx NPM_CONFIG_PREFIX "$HOME/.npm-global"
+    set -gx AGENTDECK_SKIP_UPDATE_CHECK 1
   '';
 
   # Note: All other Fish configuration (config.fish, functions, other conf.d files)

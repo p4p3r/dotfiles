@@ -173,7 +173,9 @@ programs.agent-deck-maintenance = {
 
 The resulting user timer runs hourly with overlap prevention in the controller. Its hardened
 oneshot has a private umask and state directory, explicit collector/Agent Deck/service timeouts,
-and no environment-file or secret projection. To remain portable across unprivileged user managers
+and no environment-file or secret projection. Custodian launches use the explicit managed Codex
+path (`~/.npm-global/bin/codex` by default), so a stale system binary earlier on another execution
+path cannot bypass the hourly updater. To remain portable across unprivileged user managers
 on hosts that restrict user namespaces, it intentionally omits `PrivateDevices`, `ProtectClock`,
 `ProtectKernelLogs`, and `ProtectKernelModules`; systemd implements each by narrowing the capability
 bounding set. The remaining process hardening stays enabled, while namespace protections remain

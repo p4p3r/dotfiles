@@ -267,6 +267,10 @@
         test -f "$service"
         test -f "$timer"
         ${pkgs.gnugrep}/bin/grep -F -- "--repo /project/100%%nice" "$service"
+        ${pkgs.gnugrep}/bin/grep -F -- \
+          "--codex-executable /home/maintenance-check/.npm-global/bin/codex" "$service"
+        test "$(${pkgs.gnugrep}/bin/grep -F -c -- \
+          "ConditionFileIsExecutable=" "$service")" -eq 2
         # npm-installed agent launchers need Node even without an interactive shell.
         service_path="$(${pkgs.gnused}/bin/sed -n 's/^Environment=PATH=//p' "$service")"
         test -n "$service_path"

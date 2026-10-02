@@ -13,6 +13,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -1135,7 +1136,10 @@ def launch_custodian(
         args.workdir,
         "--no-parent",
         "--cmd",
-        "codex --dangerously-bypass-approvals-and-sandbox",
+        (
+            f"{shlex.quote(args.codex_executable)} "
+            "--dangerously-bypass-approvals-and-sandbox"
+        ),
         "--effort",
         "xhigh",
         "--title",
@@ -1474,6 +1478,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--collector", default="agent-deck-maintenance-collector", help="collector executable"
     )
     parser.add_argument("--agent-deck", default="agent-deck", help="Agent Deck executable")
+    parser.add_argument(
+        "--codex-executable",
+        default=str(Path.home() / ".npm-global/bin/codex"),
+        help="absolute path to the managed Codex executable used for custodian sessions",
+    )
     parser.add_argument("--git", default="git", help="git executable for the collector")
     parser.add_argument("--charter", required=True, help="report-only custodian charter")
     parser.add_argument("--workdir", required=True, help="custodian launch directory")
@@ -1519,6 +1528,7 @@ def validate_args(args: argparse.Namespace) -> None:
         args.collector_state or str(default_state_path("maintenance-collector.json"))
     )
     args.charter = absolute_path(args.charter)
+    args.codex_executable = str(absolute_path(args.codex_executable))
     args.workdir = str(absolute_path(args.workdir))
     if not Path(args.workdir).is_dir():
         raise ControllerError("work directory is unavailable")
@@ -1526,7 +1536,7 @@ def validate_args(args: argparse.Namespace) -> None:
     args.filesystem = [
         str(absolute_path(value)) for value in (args.filesystem or ["/"])
     ]
-    all_paths = [args.workdir, *args.repo, *args.filesystem]
+    all_paths = [args.codex_executable, args.workdir, *args.repo, *args.filesystem]
     if any(len(value) > PATH_LIMIT or "\x00" in value for value in all_paths):
         raise ControllerError("configured path is invalid")
     if len(args.repo) != len(set(args.repo)) or len(args.filesystem) != len(

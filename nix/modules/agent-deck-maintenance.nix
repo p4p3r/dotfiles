@@ -44,6 +44,8 @@ let
     "${runtime}/bin/agent-deck-maintenance-collector"
     "--agent-deck"
     (systemdLiteral cfg.agentDeckExecutable)
+    "--codex-executable"
+    (systemdLiteral cfg.codexExecutable)
     "--git"
     "${pkgs.git}/bin/git"
     "--charter"
@@ -101,6 +103,12 @@ in
       type = lib.types.str;
       default = "${config.home.homeDirectory}/.local/bin/agent-deck";
       description = "Absolute path to the public Agent Deck CLI.";
+    };
+
+    codexExecutable = lib.mkOption {
+      type = lib.types.str;
+      default = "${config.home.homeDirectory}/.npm-global/bin/codex";
+      description = "Absolute path to the managed Codex CLI used for custodian sessions.";
     };
 
     repositoryRoots = lib.mkOption {
@@ -186,6 +194,7 @@ in
           [
             cfg.workDirectory
             cfg.agentDeckExecutable
+            cfg.codexExecutable
           ]
           ++ cfg.repositoryRoots
           ++ cfg.filesystemRoots
@@ -199,7 +208,10 @@ in
     systemd.user.services.agent-deck-maintenance = {
       Unit = {
         Description = "Report-only Agent Deck maintenance control tick";
-        ConditionFileIsExecutable = systemdLiteral cfg.agentDeckExecutable;
+        ConditionFileIsExecutable = map systemdLiteral [
+          cfg.agentDeckExecutable
+          cfg.codexExecutable
+        ];
       };
       Service = {
         Type = "oneshot";

@@ -326,6 +326,8 @@ class ControllerCase(unittest.TestCase):
             str(self.collector),
             "--agent-deck",
             str(self.agent_deck),
+            "--codex-executable",
+            str(self.root / "managed codex;touch SHOULD_NOT_EXIST_CODEX"),
             "--git",
             str(self.git),
             "--charter",
@@ -431,6 +433,11 @@ class ControllerCase(unittest.TestCase):
         self.assertIn("--no-parent", launch)
         self.assertIn("--message-file", launch)
         self.assertEqual(launch[launch.index("--message-file") + 1], "-")
+        self.assertEqual(
+            launch[launch.index("--cmd") + 1],
+            f"'{self.root}/managed codex;touch SHOULD_NOT_EXIST_CODEX' "
+            "--dangerously-bypass-approvals-and-sandbox",
+        )
         self.assertEqual(launch.count("--acceptance-only"), 1)
         self.assertIn("--json", launch)
         self.assertNotIn("SHOULD_NOT_EXIST", launch)
@@ -1136,6 +1143,8 @@ class ModuleContractCase(unittest.TestCase):
             with self.subTest(directive=directive):
                 self.assertNotIn(f"{directive} = true", text)
         self.assertIn("ConditionFileIsExecutable", text)
+        self.assertIn("codexExecutable", text)
+        self.assertIn('"--codex-executable"', text)
         self.assertIn("TimeoutStartSec", text)
         self.assertIn('lib.replaceStrings [ "%" ] [ "%%" ]', text)
         self.assertNotIn("EnvironmentFile", text)

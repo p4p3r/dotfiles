@@ -65,6 +65,12 @@ direnv exec . which cargo rustc python3    # confirms nix store paths, not /usr/
   whatever stray toolchain happens to be on `PATH` — which is how the FFI-path and cargo-not-found
   confusions happened in earlier attempts. Always run `direnv allow` in the worktree you're about
   to release from before relying on it.
+- The worktree used for the actual release commit/tag/push must have local `main` checked out and
+  be synchronized with `origin/main` — or the commit must be pushed with an explicit
+  `HEAD:refs/heads/main` refspec. Never run the release from a feature-style branch name. Isolated
+  worktrees remain the right pattern for packs compilation, FFI builds, and other preparation;
+  use a local `main` checkout for the release commit and tag. `scripts/release.sh` now enforces
+  this with a hard branch/synchronization guard and an explicit `HEAD:refs/heads/main` push.
 - Prefer running the whole release flow as `direnv exec . scripts/release.sh <version>` (or,
   inside an interactive `fish -l` shell that has already `cd`'d into the allowed worktree, just
   `scripts/release.sh <version>` directly — direnv's shell hook loads automatically on `cd`).
@@ -196,3 +202,9 @@ worktree are all cheap to throw away. A pushed tag is not.
   sites fixed across local/stable/canary/customer/XCFramework release tooling). If you hit a
   hardcoded `target/debug/...` path failure again, that's either a regression or a 13th site —
   find it and fix it the same way, don't hand-patch around it.
+- **v0.16.1 main-ref incident** — the release was run from an isolated worktree on a feature-style
+  branch. `git push origin HEAD` pushed the release commit to that branch's same-named remote ref,
+  silently leaving `main` behind and skipping push-to-main automation, specifically `docker.yml`'s
+  ECR publish. The structural fix in engine PR #3112 requires a synchronized local `main` checkout
+  before release changes and pushes the commit explicitly to `refs/heads/main`; keep release
+  preparation in isolated worktrees, but perform the release commit/tag/push from local `main`.

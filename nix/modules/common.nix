@@ -176,12 +176,13 @@ in {
   home.activation = lib.mkIf pkgs.stdenv.isLinux {
     installUpstreamClis = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
       # opencode's installer extracts a tarball, so tar/gzip must be on PATH.
-      export PATH=${pkgs.nodejs_22}/bin:${pkgs.curl}/bin:${pkgs.bash}/bin:${pkgs.gnutar}/bin:${pkgs.gzip}/bin:${pkgs.tmux}/bin:${pkgs.gawk}/bin:$PATH
+      export PATH=${pkgs.nodejs_22}/bin:${pkgs.curl}/bin:${pkgs.bash}/bin:${pkgs.coreutils}/bin:${pkgs.jq}/bin:${pkgs.gnutar}/bin:${pkgs.gzip}/bin:${pkgs.tmux}/bin:${pkgs.gawk}/bin:$PATH
       export NPM_CONFIG_PREFIX="$HOME/.npm-global"
       mkdir -p "$NPM_CONFIG_PREFIX" "$HOME/.local/bin"
 
       echo "[postActivation] Installing global npm packages…"
-      npm install -g @openai/codex || true
+      ${pkgs.bash}/bin/bash ${../scripts/codex-npm-install.sh} ensure "$NPM_CONFIG_PREFIX" \
+        || echo "[postActivation] WARN: no healthy Codex install could be proven"
       npm uninstall -g @zed-industries/codex-acp 2>/dev/null || true      # renamed -> @agentclientprotocol
       npm install -g @agentclientprotocol/codex-acp || true
       npm uninstall -g @zed-industries/claude-code-acp 2>/dev/null || true # renamed -> @agentclientprotocol

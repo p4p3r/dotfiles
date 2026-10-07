@@ -103,10 +103,11 @@
             # - @agentclientprotocol/*-acp: ACP bridges so Zed can talk to Codex / Claude Code
             echo "Installing global npm packages..."
             sudo -u ${user} -H bash -c '
-              export PATH=${pkgs.nodejs_22}/bin:$PATH
+              export PATH=${pkgs.nodejs_22}/bin:${pkgs.bash}/bin:${pkgs.coreutils}/bin:${pkgs.jq}/bin:$PATH
               export NPM_CONFIG_PREFIX=$HOME/.npm-global
               mkdir -p "$NPM_CONFIG_PREFIX"
-              npm install -g @openai/codex || true
+              ${pkgs.bash}/bin/bash ${./scripts/codex-npm-install.sh} ensure "$NPM_CONFIG_PREFIX" \
+                || echo "WARN: no healthy Codex install could be proven"
               npm uninstall -g @zed-industries/codex-acp 2>/dev/null || true      # renamed -> @agentclientprotocol
               npm install -g @agentclientprotocol/codex-acp || true
               npm uninstall -g @zed-industries/claude-code-acp 2>/dev/null || true # renamed -> @agentclientprotocol

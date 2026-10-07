@@ -69,28 +69,14 @@ let
 
       update_codex() {
         local codex="$HOME/.npm-global/bin/codex"
-        local current latest
-        if [[ ! -x "$codex" ]]; then
-          log "ERROR: Codex is missing at $codex."
-          return 1
-        fi
-        if ! current="$("$codex" --version | awk 'NR == 1 { print $NF }')"; then
-          log "ERROR: Could not read the installed Codex version."
-          return 1
-        fi
-        if ! latest="$(timeout 2m npm view @openai/codex version | tail -n 1)"; then
-          log "ERROR: Could not resolve the latest Codex npm version."
-          return 1
-        fi
-        if [[ -z "$current" || -z "$latest" ]]; then
-          log "ERROR: Empty Codex version (installed='$current', latest='$latest')."
-          return 1
-        fi
-        if [[ "$current" == "$latest" ]]; then
-          log "Codex is current at $current."
+        log "Checking Codex wrapper and platform package at $codex..."
+        if ${pkgs.bash}/bin/bash ${../scripts/codex-npm-install.sh} update "$NPM_CONFIG_PREFIX"; then
           return 0
+        else
+          local status=$?
+          log "ERROR: Codex update failed with status $status."
+          return "$status"
         fi
-        run_update "Codex $current -> $latest" npm install --global @openai/codex@latest
       }
 
       check_agent_deck_feature() {

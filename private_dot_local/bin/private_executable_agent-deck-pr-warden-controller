@@ -1,0 +1,1356 @@
+#!/usr/bin/env python3
+"""Fake-only, single-writer PR-warden lifecycle controller.
+
+The signed-ingress control socket remains the event and dedupe authority.  This
+process owns one private lifecycle record and never retries an uncertain wake.
+All externally visible failures are fixed codes; request bodies and command
+output are never logged.
+"""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import resource
+import shlex
+import stat
+import subprocess
+import sys
+import tempfile
+from typing import Any, Iterator, NoReturn
+import uuid
+
+
+SCHEMA_VERSION = 1
+MAX_CONFIG_BYTES = 131_072
+MAX_STATE_BYTES = 65_536
+MAX_ARTIFACT_BYTES = 16_384
+MAX_COMMAND_BYTES = 131_072
+MAX_ACCEPTANCE_BYTES = 2_048
+MAX_PATH = 4_096
+EXIT_OK = 0
+EXIT_INVALID = 64
+EXIT_NOT_VERIFIED = 77
+EXIT_BUSY = 75
+EXIT_TEST_STOP = 78
+
+ALIAS_RE = re.compile(r"^[a-z2-7]{52}$")
+TOKEN_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+CONDUCTOR_RE = re.compile(
+    r"^(?:[0-9a-f]{8,20}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})-[0-9]{9,20}$"
+)
+SESSION_RE = re.compile(r"^[0-9a-f]{8,20}-[0-9]{9,20}$")
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+OPAQUE_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+REF_RE = re.compile(r"^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
+RFC3339_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+)
+ACCEPTED_AT_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z$"
+)
+
+INGRESS_FIELDS = {
+    "version", "provider", "event", "action", "event_alias", "object_type",
+    "object_alias", "owner_host", "owner_conductor", "received_at", "accepted_at",
+    "claimed_at", "settled_at", "state", "result",
+}
+ACCEPTANCE_FIELDS = {
+    "schema_version", "success", "acceptance", "instance_id", "delivery",
+    "submitted", "accepted_turn_kind", "accepted_turn",
+}
+ACCEPTED_TURN_FIELDS = {
+    "receipt_id", "instance_id", "codex_session_id", "turn_generation", "accepted_at",
+}
+RESULT_FIELDS = {
+    "schema_version", "trigger_alias", "object_alias", "owner_session_id", "status",
+    "result_code", "completed_at", "provider_code", "local_git_code",
+}
+FACT_FIELDS = {
+    "repository_id", "pull_request_id", "pull_request_number", "url", "state", "draft",
+    "head_repository_id", "head_ref", "head_sha", "mergeability", "review_decision",
+    "check_counts", "unresolved_review_threads", "updated_at", "observed_at", "result_code",
+}
+CHECK_FIELDS = {"pending", "success", "failure", "total"}
+LOCAL_FIELDS = {
+    "schema_version", "code", "head_repository_id", "head_ref", "head_sha", "remote_name",
+    "remote_url", "dirty", "untracked", "unpushed", "observed_at",
+}
+STATE_FIELDS = {
+    "schema_version", "configuration_digest", "service_instance", "work_id", "lifecycle_key",
+    "lifecycle_state", "owner_kind", "owner_session_id", "unverified_session_id", "object_alias",
+    "admitted_at", "deadline", "next_check_at", "checked_at", "session_status",
+    "session_observed_at", "current_trigger", "last_result", "handoff", "reason_code",
+    "rotation", "authority_code", "retention", "archived_at", "state_digest",
+}
+TRIGGER_FIELDS = {
+    "event_alias", "object_alias", "disposition", "claimed_at", "receipt", "result_ref",
+    "result_digest", "settlement",
+}
+RECEIPT_FIELDS = {
+    "receipt_id", "codex_session_id", "turn_generation", "accepted_at",
+}
+LAST_RESULT_FIELDS = {"ref", "digest", "status", "code"}
+HANDOFF_FIELDS = {"ref", "digest", "verified"}
+
+
+class WardenError(Exception):
+    """A sanitized configuration, state, or evidence failure."""
+
+    def __init__(self, code: str = "INVALID") -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class BusyError(WardenError):
+    """The nonblocking single-writer lock is already held."""
+
+
+class CommandError(WardenError):
+    """A subprocess did not return bounded, usable evidence."""
+
+
+def require(condition: bool, code: str = "INVALID") -> None:
+    if not condition:
+        raise WardenError(code)
+
+
+def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        require(key not in result)
+        result[key] = value
+    return result
+
+
+def reject_constant(_value: str) -> NoReturn:
+    raise WardenError()
+
+
+def finite_float(value: str) -> float:
+    result = float(value)
+    require(math.isfinite(result))
+    return result
+
+
+def parse_json(raw: bytes) -> Any:
+    try:
+        return json.loads(
+            raw.decode("utf-8", errors="strict"), object_pairs_hook=unique_object,
+            parse_constant=reject_constant, parse_float=finite_float,
+        )
+    except (UnicodeError, ValueError, RecursionError):
+        raise WardenError() from None
+
+
+def exact(value: Any, fields: set[str], code: str = "INVALID") -> dict[str, Any]:
+    require(type(value) is dict and set(value) == fields, code)
+    return value
+
+
+def integer(value: Any, low: int = 1, high: int = 2**63 - 1) -> int:
+    require(type(value) is int and low <= value <= high)
+    return value
+
+
+def text(value: Any, maximum: int, pattern: re.Pattern[str] | None = None) -> str:
+    require(type(value) is str and 0 < len(value) <= maximum and "\x00" not in value)
+    require(pattern is None or pattern.fullmatch(value) is not None)
+    return value
+
+
+def timestamp(value: Any) -> str:
+    rendered = text(value, 20, RFC3339_RE)
+    try:
+        datetime.strptime(rendered, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (ValueError, OverflowError):
+        raise WardenError() from None
+    return rendered
+
+
+def parse_time(value: Any) -> datetime:
+    return datetime.strptime(timestamp(value), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def clock(value: str | None) -> tuple[datetime, str]:
+    now = datetime.now(timezone.utc).replace(microsecond=0) if value is None else parse_time(value)
+    return now, now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+
+
+def digest(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def absolute_path(value: Any, *, allow_store: bool = False) -> Path:
+    rendered = text(value, MAX_PATH)
+    path = Path(rendered)
+    require(path.is_absolute() and path != Path("/") and ".." not in path.parts)
+    require(allow_store or not path.is_relative_to("/nix/store"))
+    for ancestor in (path, *path.parents):
+        require(not ancestor.is_symlink(), "UNSAFE_FILE")
+    return path
+
+
+def private_directory(path: Path, *, create: bool) -> None:
+    try:
+        if create and not path.exists():
+            path.mkdir(mode=0o700)
+        info = path.lstat()
+        require(stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode), "UNSAFE_FILE")
+        require(info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700, "UNSAFE_FILE")
+    except OSError:
+        raise WardenError("UNSAFE_FILE") from None
+
+
+def private_file_info(path: Path, maximum: int, *, missing: bool = False) -> os.stat_result | None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        if missing:
+            return None
+        raise WardenError("UNSAFE_FILE") from None
+    except OSError:
+        raise WardenError("UNSAFE_FILE") from None
+    require(
+        stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+        and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o600
+        and info.st_nlink == 1 and 0 <= info.st_size <= maximum,
+        "UNSAFE_FILE",
+    )
+    return info
+
+
+def read_private(path: Path, maximum: int) -> bytes:
+    expected = private_file_info(path, maximum)
+    assert expected is not None
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            current = os.fstat(descriptor)
+            require(
+                (current.st_dev, current.st_ino, current.st_size)
+                == (expected.st_dev, expected.st_ino, expected.st_size),
+                "UNSAFE_FILE",
+            )
+            data = bytearray()
+            while len(data) <= maximum:
+                part = os.read(descriptor, min(65_536, maximum + 1 - len(data)))
+                if not part:
+                    break
+                data.extend(part)
+            require(len(data) <= maximum and len(data) == expected.st_size, "UNSAFE_FILE")
+            require(os.fstat(descriptor).st_size == expected.st_size, "UNSAFE_FILE")
+            return bytes(data)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        raise WardenError("UNSAFE_FILE") from None
+
+
+def atomic_write(path: Path, value: dict[str, Any], maximum: int) -> str:
+    private_directory(path.parent, create=False)
+    payload = json.dumps(value, sort_keys=True, indent=2, ensure_ascii=True).encode("ascii") + b"\n"
+    require(len(payload) <= maximum, "STATE_WRITE_NOT_VERIFIED")
+    descriptor = -1
+    temporary: str | None = None
+    replaced = False
+    try:
+        descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            require(written > 0, "STATE_WRITE_NOT_VERIFIED")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, path)
+        temporary = None
+        replaced = True
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        private_file_info(path, maximum)
+        return digest(payload)
+    except WardenError:
+        raise
+    except OSError:
+        raise WardenError("STATE_WRITE_NOT_VERIFIED" if replaced else "STATE_WRITE_FAILED") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+@contextmanager
+def writer_lock(path: Path) -> Iterator[None]:
+    private_directory(path.parent, create=True)
+    existing = private_file_info(path, 0, missing=True)
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+        current = os.fstat(descriptor)
+        require(
+            stat.S_ISREG(current.st_mode) and current.st_uid == os.geteuid()
+            and stat.S_IMODE(current.st_mode) == 0o600 and current.st_nlink == 1,
+            "UNSAFE_FILE",
+        )
+        if existing is not None:
+            require((existing.st_dev, existing.st_ino) == (current.st_dev, current.st_ino), "UNSAFE_FILE")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise BusyError("BUSY") from None
+        yield
+    except BusyError:
+        raise
+    except OSError:
+        raise WardenError("UNSAFE_FILE") from None
+    finally:
+        if "descriptor" in locals():
+            os.close(descriptor)
+
+
+def strict_url(value: Any) -> str:
+    rendered = text(value, 2_048)
+    require(re.fullmatch(r"https://[A-Za-z0-9.-]+/[A-Za-z0-9._~/-]+", rendered) is not None)
+    return rendered
+
+
+def executable(value: Any) -> str:
+    path = absolute_path(value, allow_store=True)
+    try:
+        info = path.stat()
+    except OSError:
+        raise WardenError() from None
+    require(stat.S_ISREG(info.st_mode) and os.access(path, os.X_OK))
+    return str(path)
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    path = absolute_path(str(path))
+    config = exact(parse_json(read_private(path, MAX_CONFIG_BYTES)), {
+        "schema_version", "service_instance", "work_id", "owner", "paths", "agent_deck",
+        "ingress", "lifecycle", "binding", "provider", "local_git", "authority",
+    })
+    require(integer(config["schema_version"]) == SCHEMA_VERSION)
+    text(config["service_instance"], 128, NAME_RE)
+    text(config["work_id"], 128, NAME_RE)
+    owner = exact(config["owner"], {"host", "conductor"})
+    text(owner["host"], 64, HOST_RE)
+    text(owner["conductor"], 64, CONDUCTOR_RE)
+    paths = exact(config["paths"], {"state_dir", "runtime_dir", "result_dir", "handoff_dir"})
+    resolved = [absolute_path(paths[name]) for name in sorted(paths)]
+    require(len(set(resolved)) == len(resolved))
+    require(all(
+        left not in right.parents and right not in left.parents
+        for index, left in enumerate(resolved)
+        for right in resolved[index + 1:]
+    ))
+    for name, value in paths.items():
+        paths[name] = str(absolute_path(value))
+    deck = exact(config["agent_deck"], {
+        "executable", "profile", "codex_executable", "work_directory", "start_timeout_seconds",
+        "wake_timeout_seconds", "parent_policy",
+    })
+    deck["executable"] = executable(deck["executable"])
+    deck["codex_executable"] = executable(deck["codex_executable"])
+    text(deck["profile"], 128, NAME_RE)
+    workdir = absolute_path(deck["work_directory"])
+    require(workdir.is_dir())
+    deck["work_directory"] = str(workdir)
+    for field in ("start_timeout_seconds", "wake_timeout_seconds"):
+        integer(deck[field], 1, 3_600)
+    require(deck["parent_policy"] == "NO_PARENT")
+    ingress = exact(config["ingress"], {
+        "executable", "socket", "owner_host", "owner_conductor", "provider", "event", "object_alias",
+    })
+    ingress["executable"] = executable(ingress["executable"])
+    ingress["socket"] = str(absolute_path(ingress["socket"]))
+    require(ingress["owner_host"] == owner["host"] and ingress["owner_conductor"] == owner["conductor"])
+    require(ingress["provider"] == "github" and ingress["event"] == "pull_request")
+    text(ingress["object_alias"], 52, ALIAS_RE)
+    lifecycle = exact(config["lifecycle"], {
+        "specialist_kind", "repository_id", "pull_request_id", "pull_request_number", "url",
+        "deadline", "next_check_at", "retention", "rotation",
+    })
+    require(lifecycle["specialist_kind"] == "pr-warden")
+    for field in ("repository_id", "pull_request_id", "pull_request_number"):
+        integer(lifecycle[field])
+    strict_url(lifecycle["url"])
+    deadline = parse_time(lifecycle["deadline"])
+    next_check = parse_time(lifecycle["next_check_at"])
+    require(next_check <= deadline)
+    text(lifecycle["retention"], 64, TOKEN_RE)
+    rotation = exact(lifecycle["rotation"], {"context_measurement", "owner_age_at", "health_failure_limit"})
+    require(rotation["context_measurement"] == "UNAVAILABLE")
+    require(parse_time(rotation["owner_age_at"]) <= deadline)
+    integer(rotation["health_failure_limit"], 1, 100)
+    binding = exact(config["binding"], {
+        "head_repository_id", "head_ref", "worktree", "remote_name", "remote_url",
+    })
+    integer(binding["head_repository_id"])
+    text(binding["head_ref"], 266, REF_RE)
+    binding["worktree"] = str(absolute_path(binding["worktree"]))
+    require(Path(binding["worktree"]).is_dir())
+    text(binding["remote_name"], 64, NAME_RE)
+    strict_url(binding["remote_url"])
+    for section in ("provider", "local_git"):
+        adapter = exact(config[section], {"kind", "executable", "fixture", "timeout_seconds"})
+        require(adapter["kind"] == "FAKE", "UNSUPPORTED_PROVIDER")
+        adapter["executable"] = executable(adapter["executable"])
+        adapter["fixture"] = str(absolute_path(adapter["fixture"]))
+        private_file_info(Path(adapter["fixture"]), MAX_ARTIFACT_BYTES)
+        integer(adapter["timeout_seconds"], 1, 300)
+    authority = exact(config["authority"], {
+        "read_only", "edit", "push", "comment", "reply", "resolve_thread", "bot_request",
+        "body_rewrite", "merge", "close", "enqueue", "force_push", "branch_delete", "deploy", "takeover",
+    })
+    require(authority["read_only"] is True)
+    require(all(authority[name] is False for name in authority if name != "read_only"))
+    return config
+
+
+def configuration_digest(config: dict[str, Any]) -> str:
+    return digest(canonical(config))
+
+
+def state_digest(state: dict[str, Any]) -> str:
+    return digest(canonical({key: value for key, value in state.items() if key != "state_digest"}))
+
+
+def validate_receipt(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    item = exact(value, RECEIPT_FIELDS, "INVALID_STATE")
+    try:
+        require(str(uuid.UUID(text(item["receipt_id"], 36))) == item["receipt_id"], "INVALID_STATE")
+    except (ValueError, AttributeError):
+        raise WardenError("INVALID_STATE") from None
+    text(item["codex_session_id"], 128, OPAQUE_RE)
+    generation = text(item["turn_generation"], 257)
+    require(generation.startswith(item["codex_session_id"] + ":"), "INVALID_STATE")
+    text(generation.split(":", 1)[1], 128, OPAQUE_RE)
+    accepted_at = text(item["accepted_at"], 64, ACCEPTED_AT_RE)
+    try:
+        datetime.fromisoformat(accepted_at[:-1] + "+00:00")
+    except (ValueError, OverflowError):
+        raise WardenError("INVALID_STATE") from None
+    return item
+
+
+def validate_state(value: Any, config: dict[str, Any]) -> dict[str, Any]:
+    state = exact(value, STATE_FIELDS, "INVALID_STATE")
+    require(type(state["schema_version"]) is int and state["schema_version"] == SCHEMA_VERSION, "INVALID_STATE")
+    require(state["configuration_digest"] == configuration_digest(config), "CONFIGURATION_CHANGED")
+    require(state["service_instance"] == config["service_instance"] and state["work_id"] == config["work_id"], "INVALID_STATE")
+    expected_key = {
+        "specialist_kind": "pr-warden",
+        "repository_id": config["lifecycle"]["repository_id"],
+        "pull_request_number": config["lifecycle"]["pull_request_number"],
+        "declared_host": config["owner"]["host"],
+    }
+    require(state["lifecycle_key"] == expected_key, "INVALID_STATE")
+    require(state["lifecycle_state"] in {"ADMITTED", "ACTIVE", "WAITING", "ROTATING", "ESCALATED", "ARCHIVED"}, "INVALID_STATE")
+    require(state["owner_kind"] in {"CONDUCTOR", "SESSION", "NONE"}, "INVALID_STATE")
+    owner = state["owner_session_id"]
+    candidate = state["unverified_session_id"]
+    require(owner is None or (type(owner) is str and SESSION_RE.fullmatch(owner) is not None), "INVALID_STATE")
+    require(candidate is None or (type(candidate) is str and SESSION_RE.fullmatch(candidate) is not None), "INVALID_STATE")
+    if state["owner_kind"] == "SESSION":
+        require(owner is not None, "INVALID_STATE")
+    else:
+        require(owner is None, "INVALID_STATE")
+    if state["lifecycle_state"] == "ARCHIVED":
+        require(state["owner_kind"] == "NONE" and owner is None and state["archived_at"] is not None, "INVALID_STATE")
+    else:
+        require(state["owner_kind"] != "NONE" and state["archived_at"] is None, "INVALID_STATE")
+    require(state["object_alias"] == config["ingress"]["object_alias"], "INVALID_STATE")
+    for field in ("admitted_at", "deadline", "next_check_at"):
+        timestamp(state[field])
+    for field in ("checked_at", "session_observed_at", "archived_at"):
+        if state[field] is not None:
+            timestamp(state[field])
+    require(state["session_status"] in {"NONE", "RUNNING", "QUEUED", "WAITING", "IDLE", "STOPPED", "ERROR", "UNKNOWN"}, "INVALID_STATE")
+    trigger = state["current_trigger"]
+    if trigger is not None:
+        trigger = exact(trigger, TRIGGER_FIELDS, "INVALID_STATE")
+        alias = text(trigger["event_alias"], 80)
+        require(ALIAS_RE.fullmatch(alias) is not None or alias.startswith("admission-"), "INVALID_STATE")
+        require(trigger["object_alias"] == state["object_alias"], "INVALID_STATE")
+        require(trigger["disposition"] in {"CLAIMED", "ATTEMPTED", "SUBMITTED", "COMPLETED", "UNCERTAIN"}, "INVALID_STATE")
+        timestamp(trigger["claimed_at"])
+        validate_receipt(trigger["receipt"])
+        for field in ("result_ref", "result_digest"):
+            if trigger[field] is not None:
+                text(trigger[field], 256 if field == "result_ref" else 64)
+        require(trigger["settlement"] in {"NONE", "completed", "api_unavailable", "indeterminate"}, "INVALID_STATE")
+    if state["last_result"] is not None:
+        item = exact(state["last_result"], LAST_RESULT_FIELDS, "INVALID_STATE")
+        text(item["ref"], 256)
+        text(item["digest"], 64, HEX_RE)
+        text(item["status"], 32, TOKEN_RE)
+        text(item["code"], 64, TOKEN_RE)
+    if state["handoff"] is not None:
+        item = exact(state["handoff"], HANDOFF_FIELDS, "INVALID_STATE")
+        text(item["ref"], 256)
+        text(item["digest"], 64, HEX_RE)
+        require(type(item["verified"]) is bool, "INVALID_STATE")
+    require(state["reason_code"] is None or (type(state["reason_code"]) is str and TOKEN_RE.fullmatch(state["reason_code"]) is not None), "INVALID_STATE")
+    require(state["rotation"] == config["lifecycle"]["rotation"], "INVALID_STATE")
+    require(state["authority_code"] == "READ_ONLY", "INVALID_STATE")
+    require(state["retention"] == config["lifecycle"]["retention"], "INVALID_STATE")
+    require(text(state["state_digest"], 64, HEX_RE) == state_digest(state), "INVALID_STATE")
+    return state
+
+
+def write_state(path: Path, state: dict[str, Any], config: dict[str, Any]) -> None:
+    state["state_digest"] = state_digest(state)
+    validate_state(state, config)
+    atomic_write(path, state, MAX_STATE_BYTES)
+
+
+def load_state(path: Path, config: dict[str, Any]) -> dict[str, Any] | None:
+    info = private_file_info(path, MAX_STATE_BYTES, missing=True)
+    if info is None:
+        return None
+    return validate_state(parse_json(read_private(path, MAX_STATE_BYTES)), config)
+
+
+def run_command(argv: list[str], timeout: int, stdin: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
+    environment = {
+        key: os.environ[key]
+        for key in (
+            "HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "TMPDIR",
+            "PATH", "LANG", "LC_ALL", "USER",
+        )
+        if key in os.environ
+    }
+    try:
+        result = subprocess.run(
+            argv, input=stdin, stdin=None if stdin is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False,
+            shell=False, env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise CommandError("COMMAND_UNAVAILABLE") from None
+    require(len(result.stdout) <= MAX_COMMAND_BYTES and len(result.stderr) <= MAX_COMMAND_BYTES, "COMMAND_UNAVAILABLE")
+    return result
+
+
+def command_json(result: subprocess.CompletedProcess[bytes], maximum: int = MAX_COMMAND_BYTES) -> dict[str, Any]:
+    require(result.returncode == 0 and not result.stderr and len(result.stdout) <= maximum, "COMMAND_NOT_VERIFIED")
+    value = parse_json(result.stdout)
+    require(type(value) is dict, "COMMAND_NOT_VERIFIED")
+    return value
+
+
+def ingress_command(config: dict[str, Any], args: list[str]) -> dict[str, Any]:
+    ingress = config["ingress"]
+    command = [ingress["executable"], "--socket", ingress["socket"], *args]
+    return command_json(run_command(command, 10))
+
+
+def validate_row(value: Any) -> dict[str, Any]:
+    row = exact(value, INGRESS_FIELDS, "INGRESS_NOT_VERIFIED")
+    require(row["version"] == 2 and row["provider"] in {"github", "linear"}, "INGRESS_NOT_VERIFIED")
+    for field in ("event_alias", "object_alias"):
+        text(row[field], 52, ALIAS_RE)
+    for field in ("owner_host", "owner_conductor", "event", "object_type", "action"):
+        text(row[field], 128)
+    for field in ("received_at", "accepted_at"):
+        text(row[field], 64)
+    for field in ("claimed_at", "settled_at"):
+        require(row[field] is None or type(row[field]) is str, "INGRESS_NOT_VERIFIED")
+    require(row["state"] in {"accepted", "claimed", "completed", "uncertain", "dead_letter"}, "INGRESS_NOT_VERIFIED")
+    require(row["result"] in {"none", "completed", "api_unavailable", "indeterminate", "dead_letter"}, "INGRESS_NOT_VERIFIED")
+    return row
+
+
+def ingress_rows(config: dict[str, Any]) -> list[dict[str, Any]]:
+    reply = exact(ingress_command(config, ["list", "--limit", "100"]), {"code", "rows"}, "INGRESS_NOT_VERIFIED")
+    require(reply["code"] == "OK" and type(reply["rows"]) is list and len(reply["rows"]) <= 100, "INGRESS_NOT_VERIFIED")
+    return [validate_row(row) for row in reply["rows"]]
+
+
+def claim(config: dict[str, Any], alias: str) -> None:
+    reply = exact(ingress_command(config, ["claim", alias]), {"code"}, "INGRESS_NOT_VERIFIED")
+    require(reply["code"] == "CLAIMED", "CLAIM_CONFLICT")
+
+
+def settle(config: dict[str, Any], alias: str, result: str) -> None:
+    reply = exact(ingress_command(config, ["settle", alias, "--result", result]), {"code"}, "INGRESS_NOT_VERIFIED")
+    require(reply["code"] == "SETTLED", "SETTLEMENT_NOT_VERIFIED")
+
+
+def parse_acceptance(raw: bytes, expected_owner: str | None) -> tuple[str, dict[str, Any]]:
+    require(len(raw) <= MAX_ACCEPTANCE_BYTES, "DELIVERY_NOT_VERIFIED")
+    value = exact(parse_json(raw), ACCEPTANCE_FIELDS, "DELIVERY_NOT_VERIFIED")
+    owner = text(value["instance_id"], 64, SESSION_RE)
+    require(expected_owner is None or owner == expected_owner, "DELIVERY_NOT_VERIFIED")
+    require(
+        type(value["schema_version"]) is int and value["schema_version"] == 1 and value["success"] is True
+        and value["acceptance"] == "accepted" and value["delivery"] == "submitted"
+        and value["submitted"] is True and value["accepted_turn_kind"] == "codex_rollout",
+        "DELIVERY_NOT_VERIFIED",
+    )
+    accepted = exact(value["accepted_turn"], ACCEPTED_TURN_FIELDS, "DELIVERY_NOT_VERIFIED")
+    require(accepted["instance_id"] == owner, "DELIVERY_NOT_VERIFIED")
+    receipt = {
+        "receipt_id": accepted["receipt_id"],
+        "codex_session_id": accepted["codex_session_id"],
+        "turn_generation": accepted["turn_generation"],
+        "accepted_at": accepted["accepted_at"],
+    }
+    validate_receipt(receipt)
+    return owner, receipt
+
+
+def show_owner(config: dict[str, Any], owner: str) -> str:
+    deck = config["agent_deck"]
+    result = run_command(
+        [deck["executable"], "-p", deck["profile"], "session", "show", owner, "--json"],
+        deck["wake_timeout_seconds"],
+    )
+    payload = command_json(result)
+    forbidden = {"body", "output", "message", "prompt", "log", "transcript"}
+    require(not forbidden.intersection(payload), "OWNER_NOT_VERIFIED")
+    require(payload.get("id") == owner, "OWNER_NOT_VERIFIED")
+    require(payload.get("profile", deck["profile"]) == deck["profile"], "OWNER_NOT_VERIFIED")
+    raw = payload.get("status")
+    require(raw in {"running", "queued", "waiting", "idle", "stopped", "error"}, "OWNER_NOT_VERIFIED")
+    return str(raw).upper()
+
+
+def result_path(config: dict[str, Any], alias: str) -> Path:
+    return Path(config["paths"]["result_dir"]) / f"{alias}.json"
+
+
+def handoff_path(config: dict[str, Any], alias: str) -> Path:
+    return Path(config["paths"]["handoff_dir"]) / f"{alias}.json"
+
+
+def prompt(config: dict[str, Any], alias: str, *, admission: bool) -> bytes:
+    lines = [
+        "PR_WARDEN_TRIGGER_VERSION: 1",
+        f"TRIGGER_ALIAS: {alias}",
+        f"OBJECT_ALIAS: {config['ingress']['object_alias']}",
+        f"OWNER_ALIAS: {config['owner']['host']}:{config['owner']['conductor']}",
+        f"RESULT_LOCATION: {result_path(config, alias)}",
+        "AUTHORITY: READ_ONLY",
+        "EVENT_BODY: UNAVAILABLE",
+        "Fetch current facts only after this accepted wake through the configured fake interface.",
+        "Write one owner-only result JSON with no body, review text, raw provider response, or logs.",
+        "This is admission acknowledgement." if admission else "This is one exact signed-ingress trigger.",
+    ]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def verify_result(
+    config: dict[str, Any], alias: str, owner: str, claimed_at: str, observed_at: str,
+) -> tuple[dict[str, Any], str]:
+    path = result_path(config, alias)
+    raw = read_private(path, MAX_ARTIFACT_BYTES)
+    value = exact(parse_json(raw), RESULT_FIELDS, "RESULT_NOT_VERIFIED")
+    require(
+        type(value["schema_version"]) is int and value["schema_version"] == 1 and value["trigger_alias"] == alias
+        and value["object_alias"] == config["ingress"]["object_alias"]
+        and value["owner_session_id"] == owner,
+        "RESULT_NOT_VERIFIED",
+    )
+    require(value["status"] in {"COMPLETE", "NEEDS_USER", "NEEDS_SCOPE", "FAILED"}, "RESULT_NOT_VERIFIED")
+    for field in ("result_code", "provider_code", "local_git_code"):
+        text(value[field], 64, TOKEN_RE)
+    require(
+        parse_time(claimed_at) <= parse_time(value["completed_at"]) <= parse_time(observed_at),
+        "RESULT_NOT_VERIFIED",
+    )
+    return value, digest(raw)
+
+
+def fetch_interface(config: dict[str, Any], section: str) -> dict[str, Any]:
+    adapter = config[section]
+    request = {
+        "schema_version": 1,
+        "op": "fetch_current_pr" if section == "provider" else "inspect_local_git",
+        "fixture": adapter["fixture"],
+        "binding": {
+            "repository_id": config["lifecycle"]["repository_id"],
+            "pull_request_id": config["lifecycle"]["pull_request_id"],
+            "pull_request_number": config["lifecycle"]["pull_request_number"],
+            "url": config["lifecycle"]["url"],
+            "head_repository_id": config["binding"]["head_repository_id"],
+            "head_ref": config["binding"]["head_ref"],
+            "worktree": config["binding"]["worktree"],
+            "remote_name": config["binding"]["remote_name"],
+            "remote_url": config["binding"]["remote_url"],
+        },
+    }
+    result = run_command([adapter["executable"]], adapter["timeout_seconds"], canonical(request) + b"\n")
+    return command_json(result, MAX_ARTIFACT_BYTES)
+
+
+def provider_facts(config: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    try:
+        value = fetch_interface(config, "provider")
+    except WardenError:
+        return "MALFORMED", None
+    if set(value) == {"schema_version", "code"} and value == {"schema_version": 1, "code": "API_UNAVAILABLE"}:
+        return "API_UNAVAILABLE", None
+    try:
+        envelope = exact(value, {"schema_version", "code", "facts"})
+        require(type(envelope["schema_version"]) is int and envelope["schema_version"] == 1 and envelope["code"] == "OK")
+        facts = exact(envelope["facts"], FACT_FIELDS)
+        require(facts["result_code"] == "OK")
+        for field in ("repository_id", "pull_request_id", "pull_request_number", "head_repository_id", "unresolved_review_threads"):
+            integer(facts[field], 0 if field == "unresolved_review_threads" else 1)
+        strict_url(facts["url"])
+        require(facts["state"] in {"OPEN", "CLOSED", "MERGED"} and type(facts["draft"]) is bool)
+        text(facts["head_ref"], 266, REF_RE)
+        text(facts["head_sha"], 40, SHA_RE)
+        require(facts["mergeability"] in {"MERGEABLE", "CONFLICTING", "UNKNOWN"})
+        require(facts["review_decision"] in {"APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED", "NONE"})
+        counts = exact(facts["check_counts"], CHECK_FIELDS)
+        for value in counts.values():
+            integer(value, 0, 1_000_000)
+        require(counts["total"] == counts["pending"] + counts["success"] + counts["failure"])
+        timestamp(facts["updated_at"])
+        timestamp(facts["observed_at"])
+    except WardenError:
+        return "MALFORMED", None
+    expected = config["lifecycle"]
+    identity = (
+        facts["repository_id"] == expected["repository_id"]
+        and facts["pull_request_id"] == expected["pull_request_id"]
+        and facts["pull_request_number"] == expected["pull_request_number"]
+        and facts["url"] == expected["url"]
+        and facts["head_repository_id"] == config["binding"]["head_repository_id"]
+        and facts["head_ref"] == config["binding"]["head_ref"]
+    )
+    return ("OK", facts) if identity else ("IDENTITY_MISMATCH", facts)
+
+
+def local_facts(config: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    try:
+        value = exact(fetch_interface(config, "local_git"), LOCAL_FIELDS)
+        require(type(value["schema_version"]) is int and value["schema_version"] == 1 and value["code"] == "OK")
+        integer(value["head_repository_id"])
+        text(value["head_ref"], 266, REF_RE)
+        text(value["head_sha"], 40, SHA_RE)
+        text(value["remote_name"], 64, NAME_RE)
+        strict_url(value["remote_url"])
+        for field in ("dirty", "untracked", "unpushed"):
+            require(type(value[field]) is bool)
+        timestamp(value["observed_at"])
+    except WardenError:
+        return "MALFORMED", None
+    binding = config["binding"]
+    if (
+        value["head_repository_id"] != binding["head_repository_id"]
+        or value["head_ref"] != binding["head_ref"]
+        or value["remote_name"] != binding["remote_name"]
+        or value["remote_url"] != binding["remote_url"]
+    ):
+        return "IDENTITY_MISMATCH", value
+    if value["dirty"] or value["untracked"] or value["unpushed"]:
+        return "DIRTY_BRANCH", value
+    return "OK", value
+
+
+def compact_handoff(
+    config: dict[str, Any], state: dict[str, Any], alias: str, result: dict[str, Any],
+    provider_code: str, local_code: str, disposition: str, now_text: str,
+) -> tuple[str, str]:
+    artifact = {
+        "schema_version": 1,
+        "lifecycle_key": state["lifecycle_key"],
+        "trigger_alias": alias,
+        "object_alias": state["object_alias"],
+        "owner_session_id": state["owner_session_id"],
+        "completed_at": now_text,
+        "status": result["status"],
+        "result_code": result["result_code"],
+        "provider_code": provider_code,
+        "local_git_code": local_code,
+        "disposition": disposition,
+        "authority_code": "READ_ONLY",
+        "retention": state["retention"],
+    }
+    path = handoff_path(config, alias)
+    handoff_digest = atomic_write(path, artifact, MAX_ARTIFACT_BYTES)
+    return path.name, handoff_digest
+
+
+def new_state(config: dict[str, Any], now_text: str) -> dict[str, Any]:
+    state = {
+        "schema_version": 1,
+        "configuration_digest": configuration_digest(config),
+        "service_instance": config["service_instance"],
+        "work_id": config["work_id"],
+        "lifecycle_key": {
+            "specialist_kind": "pr-warden",
+            "repository_id": config["lifecycle"]["repository_id"],
+            "pull_request_number": config["lifecycle"]["pull_request_number"],
+            "declared_host": config["owner"]["host"],
+        },
+        "lifecycle_state": "ADMITTED",
+        "owner_kind": "CONDUCTOR",
+        "owner_session_id": None,
+        "unverified_session_id": None,
+        "object_alias": config["ingress"]["object_alias"],
+        "admitted_at": now_text,
+        "deadline": config["lifecycle"]["deadline"],
+        "next_check_at": config["lifecycle"]["next_check_at"],
+        "checked_at": None,
+        "session_status": "NONE",
+        "session_observed_at": None,
+        "current_trigger": None,
+        "last_result": None,
+        "handoff": None,
+        "reason_code": "ADMITTED",
+        "rotation": config["lifecycle"]["rotation"],
+        "authority_code": "READ_ONLY",
+        "retention": config["lifecycle"]["retention"],
+        "archived_at": None,
+        "state_digest": "0" * 64,
+    }
+    state["state_digest"] = state_digest(state)
+    return state
+
+
+def admission_alias(config: dict[str, Any]) -> str:
+    return "admission-" + digest(config["service_instance"].encode("ascii"))[:52]
+
+
+def test_stop(args: argparse.Namespace, point: str) -> bool:
+    return args.test_stop_after == point
+
+
+def finish_admission(
+    config: dict[str, Any], state: dict[str, Any], state_path: Path, now_text: str,
+    *, observed: str | None = None,
+) -> int:
+    trigger = state["current_trigger"]
+    assert trigger is not None and trigger["event_alias"].startswith("admission-")
+    owner = state["owner_session_id"]
+    assert isinstance(owner, str)
+    if observed is None:
+        observed = show_owner(config, owner)
+    state["session_status"] = observed
+    state["session_observed_at"] = now_text
+    state["checked_at"] = now_text
+    if observed in {"RUNNING", "QUEUED"}:
+        state["reason_code"] = "OWNER_ACTIVE"
+        write_state(state_path, state, config)
+        return EXIT_OK
+    if observed in {"STOPPED", "ERROR"}:
+        state["lifecycle_state"] = "ESCALATED"
+        state["reason_code"] = "OWNER_TERMINAL"
+        write_state(state_path, state, config)
+        return EXIT_NOT_VERIFIED
+    result_value, result_digest = verify_result(
+        config, trigger["event_alias"], owner, trigger["claimed_at"], now_text,
+    )
+    require(result_value["status"] == "COMPLETE", "RESULT_NOT_VERIFIED")
+    trigger["disposition"] = "COMPLETED"
+    trigger["result_ref"] = result_path(config, trigger["event_alias"]).name
+    trigger["result_digest"] = result_digest
+    state["last_result"] = {
+        "ref": trigger["result_ref"], "digest": result_digest,
+        "status": result_value["status"], "code": result_value["result_code"],
+    }
+    state["lifecycle_state"] = "WAITING"
+    state["reason_code"] = "ADMISSION_VERIFIED"
+    write_state(state_path, state, config)
+    return EXIT_OK
+
+
+def process_admit(config: dict[str, Any], args: argparse.Namespace, state_path: Path, now_text: str) -> int:
+    require(load_state(state_path, config) is None, "DUPLICATE_ADMISSION")
+    state = new_state(config, now_text)
+    write_state(state_path, state, config)
+    alias = admission_alias(config)
+    deck = config["agent_deck"]
+    command = [
+        deck["executable"], "-p", deck["profile"], "launch", deck["work_directory"], "--no-parent",
+        "--cmd", f"{shlex.quote(deck['codex_executable'])} --dangerously-bypass-approvals-and-sandbox",
+        "--effort", "xhigh", "--title", "pr-warden", "--message-file", "-",
+        "--acceptance-only", "--json",
+    ]
+    result = run_command(command, deck["start_timeout_seconds"] + 30, prompt(config, alias, admission=True))
+    try:
+        if result.returncode != 0 or result.stderr:
+            raise WardenError("LAUNCH_NOT_VERIFIED")
+        owner, receipt = parse_acceptance(result.stdout, None)
+    except WardenError:
+        state["lifecycle_state"] = "ESCALATED"
+        state["reason_code"] = "LAUNCH_NOT_VERIFIED"
+        try:
+            parsed = parse_json(result.stdout)
+            candidate = parsed.get("instance_id") if type(parsed) is dict else None
+            if type(candidate) is str and SESSION_RE.fullmatch(candidate):
+                state["unverified_session_id"] = candidate
+        except WardenError:
+            pass
+        write_state(state_path, state, config)
+        return EXIT_NOT_VERIFIED
+    state["unverified_session_id"] = owner
+    write_state(state_path, state, config)
+    try:
+        observed = show_owner(config, owner)
+        require(observed not in {"STOPPED", "ERROR"}, "OWNER_NOT_VERIFIED")
+    except WardenError:
+        state["lifecycle_state"] = "ESCALATED"
+        state["reason_code"] = "OWNER_NOT_VERIFIED"
+        write_state(state_path, state, config)
+        return EXIT_NOT_VERIFIED
+    state["owner_kind"] = "SESSION"
+    state["owner_session_id"] = owner
+    state["unverified_session_id"] = None
+    state["lifecycle_state"] = "ACTIVE"
+    state["session_status"] = observed
+    state["session_observed_at"] = now_text
+    state["current_trigger"] = {
+        "event_alias": alias, "object_alias": state["object_alias"], "disposition": "SUBMITTED",
+        "claimed_at": now_text, "receipt": receipt, "result_ref": None,
+        "result_digest": None, "settlement": "NONE",
+    }
+    state["reason_code"] = "ADMISSION_SUBMITTED"
+    write_state(state_path, state, config)
+    if observed in {"WAITING", "IDLE"}:
+        return finish_admission(config, state, state_path, now_text, observed=observed)
+    return EXIT_OK
+
+
+def target_rows(config: dict[str, Any], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    expected = config["ingress"]
+    matching = []
+    for row in rows:
+        if row["object_alias"] != expected["object_alias"]:
+            continue
+        require(
+            row["provider"] == expected["provider"] and row["event"] == expected["event"]
+            and row["object_type"] == expected["event"],
+            "WRONG_OBJECT",
+        )
+        require(
+            row["owner_host"] == expected["owner_host"]
+            and row["owner_conductor"] == expected["owner_conductor"],
+            "WRONG_INGRESS_OWNER",
+        )
+        matching.append(row)
+    return matching
+
+
+def row_for_alias(rows: list[dict[str, Any]], alias: str) -> dict[str, Any] | None:
+    found = [row for row in rows if row["event_alias"] == alias]
+    require(len(found) <= 1, "INGRESS_NOT_VERIFIED")
+    return found[0] if found else None
+
+
+def uncertain_trigger(config: dict[str, Any], state: dict[str, Any], state_path: Path, now_text: str) -> int:
+    trigger = state["current_trigger"]
+    assert trigger is not None
+    try:
+        settle(config, trigger["event_alias"], "indeterminate")
+        trigger["settlement"] = "indeterminate"
+    except WardenError:
+        trigger["settlement"] = "NONE"
+    trigger["disposition"] = "UNCERTAIN"
+    state["lifecycle_state"] = "ESCALATED"
+    state["checked_at"] = now_text
+    state["reason_code"] = "DELIVERY_NOT_VERIFIED"
+    write_state(state_path, state, config)
+    return EXIT_NOT_VERIFIED
+
+
+def archive_owner(config: dict[str, Any], state: dict[str, Any], state_path: Path, now_text: str) -> int:
+    owner = state["owner_session_id"]
+    require(type(owner) is str, "OWNER_NOT_VERIFIED")
+    rows = target_rows(config, ingress_rows(config))
+    require(not any(row["state"] in {"accepted", "claimed"} for row in rows), "ARCHIVE_PENDING_TRIGGER")
+    deck = config["agent_deck"]
+    try:
+        result = run_command(
+            [deck["executable"], "-p", deck["profile"], "session", "archive", owner, "--json"],
+            deck["wake_timeout_seconds"],
+        )
+        payload = command_json(result)
+        require(payload.get("id") == owner and payload.get("archived") is True, "ARCHIVE_NOT_VERIFIED")
+        observed = show_owner(config, owner)
+        require(observed == "STOPPED", "ARCHIVE_NOT_VERIFIED")
+    except WardenError:
+        state["lifecycle_state"] = "ESCALATED"
+        state["reason_code"] = "ARCHIVE_NOT_VERIFIED"
+        write_state(state_path, state, config)
+        return EXIT_NOT_VERIFIED
+    state["session_status"] = observed
+    state["session_observed_at"] = now_text
+    state["owner_kind"] = "NONE"
+    state["owner_session_id"] = None
+    state["lifecycle_state"] = "ARCHIVED"
+    state["archived_at"] = now_text
+    state["reason_code"] = "MERGED_ARCHIVED"
+    write_state(state_path, state, config)
+    return EXIT_OK
+
+
+def finish_submitted(
+    config: dict[str, Any], args: argparse.Namespace, state: dict[str, Any], state_path: Path,
+    row: dict[str, Any], now_text: str,
+) -> int:
+    trigger = state["current_trigger"]
+    assert trigger is not None
+    owner = state["owner_session_id"]
+    assert isinstance(owner, str)
+    observed = show_owner(config, owner)
+    state["session_status"] = observed
+    state["session_observed_at"] = now_text
+    if observed in {"RUNNING", "QUEUED"}:
+        state["checked_at"] = now_text
+        state["reason_code"] = "OWNER_ACTIVE"
+        write_state(state_path, state, config)
+        return EXIT_OK
+    if observed in {"STOPPED", "ERROR"}:
+        state["lifecycle_state"] = "ESCALATED"
+        state["reason_code"] = "OWNER_TERMINAL"
+        write_state(state_path, state, config)
+        return EXIT_NOT_VERIFIED
+    try:
+        result_value, result_digest = verify_result(
+            config, trigger["event_alias"], owner, trigger["claimed_at"], now_text,
+        )
+    except WardenError:
+        try:
+            settle(config, trigger["event_alias"], "indeterminate")
+            trigger["settlement"] = "indeterminate"
+        except WardenError:
+            trigger["settlement"] = "NONE"
+        trigger["disposition"] = "UNCERTAIN"
+        state["lifecycle_state"] = "ESCALATED"
+        state["checked_at"] = now_text
+        state["reason_code"] = "RESULT_NOT_VERIFIED"
+        write_state(state_path, state, config)
+        return EXIT_NOT_VERIFIED
+    provider_code, facts = provider_facts(config)
+    local_code, local = local_facts(config)
+    settlement = "completed"
+    final_state = "WAITING"
+    reason = "TRIGGER_COMPLETED"
+    exit_code = EXIT_OK
+    if provider_code == "API_UNAVAILABLE":
+        settlement, final_state, reason, exit_code = "api_unavailable", "ESCALATED", "API_UNAVAILABLE", EXIT_NOT_VERIFIED
+    elif provider_code in {"MALFORMED", "IDENTITY_MISMATCH"} or local_code == "MALFORMED":
+        settlement, final_state, reason, exit_code = "indeterminate", "ESCALATED", "FACTS_NOT_VERIFIED", EXIT_NOT_VERIFIED
+    elif local_code == "IDENTITY_MISMATCH":
+        final_state, reason, exit_code = "ESCALATED", "LOCAL_IDENTITY_MISMATCH", EXIT_NOT_VERIFIED
+    elif local_code == "DIRTY_BRANCH":
+        final_state, reason, exit_code = "ESCALATED", "DIRTY_BRANCH", EXIT_NOT_VERIFIED
+    elif facts is None or local is None:
+        settlement, final_state, reason, exit_code = "indeterminate", "ESCALATED", "FACTS_NOT_VERIFIED", EXIT_NOT_VERIFIED
+    elif facts["head_sha"] != local["head_sha"]:
+        final_state, reason, exit_code = "ESCALATED", "STALE_HEAD", EXIT_NOT_VERIFIED
+    elif facts["state"] == "CLOSED":
+        final_state, reason, exit_code = "ESCALATED", "CLOSED_UNMERGED", EXIT_NOT_VERIFIED
+    elif facts["state"] == "MERGED":
+        reason = "MERGED"
+    elif result_value["status"] != "COMPLETE":
+        final_state, reason, exit_code = "ESCALATED", result_value["status"], EXIT_NOT_VERIFIED
+    handoff_ref, handoff_digest = compact_handoff(
+        config, state, trigger["event_alias"], result_value, provider_code, local_code,
+        reason, now_text,
+    )
+    trigger["result_ref"] = result_path(config, trigger["event_alias"]).name
+    trigger["result_digest"] = result_digest
+    state["last_result"] = {
+        "ref": trigger["result_ref"], "digest": result_digest,
+        "status": result_value["status"], "code": result_value["result_code"],
+    }
+    state["handoff"] = {"ref": handoff_ref, "digest": handoff_digest, "verified": True}
+    state["checked_at"] = now_text
+    state["reason_code"] = reason
+    write_state(state_path, state, config)
+    if test_stop(args, "after-result"):
+        return EXIT_TEST_STOP
+    settle(config, trigger["event_alias"], settlement)
+    if test_stop(args, "after-settle"):
+        return EXIT_TEST_STOP
+    trigger["settlement"] = settlement
+    trigger["disposition"] = "COMPLETED" if settlement == "completed" else "UNCERTAIN"
+    state["lifecycle_state"] = final_state
+    state["reason_code"] = reason
+    write_state(state_path, state, config)
+    if facts is not None and facts["state"] == "MERGED" and settlement == "completed" and final_state == "WAITING":
+        if test_stop(args, "before-archive"):
+            return EXIT_TEST_STOP
+        return archive_owner(config, state, state_path, now_text)
+    return exit_code
+
+
+def reconcile_active(
+    config: dict[str, Any], args: argparse.Namespace, state: dict[str, Any], state_path: Path,
+    rows: list[dict[str, Any]], now_text: str,
+) -> int | None:
+    trigger = state["current_trigger"]
+    if trigger is None:
+        return None
+    if trigger["event_alias"].startswith("admission-"):
+        if trigger["disposition"] == "COMPLETED":
+            return None
+        require(
+            state["lifecycle_state"] == "ACTIVE" and trigger["disposition"] == "SUBMITTED",
+            "RESULT_NOT_VERIFIED",
+        )
+        return finish_admission(config, state, state_path, now_text)
+    if trigger["disposition"] == "COMPLETED" and state["reason_code"] == "MERGED":
+        return archive_owner(config, state, state_path, now_text)
+    if trigger["disposition"] == "COMPLETED":
+        return None
+    row = row_for_alias(rows, trigger["event_alias"])
+    require(row is not None, "INGRESS_NOT_VERIFIED")
+    if row["state"] in {"completed", "uncertain", "dead_letter"}:
+        trigger["settlement"] = row["result"]
+        trigger["disposition"] = "COMPLETED" if row["state"] == "completed" else "UNCERTAIN"
+        completed_reason = state["reason_code"] in {"TRIGGER_COMPLETED", "MERGED"}
+        state["lifecycle_state"] = "WAITING" if row["state"] == "completed" and completed_reason else "ESCALATED"
+        state["checked_at"] = now_text
+        merged = state["reason_code"] == "MERGED"
+        state["reason_code"] = "MERGED" if merged else ("SETTLEMENT_RECONCILED" if state["lifecycle_state"] == "WAITING" else "UNCERTAIN_RECONCILED")
+        write_state(state_path, state, config)
+        if merged and state["lifecycle_state"] == "WAITING":
+            return archive_owner(config, state, state_path, now_text)
+        return EXIT_OK if state["lifecycle_state"] == "WAITING" else EXIT_NOT_VERIFIED
+    require(row["state"] == "claimed", "INGRESS_NOT_VERIFIED")
+    if trigger["disposition"] == "SUBMITTED":
+        return finish_submitted(config, args, state, state_path, row, now_text)
+    if trigger["disposition"] == "ATTEMPTED":
+        return uncertain_trigger(config, state, state_path, now_text)
+    if trigger["disposition"] == "CLAIMED":
+        state["lifecycle_state"] = "ESCALATED"
+        state["checked_at"] = now_text
+        state["reason_code"] = "CLAIM_RECOVERY_REQUIRED"
+        write_state(state_path, state, config)
+        return EXIT_NOT_VERIFIED
+    return EXIT_NOT_VERIFIED
+
+
+def process_reconcile(
+    config: dict[str, Any], args: argparse.Namespace, state: dict[str, Any], state_path: Path,
+    now_text: str,
+) -> int:
+    if state["lifecycle_state"] == "ARCHIVED":
+        return EXIT_OK
+    rows = ingress_rows(config)
+    targets = target_rows(config, rows)
+    active_result = reconcile_active(config, args, state, state_path, rows, now_text)
+    if active_result is not None:
+        return active_result
+    claimed = [row for row in targets if row["state"] == "claimed"]
+    if claimed:
+        state["lifecycle_state"] = "ESCALATED"
+        state["checked_at"] = now_text
+        state["reason_code"] = "CLAIM_RECOVERY_REQUIRED"
+        write_state(state_path, state, config)
+        return EXIT_NOT_VERIFIED
+    state["checked_at"] = now_text
+    state["reason_code"] = "RECONCILED"
+    write_state(state_path, state, config)
+    return EXIT_OK
+
+
+def process_tick(
+    config: dict[str, Any], args: argparse.Namespace, state: dict[str, Any], state_path: Path,
+    now: datetime, now_text: str,
+) -> int:
+    require(state["lifecycle_state"] != "ARCHIVED", "ARCHIVED")
+    if now >= parse_time(state["deadline"]):
+        state["lifecycle_state"] = "ESCALATED"
+        state["checked_at"] = now_text
+        state["reason_code"] = "DEADLINE_CROSSED"
+        write_state(state_path, state, config)
+        return EXIT_NOT_VERIFIED
+    if state["owner_kind"] == "SESSION" and now >= parse_time(state["rotation"]["owner_age_at"]):
+        state["lifecycle_state"] = "ROTATING"
+        state["checked_at"] = now_text
+        state["reason_code"] = "OWNER_AGE_DUE"
+        write_state(state_path, state, config)
+        return EXIT_NOT_VERIFIED
+    rows = ingress_rows(config)
+    targets = target_rows(config, rows)
+    active_result = reconcile_active(config, args, state, state_path, rows, now_text)
+    if active_result is not None:
+        return active_result
+    require(state["lifecycle_state"] == "WAITING" and state["owner_kind"] == "SESSION", "LIFECYCLE_NOT_WAITING")
+    owner = state["owner_session_id"]
+    assert isinstance(owner, str)
+    observed = show_owner(config, owner)
+    state["session_status"] = observed
+    state["session_observed_at"] = now_text
+    state["checked_at"] = now_text
+    if observed in {"RUNNING", "QUEUED"}:
+        state["reason_code"] = "OWNER_BUSY"
+        write_state(state_path, state, config)
+        return EXIT_OK
+    if observed in {"STOPPED", "ERROR"}:
+        state["lifecycle_state"] = "ESCALATED"
+        state["reason_code"] = "OWNER_TERMINAL"
+        write_state(state_path, state, config)
+        return EXIT_NOT_VERIFIED
+    claimed = [row for row in targets if row["state"] == "claimed"]
+    if claimed:
+        state["lifecycle_state"] = "ESCALATED"
+        state["reason_code"] = "CLAIM_RECOVERY_REQUIRED"
+        write_state(state_path, state, config)
+        return EXIT_NOT_VERIFIED
+    accepted = [row for row in targets if row["state"] == "accepted"]
+    if not accepted:
+        if len(rows) == 100:
+            state["lifecycle_state"] = "ESCALATED"
+            state["reason_code"] = "LIST_BOUND_NOT_VERIFIED"
+            write_state(state_path, state, config)
+            return EXIT_NOT_VERIFIED
+        state["reason_code"] = "NO_TRIGGER"
+        write_state(state_path, state, config)
+        return EXIT_OK
+    row = accepted[0]
+    if test_stop(args, "before-claim"):
+        return EXIT_TEST_STOP
+    claim(config, row["event_alias"])
+    if test_stop(args, "after-claim"):
+        return EXIT_TEST_STOP
+    trigger = {
+        "event_alias": row["event_alias"], "object_alias": row["object_alias"],
+        "disposition": "CLAIMED", "claimed_at": now_text, "receipt": None,
+        "result_ref": None, "result_digest": None, "settlement": "NONE",
+    }
+    state["current_trigger"] = trigger
+    state["lifecycle_state"] = "ACTIVE"
+    state["reason_code"] = "TRIGGER_CLAIMED"
+    write_state(state_path, state, config)
+    if test_stop(args, "after-trigger-write"):
+        return EXIT_TEST_STOP
+    trigger["disposition"] = "ATTEMPTED"
+    state["reason_code"] = "DELIVERY_ATTEMPTED"
+    write_state(state_path, state, config)
+    deck = config["agent_deck"]
+    result = run_command(
+        [
+            deck["executable"], "-p", deck["profile"], "session", "send", owner,
+            "--message-file", "-", "--acceptance-only", "--json", "--timeout",
+            f"{deck['wake_timeout_seconds']}s",
+        ],
+        deck["wake_timeout_seconds"] + 5,
+        prompt(config, row["event_alias"], admission=False),
+    )
+    if test_stop(args, "after-send"):
+        return EXIT_TEST_STOP
+    try:
+        if result.returncode != 0 or result.stderr:
+            raise WardenError("DELIVERY_NOT_VERIFIED")
+        exact_owner, receipt = parse_acceptance(result.stdout, owner)
+        require(exact_owner == owner, "DELIVERY_NOT_VERIFIED")
+    except WardenError:
+        return uncertain_trigger(config, state, state_path, now_text)
+    trigger["receipt"] = receipt
+    trigger["disposition"] = "SUBMITTED"
+    state["reason_code"] = "TRIGGER_SUBMITTED"
+    write_state(state_path, state, config)
+    return finish_submitted(config, args, state, state_path, row, now_text)
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message: str) -> NoReturn:
+        raise WardenError() from None
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = Parser(description="Fake-only, disabled-by-default PR-warden lifecycle controller.")
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--now", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--test-stop-after",
+        choices=("before-claim", "after-claim", "after-trigger-write", "after-send", "after-result", "after-settle", "before-archive"),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("command", choices=("admit", "tick", "reconcile"))
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    os.umask(0o077)
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    try:
+        args = build_parser().parse_args(argv)
+        config = load_config(args.config)
+        for directory in ("state_dir", "runtime_dir", "result_dir", "handoff_dir"):
+            private_directory(Path(config["paths"][directory]), create=True)
+        state_path = Path(config["paths"]["state_dir"]) / "lifecycle.json"
+        lock_path = Path(config["paths"]["runtime_dir"]) / "controller.lock"
+        now, now_text = clock(args.now)
+        with writer_lock(lock_path):
+            if args.command == "admit":
+                result = process_admit(config, args, state_path, now_text)
+            else:
+                state = load_state(state_path, config)
+                require(state is not None, "NOT_ADMITTED")
+                try:
+                    if args.command == "tick":
+                        result = process_tick(config, args, state, state_path, now, now_text)
+                    else:
+                        result = process_reconcile(config, args, state, state_path, now_text)
+                except WardenError as error:
+                    reasons = {
+                        "WRONG_INGRESS_OWNER": "WRONG_INGRESS_OWNER",
+                        "WRONG_OBJECT": "WRONG_OBJECT",
+                        "OWNER_NOT_VERIFIED": "OWNER_NOT_VERIFIED",
+                        "RESULT_NOT_VERIFIED": "RESULT_NOT_VERIFIED",
+                        "INGRESS_NOT_VERIFIED": "INGRESS_NOT_VERIFIED",
+                        "SETTLEMENT_NOT_VERIFIED": "SETTLEMENT_NOT_VERIFIED",
+                    }
+                    if error.code in reasons and state["lifecycle_state"] != "ARCHIVED":
+                        state["lifecycle_state"] = "ESCALATED"
+                        state["checked_at"] = now_text
+                        state["reason_code"] = reasons[error.code]
+                        write_state(state_path, state, config)
+                    raise
+        sys.stdout.write(json.dumps({"code": "OK" if result == EXIT_OK else "NOT_VERIFIED"}, separators=(",", ":")) + "\n")
+        return result
+    except BusyError:
+        sys.stderr.write("ERROR: BUSY\n")
+        return EXIT_BUSY
+    except WardenError as error:
+        allowed = {
+            "DUPLICATE_ADMISSION", "UNSUPPORTED_PROVIDER", "CONFIGURATION_CHANGED", "ARCHIVED",
+            "OWNER_NOT_VERIFIED", "RESULT_NOT_VERIFIED", "CLAIM_CONFLICT", "SETTLEMENT_NOT_VERIFIED",
+            "INGRESS_NOT_VERIFIED", "WRONG_INGRESS_OWNER", "WRONG_OBJECT", "LIFECYCLE_NOT_WAITING",
+            "NOT_ADMITTED", "UNSAFE_FILE", "STATE_WRITE_NOT_VERIFIED", "STATE_WRITE_FAILED",
+        }
+        code = error.code if error.code in allowed else "INVALID_STATE_OR_INPUT"
+        sys.stderr.write(f"ERROR: {code}\n")
+        return EXIT_INVALID if code in {"DUPLICATE_ADMISSION", "UNSUPPORTED_PROVIDER", "NOT_ADMITTED", "UNSAFE_FILE", "INVALID_STATE_OR_INPUT"} else EXIT_NOT_VERIFIED
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

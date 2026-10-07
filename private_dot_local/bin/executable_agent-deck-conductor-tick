@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Bounded metadata reconciliation for one conductor-owned work registry."""
+
+from datetime import datetime, timezone
+import argparse
+import json
+import math
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import time
+
+
+MAX_RESPONSE_BYTES = 2_097_152
+ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+SESSION_ID = re.compile(r"[0-9a-f]{8,20}-[0-9]{9,20}\Z")
+TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})\Z"
+)
+TERMINAL = {"COMPLETE", "COMPLETE_WITH_BACKLOG", "NEEDS_USER", "NEEDS_SCOPE",
+            "NEEDS_FLEET", "FAILED", "CANCELLED"}
+OBSERVED = {"NOT_CHECKED", "ACTIVE", "WAITING", "FAILED", "CANCELLED", "UNKNOWN"}
+SUBSTATES = {"NONE", "RUNNING", "IDLE_AT_EMPTY_PROMPT", "MODEL_UNAVAILABLE",
+            "AUTH_401", "USAGE_LIMIT", "UNKNOWN"}
+REASONS = {"REGISTERED", "REGISTRATION_UPDATED", "SESSION_RUNNING", "SESSION_QUEUED",
+           "SESSION_WAITING", "SESSION_IDLE", "SESSION_ERROR", "SESSION_STOPPED",
+           "SESSION_NOT_FOUND", "SESSION_ID_MISMATCH", "POLL_COMMAND_FAILED",
+           "POLL_EXECUTABLE_MISSING", "POLL_TIMEOUT", "POLL_MALFORMED_JSON",
+           "POLL_UNKNOWN_STATUS", "POLL_UNKNOWN_SUBSTATE", "CONDUCTOR_VERIFIED",
+           "USER_DECISION_REQUIRED", "SCOPE_STOP", "FLEET_STOP", "ACCEPTANCE_FAILED",
+           "CANCELLED_BY_USER"}
+FIELDS = {"work_id", "owner_session_id", "requested_status", "observed_status",
+          "observed_substate", "deadline", "last_checked_at", "reason_code", "overdue"}
+BUSY = "ERROR: registry is busy; single writer lock not acquired\n"
+
+
+class TickError(Exception):
+    pass
+
+
+def require(condition, code="REGISTRY_INVALID"):
+    if not condition:
+        raise TickError(code)
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        require(key not in result)
+        result[key] = value
+    return result
+
+
+def timestamp(value):
+    require(isinstance(value, str) and TIMESTAMP.fullmatch(value) is not None)
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        raise TickError("REGISTRY_INVALID") from None
+
+
+def identifier(value, pattern=ID):
+    return isinstance(value, str) and pattern.fullmatch(value) is not None
+
+
+def enum(value, values):
+    return isinstance(value, str) and value in values
+
+
+def record(value, now):
+    require(isinstance(value, dict) and set(value) == FIELDS)
+    require(identifier(value["work_id"]) and identifier(value["owner_session_id"], SESSION_ID))
+    require(enum(value["requested_status"], TERMINAL | {"ACTIVE"}))
+    require(enum(value["observed_status"], OBSERVED) and enum(value["observed_substate"], SUBSTATES))
+    require(enum(value["reason_code"], REASONS))
+    deadline = timestamp(value["deadline"])
+    if value["last_checked_at"] is not None:
+        timestamp(value["last_checked_at"])
+    require(type(value["overdue"]) is bool)
+    require(value["overdue"] == (value["requested_status"] not in TERMINAL and now > deadline))
+    return value
+
+
+def decode(raw):
+    require(len(raw) <= MAX_RESPONSE_BYTES)
+    try:
+        return json.loads(raw, object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise TickError("REGISTRY_INVALID") from None
+
+
+def registry_call(command, timeout):
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, start_new_session=True)
+    except OSError:
+        raise TickError("REGISTRY_UNAVAILABLE") from None
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Terminate only this invocation and its read-only CLI descendants.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        # Do not let a detached descendant retaining these pipes extend the
+        # caller's deadline. Drain only within the original call budget, then
+        # close our read ends and make a non-blocking reap attempt.
+        try:
+            process.communicate(timeout=0)
+        except subprocess.TimeoutExpired:
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
+            process.poll()
+        raise TickError("REGISTRY_TIMEOUT") from None
+    require(len(stdout) <= MAX_RESPONSE_BYTES and len(stderr) <= MAX_RESPONSE_BYTES)
+    if process.returncode not in (0, 4):
+        raise TickError("REGISTRY_BUSY" if stderr == BUSY.encode() else "REGISTRY_UNAVAILABLE")
+    return decode(stdout), process.returncode == 0
+
+
+def events(before, after):
+    if after["requested_status"] in TERMINAL:
+        return []
+    dispositions = []
+    if any(before[key] != after[key] for key in ("observed_status", "observed_substate", "reason_code")):
+        dispositions.append("UNKNOWN" if after["observed_status"] == "UNKNOWN" else "CHANGED")
+    previous_check = before["last_checked_at"]
+    if after["overdue"] and (previous_check is None or timestamp(previous_check) <= timestamp(before["deadline"])):
+        dispositions.append("OVERDUE")
+    if not dispositions:
+        return []
+    return [{"work_id": after["work_id"], "dispositions": dispositions,
+             "observed_status": after["observed_status"], "observed_substate": after["observed_substate"],
+             "reason_code": after["reason_code"], "overdue": after["overdue"]}]
+
+
+def tick(args):
+    now_text = args.now or datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    now = timestamp(now_text)
+    end = time.monotonic() + args.budget_seconds
+    common = [args.registry, "--state", args.state, "--agent-deck", args.agent_deck,
+              "--profile", args.profile, "--now", now_text, "--timeout", str(args.poll_timeout)]
+    result = {"code": "OK", "events": [], "polled": 0, "remaining": 0}
+    try:
+        snapshot, verified = registry_call([*common, "list"], min(5.0, args.budget_seconds))
+        require(verified and isinstance(snapshot, dict) and set(snapshot) == {"format_version", "records"})
+        require(type(snapshot["format_version"]) is int and snapshot["format_version"] == 1)
+        require(isinstance(snapshot["records"], list) and len(snapshot["records"]) <= 10_000)
+        records = [record(item, now) for item in snapshot["records"]]
+        require(len({item["work_id"] for item in records}) == len(records))
+        active = [item for item in records if item["requested_status"] not in TERMINAL]
+        active.sort(key=lambda item: (timestamp(item["last_checked_at"]) if item["last_checked_at"]
+                                     else datetime.min.replace(tzinfo=timezone.utc), item["work_id"]))
+        result["remaining"] = len(active)
+        for before in active[:args.max_polls]:
+            remaining_time = end - time.monotonic()
+            # The registry needs time to atomically persist a timed-out poll.
+            if remaining_time < args.poll_timeout + 2:
+                raise TickError("TIME_BUDGET")
+            after, verified = registry_call([*common, "reconcile", before["work_id"]], args.poll_timeout + 2)
+            record(after, now)
+            require(after["work_id"] == before["work_id"] and after["owner_session_id"] == before["owner_session_id"])
+            require(verified or after["observed_status"] == "UNKNOWN")
+            result["remaining"] -= 1
+            if after["requested_status"] not in TERMINAL:
+                result["polled"] += 1
+                result["events"].extend(events(before, after))
+                if not verified or after["observed_status"] == "UNKNOWN":
+                    result["code"] = "NOT_VERIFIED"
+    except TickError as exc:
+        result["code"] = str(exc)
+    return result, 0 if result["code"] == "OK" else 4
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise TickError("INVOCATION")
+
+
+def main(argv=None):
+    parser = Parser(description="Poll bounded exact-ID metadata; no agent wake or completion inference.")
+    parser.add_argument("--state", required=True, help="explicit conductor-owned registry file")
+    parser.add_argument("--registry", default="agent-deck-work-registry")
+    parser.add_argument("--agent-deck", default="agent-deck")
+    parser.add_argument("--profile", required=True)
+    parser.add_argument("--max-polls", type=int, default=12)
+    parser.add_argument("--poll-timeout", type=float, default=5.0)
+    parser.add_argument("--budget-seconds", type=float, default=80.0)
+    parser.add_argument("--now", help="inject a strict RFC3339 clock for offline checks")
+    try:
+        args = parser.parse_args(argv)
+        require(Path(args.state).is_absolute() and identifier(args.profile), "INVOCATION")
+        require(1 <= args.max_polls <= 12, "INVOCATION")
+        require(math.isfinite(args.poll_timeout) and 0 < args.poll_timeout <= 5, "INVOCATION")
+        require(math.isfinite(args.budget_seconds) and 0 < args.budget_seconds <= 85, "INVOCATION")
+        if args.now is not None:
+            try:
+                timestamp(args.now)
+            except TickError:
+                raise TickError("INVOCATION") from None
+        result, code = tick(args)
+        sys.stdout.write(json.dumps(result, sort_keys=True) + "\n")
+        return code
+    except TickError:
+        sys.stderr.write("conductor-tick: INVOCATION\n")
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

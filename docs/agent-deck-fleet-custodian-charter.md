@@ -37,6 +37,22 @@ as permission to act.
 
 ## Completion
 
+The trigger brief names `TRIGGER_ALIAS`, `REPORT_BODY`, and `REPORT_ENVELOPE`.
+Resolve your immutable owner ID with `agent-deck session current --json` and
+confirm it with exact `agent-deck -p PROFILE session show ID --json`; if either
+instrument is ambiguous, report `NOT_VERIFIED` and do not invent an ID. Write a
+detailed report to `REPORT_BODY` with mode `0600` under the mode `0700` report
+root. Keep only report-only outcomes, bounded counts, UTC evidence times,
+decisions, and retained-artifact references; include no copied bodies or logs.
+Write `REPORT_ENVELOPE` last, also mode `0600`, after the body is durable. Its
+strict JSON fields are `schema_version` (1), `trigger_alias`, exact
+`owner_session_id`, terminal `status`, relative `report_ref` (the report body
+filename), lowercase 64-hex SHA-256 `report_digest` of the body bytes,
+`completed_at` (UTC seconds), and bounded uppercase `result_code`. The
+controller verifies the exact owner, alias, private files, timestamp, and
+digest on a later tick. Until then, the trigger stays active. Retain all reports
+and evidence indefinitely; `NO_DELETION` is the current retention rule.
+
 End with exactly this compact envelope and no raw logs or copied bodies:
 
 ```text

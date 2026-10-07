@@ -13,7 +13,7 @@ import unittest
 
 
 REPO = Path(__file__).resolve().parents[1]
-PROBE = REPO / "private_dot_local/bin/executable_agent-deck-hook-probe"
+PROBE = REPO / "private_dot_local/bin/private_executable_agent-deck-hook-probe"
 
 CLAUDE_EVENTS = {
     "SessionStart": ("", True),

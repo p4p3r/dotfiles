@@ -17,7 +17,7 @@ import unittest
 
 
 REPO = Path(__file__).resolve().parents[1]
-SCRIPT = REPO / "private_dot_local/bin/executable_agent-deck-maintenance-collector"
+SCRIPT = REPO / "private_dot_local/bin/private_executable_agent-deck-maintenance-collector"
 MAX_INPUT_BYTES = 4_194_304
 MAX_STATE_BYTES = 1_048_576
 MAX_GENERATION = 9_223_372_036_854_775_807

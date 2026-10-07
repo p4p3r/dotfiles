@@ -8,7 +8,12 @@ in {
   # Import shell configuration
   imports = [
     ./agent-cli-updates.nix
+    ./agent-deck-archive-only-custodian.nix
+    ./agent-deck-control.nix
     ./agent-deck-maintenance.nix
+    ./agent-deck-pr-warden.nix
+    ./agent-deck-slack-watchdog.nix
+    ./agent-deck-signed-ingress.nix
     ./shell/fish.nix
   ];
 

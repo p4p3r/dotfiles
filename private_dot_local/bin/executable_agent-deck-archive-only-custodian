@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""Copy one private regular file into a recoverable archive and rehearse a restore."""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import errno
+import functools
+import hashlib
+import json
+import os
+import re
+import secrets
+import stat
+import sys
+
+
+VERSION = 1
+MAX_CONTENT_BYTES = 1_048_576
+MAX_MANIFEST_BYTES = 2_048
+CHUNK_BYTES = 65_536
+NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+NOFOLLOW = os.O_NOFOLLOW | os.O_CLOEXEC
+DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW
+READ_FILE = os.O_RDONLY | os.O_NONBLOCK | os.O_NOATIME | NOFOLLOW
+CREATE_FILE = os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW
+
+
+class Rejected(Exception):
+    """An operation that cannot safely claim completion."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, _message: str) -> None:
+        raise Rejected("INVALID_INPUT")
+
+
+def exact_path(value: str) -> list[str]:
+    if not value.startswith("/") or value != os.path.normpath(value) or "\x00" in value:
+        raise Rejected("INVALID_PATH")
+    if value == "/":
+        return []
+    components = value.split("/")[1:]
+    if any(not component or component in (".", "..") for component in components):
+        raise Rejected("INVALID_PATH")
+    return components
+
+
+def exact_name(value: str) -> str:
+    if not NAME.fullmatch(value):
+        raise Rejected("INVALID_NAME")
+    return value
+
+
+def safe_directory(info: os.stat_result, *, private: bool) -> None:
+    mode = stat.S_IMODE(info.st_mode)
+    if not stat.S_ISDIR(info.st_mode):
+        raise Rejected("UNSAFE_DIRECTORY")
+    if private:
+        if info.st_uid != os.getuid() or mode != 0o700:
+            raise Rejected("UNSAFE_DIRECTORY")
+    elif info.st_uid not in (0, os.getuid()) or (
+        mode & 0o022 and not (info.st_uid == 0 and mode & stat.S_ISVTX)
+    ):
+        raise Rejected("UNSAFE_DIRECTORY")
+
+
+def open_directory(path: str, *, private: bool = False) -> int:
+    parts = exact_path(path)
+    fd = os.open("/", DIRECTORY)
+    try:
+        safe_directory(os.fstat(fd), private=False)
+        for part in parts:
+            child = os.open(part, DIRECTORY, dir_fd=fd)
+            try:
+                safe_directory(os.fstat(child), private=False)
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(fd)
+            fd = child
+        if private:
+            safe_directory(os.fstat(fd), private=True)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def same_file(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        left.st_dev, left.st_ino, left.st_uid, left.st_gid, left.st_mode,
+        left.st_nlink, left.st_size, left.st_mtime_ns, left.st_ctime_ns,
+    ) == (
+        right.st_dev, right.st_ino, right.st_uid, right.st_gid, right.st_mode,
+        right.st_nlink, right.st_size, right.st_mtime_ns, right.st_ctime_ns,
+    )
+
+
+def safe_file(info: os.stat_result) -> None:
+    mode = stat.S_IMODE(info.st_mode)
+    if (
+        not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+        or info.st_nlink != 1 or info.st_size > MAX_CONTENT_BYTES
+        or mode & 0o077
+    ):
+        raise Rejected("UNSAFE_FILE")
+
+
+def verify_path(path: str, parent_fd: int, file_fd: int, original: os.stat_result) -> None:
+    parts = exact_path(path)
+    if not parts:
+        raise Rejected("INVALID_PATH")
+    fresh_parent = open_directory("/" + "/".join(parts[:-1]))
+    try:
+        current_parent = os.fstat(parent_fd)
+        if (current_parent.st_dev, current_parent.st_ino) != (
+            os.fstat(fresh_parent).st_dev, os.fstat(fresh_parent).st_ino
+        ):
+            raise Rejected("SOURCE_CHANGED")
+        named = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+        if not same_file(original, named) or not same_file(original, os.fstat(file_fd)):
+            raise Rejected("SOURCE_CHANGED")
+    finally:
+        os.close(fresh_parent)
+
+
+def verify_directory(path: str, fd: int) -> None:
+    fresh = open_directory(path, private=True)
+    try:
+        safe_directory(os.fstat(fd), private=True)
+        if (os.fstat(fresh).st_dev, os.fstat(fresh).st_ino) != (
+            os.fstat(fd).st_dev, os.fstat(fd).st_ino
+        ):
+            raise Rejected("DIRECTORY_CHANGED")
+    finally:
+        os.close(fresh)
+
+
+def write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        count = os.write(fd, view)
+        if count <= 0:
+            raise Rejected("WRITE_FAILED")
+        view = view[count:]
+
+
+def create_file(parent_fd: int, name: str, data: bytes) -> None:
+    fd = os.open(name, CREATE_FILE, 0o600, dir_fd=parent_fd)
+    try:
+        os.fchmod(fd, 0o600)
+        write_all(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def rejected_io(function):
+    @functools.wraps(function)
+    def guarded(*args):
+        try:
+            return function(*args)
+        except OSError as exc:
+            raise Rejected("IO_NOT_VERIFIED") from exc
+    return guarded
+
+
+def no_replace_rename(source_fd: int, source: str, target_fd: int, target: str) -> None:
+    # Linux renameat2 makes the absent-target check part of the publication step.
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = libc.renameat2
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    if renameat2(source_fd, os.fsencode(source), target_fd, os.fsencode(target), 1) != 0:
+        code = ctypes.get_errno()
+        if code == errno.EEXIST:
+            raise Rejected("COLLISION")
+        raise OSError(code, os.strerror(code))
+
+
+@rejected_io
+def archive(source: str, archive_root: str, label: str) -> None:
+    exact_name(label)
+    parts = exact_path(source)
+    if not parts:
+        raise Rejected("INVALID_PATH")
+    parent_path = "/" + "/".join(parts[:-1])
+    parent_fd = open_directory(parent_path)
+    root_fd = open_directory(archive_root, private=True)
+    try:
+        source_fd = os.open(parts[-1], READ_FILE, dir_fd=parent_fd)
+        try:
+            original = os.fstat(source_fd)
+            safe_file(original)
+            verify_path(source, parent_fd, source_fd, original)
+            stage = ".pending-" + secrets.token_hex(16)
+            os.mkdir(stage, 0o700, dir_fd=root_fd)
+            stage_fd = os.open(stage, DIRECTORY, dir_fd=root_fd)
+            try:
+                safe_directory(os.fstat(stage_fd), private=True)
+                content_fd = os.open("content", CREATE_FILE, 0o600, dir_fd=stage_fd)
+                digest = hashlib.sha256()
+                total = 0
+                try:
+                    while True:
+                        block = os.read(source_fd, CHUNK_BYTES)
+                        verify_path(source, parent_fd, source_fd, original)
+                        if not block:
+                            break
+                        total += len(block)
+                        if total > MAX_CONTENT_BYTES or total > original.st_size:
+                            raise Rejected("SOURCE_CHANGED")
+                        digest.update(block)
+                        write_all(content_fd, block)
+                    if total != original.st_size:
+                        raise Rejected("SOURCE_CHANGED")
+                    os.fchmod(content_fd, stat.S_IMODE(original.st_mode))
+                    os.fsync(content_fd)
+                finally:
+                    os.close(content_fd)
+                manifest = {
+                    "version": VERSION, "sha256": digest.hexdigest(), "size": total,
+                    "mode": stat.S_IMODE(original.st_mode), "owner_uid": original.st_uid,
+                }
+                encoded = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+                create_file(stage_fd, "manifest.json", encoded)
+                os.fsync(stage_fd)
+                verify_path(source, parent_fd, source_fd, original)
+                verify_directory(archive_root, root_fd)
+                staged = os.stat(stage, dir_fd=root_fd, follow_symlinks=False)
+                if not same_file(staged, os.fstat(stage_fd)):
+                    raise Rejected("ARCHIVE_CHANGED")
+                no_replace_rename(root_fd, stage, root_fd, label)
+                os.fsync(root_fd)
+                verify_directory(archive_root, root_fd)
+                if not same_file(os.fstat(stage_fd), os.stat(label, dir_fd=root_fd, follow_symlinks=False)):
+                    raise Rejected("ARCHIVE_CHANGED")
+            finally:
+                os.close(stage_fd)
+        finally:
+            os.close(source_fd)
+    finally:
+        os.close(root_fd)
+        os.close(parent_fd)
+
+
+def parse_manifest(raw: bytes) -> dict[str, int | str]:
+    if len(raw) > MAX_MANIFEST_BYTES:
+        raise Rejected("INVALID_MANIFEST")
+
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise Rejected("INVALID_MANIFEST")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique,
+                           parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()))
+    except (ValueError, UnicodeError) as exc:
+        raise Rejected("INVALID_MANIFEST") from exc
+    if not isinstance(value, dict) or set(value) != {"version", "sha256", "size", "mode", "owner_uid"}:
+        raise Rejected("INVALID_MANIFEST")
+    if type(value["version"]) is not int or value["version"] != VERSION:
+        raise Rejected("INVALID_MANIFEST")
+    if (type(value["size"]) is not int or not 0 <= value["size"] <= MAX_CONTENT_BYTES
+        or type(value["mode"]) is not int or value["mode"] & ~0o700
+        or type(value["owner_uid"]) is not int or value["owner_uid"] != os.getuid()
+        or not isinstance(value["sha256"], str)
+        or not re.fullmatch(r"[0-9a-f]{64}", value["sha256"])):
+        raise Rejected("INVALID_MANIFEST")
+    return value
+
+
+def read_verified_file(parent_fd: int, name: str, limit: int) -> tuple[bytes, os.stat_result]:
+    fd = os.open(name, READ_FILE, dir_fd=parent_fd)
+    try:
+        before = os.fstat(fd)
+        safe_file(before)
+        if name == "manifest.json" and stat.S_IMODE(before.st_mode) != 0o600:
+            raise Rejected("INVALID_ARCHIVE")
+        if before.st_size > limit:
+            raise Rejected("INVALID_ARCHIVE")
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not same_file(before, named):
+            raise Rejected("ARCHIVE_CHANGED")
+        chunks = []
+        size = 0
+        while True:
+            block = os.read(fd, min(CHUNK_BYTES, limit + 1 - size))
+            if not block:
+                break
+            size += len(block)
+            if size > limit:
+                raise Rejected("INVALID_ARCHIVE")
+            chunks.append(block)
+            if not same_file(before, os.fstat(fd)) or not same_file(before, os.stat(name, dir_fd=parent_fd, follow_symlinks=False)):
+                raise Rejected("ARCHIVE_CHANGED")
+        if size != before.st_size or not same_file(before, os.fstat(fd)):
+            raise Rejected("ARCHIVE_CHANGED")
+        return b"".join(chunks), before
+    finally:
+        os.close(fd)
+
+
+@rejected_io
+def restore(archive_root: str, label: str, destination_root: str, destination: str) -> None:
+    exact_name(label)
+    exact_name(destination)
+    root_fd = open_directory(archive_root, private=True)
+    dest_fd = open_directory(destination_root, private=True)
+    try:
+        label_fd = os.open(label, DIRECTORY, dir_fd=root_fd)
+        try:
+            label_info = os.fstat(label_fd)
+            safe_directory(label_info, private=True)
+            if not same_file(label_info, os.stat(label, dir_fd=root_fd, follow_symlinks=False)):
+                raise Rejected("ARCHIVE_CHANGED")
+            raw, manifest_info = read_verified_file(label_fd, "manifest.json", MAX_MANIFEST_BYTES)
+            manifest = parse_manifest(raw)
+            body, info = read_verified_file(label_fd, "content", MAX_CONTENT_BYTES)
+            if (len(body) != manifest["size"] or hashlib.sha256(body).hexdigest() != manifest["sha256"]
+                or manifest["owner_uid"] != info.st_uid
+                or manifest["mode"] != stat.S_IMODE(info.st_mode)):
+                raise Rejected("CONTENT_MISMATCH")
+            if not same_file(label_info, os.stat(label, dir_fd=root_fd, follow_symlinks=False)):
+                raise Rejected("ARCHIVE_CHANGED")
+            if (not same_file(manifest_info, os.stat("manifest.json", dir_fd=label_fd, follow_symlinks=False))
+                or not same_file(info, os.stat("content", dir_fd=label_fd, follow_symlinks=False))):
+                raise Rejected("ARCHIVE_CHANGED")
+            verify_directory(archive_root, root_fd)
+            verify_directory(destination_root, dest_fd)
+            pending = ".restore-pending-" + secrets.token_hex(16)
+            fd = os.open(pending, CREATE_FILE, 0o600, dir_fd=dest_fd)
+            try:
+                write_all(fd, body)
+                os.fchmod(fd, manifest["mode"])
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            no_replace_rename(dest_fd, pending, dest_fd, destination)
+            os.fsync(dest_fd)
+            verify_directory(destination_root, dest_fd)
+        finally:
+            os.close(label_fd)
+    finally:
+        os.close(dest_fd)
+        os.close(root_fd)
+
+
+def main() -> int:
+    parser = Parser(description="Archive one private file or rehearse a byte-exact restore. No source is changed.")
+    commands = parser.add_subparsers(dest="command", required=True, parser_class=Parser)
+    save = commands.add_parser("archive")
+    save.add_argument("--source", required=True)
+    save.add_argument("--archive-root", required=True)
+    save.add_argument("--label", required=True)
+    replay = commands.add_parser("restore")
+    replay.add_argument("--archive-root", required=True)
+    replay.add_argument("--label", required=True)
+    replay.add_argument("--destination-root", required=True)
+    replay.add_argument("--destination", required=True)
+    try:
+        args = parser.parse_args()
+        if args.command == "archive":
+            archive(args.source, args.archive_root, args.label)
+            outcome = {"status": "ARCHIVED", "code": "OK"}
+        else:
+            restore(args.archive_root, args.label, args.destination_root, args.destination)
+            outcome = {"status": "RESTORED", "code": "OK"}
+        exit_code = 0
+    except Rejected as exc:
+        outcome = {"status": "REJECTED", "code": exc.code}
+        exit_code = 1
+    except OSError:
+        outcome = {"status": "REJECTED", "code": "IO_NOT_VERIFIED"}
+        exit_code = 1
+    print(json.dumps(outcome, separators=(",", ":")))
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

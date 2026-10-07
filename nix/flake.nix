@@ -307,6 +307,233 @@
         touch "$out"
       '';
 
+    slackWatchdogRuntimeConfiguration = system:
+      home-manager.lib.homeManagerConfiguration {
+        pkgs = nixpkgs.legacyPackages.${system};
+        modules = [
+          ./modules/agent-deck-slack-watchdog.nix
+          {
+            home.username = "watchdog-check";
+            home.homeDirectory = "/home/watchdog-check";
+            home.stateVersion = "24.05";
+            programs.agent-deck-slack-watchdog = {
+              enable = true;
+              settingsFile = "/home/watchdog-check/.config/agent-deck/slack-watchdog.json";
+            };
+          }
+        ];
+      };
+
+    slackWatchdogRuntimeCheck = system:
+      let
+        pkgs = nixpkgs.legacyPackages.${system};
+        generation = (slackWatchdogRuntimeConfiguration system).activationPackage;
+      in
+      pkgs.runCommand "agent-deck-slack-watchdog-runtime-check" { } ''
+        service="${generation}/home-files/.config/systemd/user/agent-deck-slack-watchdog.service"
+        timer="${generation}/home-files/.config/systemd/user/agent-deck-slack-watchdog.timer"
+        test -f "$service"
+        test -f "$timer"
+        ${pkgs.gnugrep}/bin/grep -F -x -- \
+          "ConditionPathExists=/home/watchdog-check/.config/agent-deck/slack-watchdog.json" "$service"
+        ${pkgs.gnugrep}/bin/grep -F -- "--state %S/agent-deck-slack-watchdog/state.json" "$service"
+        ${pkgs.gnugrep}/bin/grep -F -- "--systemctl ${pkgs.systemd}/bin/systemctl" "$service"
+        ${pkgs.gnugrep}/bin/grep -F -x -- "RestrictAddressFamilies=AF_UNIX" "$service"
+        ${pkgs.gnugrep}/bin/grep -F -x -- "OnUnitInactiveSec=1m" "$timer"
+        ! ${pkgs.gnugrep}/bin/grep -q '^Restart=' "$service"
+        ! ${pkgs.gnugrep}/bin/grep -q '^EnvironmentFile=' "$service"
+        for directive in PrivateDevices ProtectClock ProtectKernelLogs ProtectKernelModules; do
+          if ${pkgs.gnugrep}/bin/grep -q "^$directive=" "$service"; then
+            echo "user service must not alter the capability bounding set via $directive" >&2
+            exit 1
+          fi
+        done
+        for setting in \
+          NoNewPrivileges=true \
+          ProtectControlGroups=true \
+          ProtectKernelTunables=true \
+          ProtectSystem=strict \
+          RestrictRealtime=true \
+          RestrictSUIDSGID=true \
+          LockPersonality=true \
+          SystemCallArchitectures=native; do
+          ${pkgs.gnugrep}/bin/grep -F -x -- "$setting" "$service"
+        done
+        "${generation}/home-path/bin/agent-deck-slack-watchdog" --help >/dev/null
+        runtime_directory="$TMPDIR/systemd-runtime"
+        mkdir -p "$runtime_directory"
+        XDG_RUNTIME_DIR="$runtime_directory" \
+          ${pkgs.systemd}/bin/systemd-analyze verify \
+            --user --recursive-errors=no "$service" "$timer"
+        touch "$out"
+      '';
+
+    signedIngressConfiguration = system: enabled:
+      home-manager.lib.homeManagerConfiguration {
+        pkgs = nixpkgs.legacyPackages.${system};
+        modules = [
+          ./modules/agent-deck-signed-ingress.nix
+          {
+            home.username = "ingress-check";
+            home.homeDirectory = "/home/ingress-check";
+            home.stateVersion = "24.05";
+            programs.agent-deck-signed-ingress = {
+              enable = enabled;
+              runtimeConfig = "/run/ingress-check/config.json";
+            };
+          }
+        ];
+      };
+
+    signedIngressCheck = system:
+      let
+        pkgs = nixpkgs.legacyPackages.${system};
+        enabled = signedIngressConfiguration system true;
+        disabled = signedIngressConfiguration system false;
+        generation = enabled.activationPackage;
+      in
+      assert !(disabled.config.programs.agent-deck-signed-ingress.enable);
+      assert !(disabled.config.systemd.user.services ? agent-deck-signed-ingress);
+      pkgs.runCommand "agent-deck-signed-ingress-offline-check" { } ''
+        export HOME="$TMPDIR/home"
+        export XDG_CONFIG_HOME="$HOME/config" XDG_STATE_HOME="$HOME/state" XDG_RUNTIME_DIR="$HOME/run"
+        export PYTHONDONTWRITEBYTECODE=1
+        mkdir -p "$XDG_RUNTIME_DIR" private_dot_local/bin tests
+        chmod 0700 "$HOME" "$XDG_RUNTIME_DIR"
+        cp ${../private_dot_local/bin/executable_agent-deck-signed-ingress} \
+          private_dot_local/bin/executable_agent-deck-signed-ingress
+        cp ${../tests/test_agent_deck_signed_ingress.py} tests/test_agent_deck_signed_ingress.py
+        ${pkgs.python3}/bin/python3 -m unittest discover -s tests -p test_agent_deck_signed_ingress.py -v
+        "${enabled.config.programs.agent-deck-signed-ingress.package}/bin/agent-deck-signed-ingress" --help >/dev/null
+        service="${generation}/home-files/.config/systemd/user/agent-deck-signed-ingress.service"
+        test -f "$service"
+        for setting in UMask=0077 StateDirectoryMode=0700 RuntimeDirectoryMode=0700 \
+          Restart=on-failure RestartSec=5 StartLimitIntervalSec=300 StartLimitBurst=3 \
+          TimeoutStartSec=10 TimeoutStopSec=10 LimitCORE=0 NoNewPrivileges=true ProtectSystem=strict \
+          RestrictAddressFamilies=AF_UNIX RestrictAddressFamilies=AF_INET; do
+          ${pkgs.gnugrep}/bin/grep -F -x -- "$setting" "$service"
+        done
+        if ${pkgs.gnugrep}/bin/grep -F -x -- 'RestrictAddressFamilies=AF_INET6' "$service"; then
+          exit 1
+        fi
+        if ${pkgs.gnugrep}/bin/grep -E '^(Environment|EnvironmentFile)=' "$service"; then
+          exit 1
+        fi
+        ${pkgs.systemd}/bin/systemd-analyze verify --user --recursive-errors=no "$service"
+        touch "$out"
+      '';
+
+    prWardenConfiguration = system: enabled:
+      home-manager.lib.homeManagerConfiguration {
+        pkgs = nixpkgs.legacyPackages.${system};
+        modules = [
+          ./modules/agent-deck-pr-warden.nix
+          {
+            home.username = "warden-check";
+            home.homeDirectory = "/home/warden-check";
+            home.stateVersion = "24.05";
+            programs.agent-deck-pr-warden = {
+              enable = enabled;
+              runtimeConfig = "/run/warden-check/config.json";
+            };
+          }
+        ];
+      };
+
+    prWardenCheck = system:
+      let
+        pkgs = nixpkgs.legacyPackages.${system};
+        enabled = prWardenConfiguration system true;
+        disabled = prWardenConfiguration system false;
+        generation = enabled.activationPackage;
+        package = disabled.config.programs.agent-deck-pr-warden.package;
+      in
+      assert !(disabled.config.programs.agent-deck-pr-warden.enable);
+      assert !(disabled.config.systemd.user.services ? agent-deck-pr-warden);
+      assert !(disabled.config.systemd.user.timers ? agent-deck-pr-warden);
+      pkgs.runCommand "agent-deck-pr-warden-offline-check" { } ''
+        export HOME="$TMPDIR/home"
+        export XDG_CONFIG_HOME="$HOME/config" XDG_STATE_HOME="$HOME/state" XDG_RUNTIME_DIR="$HOME/run"
+        export PYTHONDONTWRITEBYTECODE=1
+        mkdir -p "$XDG_RUNTIME_DIR" private_dot_local/bin tests/fixtures/agent_deck_pr_warden \
+          nix/modules docs
+        chmod 0700 "$HOME" "$XDG_RUNTIME_DIR"
+        install -m 0700 \
+          ${../private_dot_local/bin/private_executable_agent-deck-pr-warden-controller} \
+          private_dot_local/bin/private_executable_agent-deck-pr-warden-controller
+        install -m 0600 ${../tests/test_agent_deck_pr_warden_controller.py} \
+          tests/test_agent_deck_pr_warden_controller.py
+        install -m 0700 ${../tests/fixtures/agent_deck_pr_warden/fake_github_facts.py} \
+          tests/fixtures/agent_deck_pr_warden/fake_github_facts.py
+        install -m 0600 ${./modules/agent-deck-pr-warden.nix} \
+          nix/modules/agent-deck-pr-warden.nix
+        install -m 0600 ${../docs/agent-deck-pr-warden.md} docs/agent-deck-pr-warden.md
+        ${pkgs.python3}/bin/python3 -m unittest tests.test_agent_deck_pr_warden_controller -v
+        "${package}/bin/agent-deck-pr-warden-controller" --help >/dev/null
+        mkdir private-runtime
+        ${pkgs.coreutils}/bin/install -m 0700 \
+          "${package}/libexec/agent-deck-pr-warden-controller.py" \
+          private-runtime/controller.py
+        test "$(${pkgs.coreutils}/bin/stat -c %a private-runtime/controller.py)" = 700
+        service="${generation}/home-files/.config/systemd/user/agent-deck-pr-warden.service"
+        timer="${generation}/home-files/.config/systemd/user/agent-deck-pr-warden.timer"
+        test -f "$service"
+        test -f "$timer"
+        ${pkgs.gnugrep}/bin/grep -F -- "install -m 0700" "$service"
+        ${pkgs.gnugrep}/bin/grep -F -- "%t/agent-deck-pr-warden/controller.py" "$service"
+        for setting in UMask=0077 StateDirectoryMode=0700 RuntimeDirectoryMode=0700 \
+          LimitCORE=0 NoNewPrivileges=true ProtectSystem=strict \
+          RestrictAddressFamilies=AF_UNIX RestrictRealtime=true RestrictSUIDSGID=true \
+          LockPersonality=true SystemCallArchitectures=native; do
+          ${pkgs.gnugrep}/bin/grep -F -x -- "$setting" "$service"
+        done
+        ${pkgs.gnugrep}/bin/grep -F -x -- "OnUnitInactiveSec=5m" "$timer"
+        if ${pkgs.gnugrep}/bin/grep -E '^(Environment|EnvironmentFile)=' "$service"; then
+          exit 1
+        fi
+        ${pkgs.systemd}/bin/systemd-analyze verify --user --recursive-errors=no "$service" "$timer"
+        touch "$out"
+      '';
+
+    archiveOnlyPackage = system:
+      import ./lib/agent-deck-archive-only-custodian.nix {
+        pkgs = nixpkgs.legacyPackages.${system};
+      };
+
+    archiveOnlyConfiguration = system: enabled:
+      home-manager.lib.homeManagerConfiguration {
+        pkgs = nixpkgs.legacyPackages.${system};
+        modules = [
+          ./modules/agent-deck-archive-only-custodian.nix
+          {
+            home.username = "archive-check";
+            home.homeDirectory = "/home/archive-check";
+            home.stateVersion = "24.05";
+          }
+        ] ++ nixpkgs.lib.optional enabled {
+          programs.agent-deck-archive-only-custodian.enable = true;
+        };
+      };
+
+    archiveOnlyCheck = system:
+      let
+        pkgs = nixpkgs.legacyPackages.${system};
+        package = archiveOnlyPackage system;
+        disabled = (archiveOnlyConfiguration system false).activationPackage;
+        enabled = (archiveOnlyConfiguration system true).activationPackage;
+      in
+      pkgs.runCommand "agent-deck-archive-only-custodian-check" { } ''
+        test -x "${package}/bin/agent-deck-archive-only-custodian"
+        "${package}/bin/agent-deck-archive-only-custodian" --help >/dev/null
+        test ! -e "${disabled}/home-path/bin/agent-deck-archive-only-custodian"
+        test -x "${enabled}/home-path/bin/agent-deck-archive-only-custodian"
+        for generation in "${disabled}" "${enabled}"; do
+          test ! -e "$generation/home-files/.config/systemd/user/agent-deck-archive-only-custodian.service"
+          test ! -e "$generation/home-files/.config/systemd/user/agent-deck-archive-only-custodian.timer"
+        done
+        touch "$out"
+      '';
+
     # Linux profile list: from PROFILES env var when set
     # (e.g. `PROFILES=work home-manager switch --flake .#paper@linux --impure`).
     # Falls back to ["p4p3r"] for parity with mkHome's default.
@@ -336,6 +563,9 @@
       "${username}@linux-aarch64"  = mkHome { system = "aarch64-linux"; user = username; profiles = linuxProfiles; };
     };
 
+    homeManagerModules.agent-deck-archive-only-custodian = ./modules/agent-deck-archive-only-custodian.nix;
+    homeManagerModules.agent-deck-pr-warden = ./modules/agent-deck-pr-warden.nix;
+
     # Dev shells with toolchains — one per supported system.
     devShells = nixpkgs.lib.genAttrs ([ "aarch64-darwin" ] ++ linuxSystems) (system: {
       default = let
@@ -352,8 +582,19 @@
       # Build the Linux Home Manager activation packages (does NOT switch)
       x86_64-linux.hm-build  = self.homeConfigurations."${username}@linux-x86_64".activationPackage;
       x86_64-linux.maintenance-runtime = maintenanceRuntimeCheck "x86_64-linux";
+      x86_64-linux.slack-watchdog-runtime = slackWatchdogRuntimeCheck "x86_64-linux";
+      x86_64-linux.signed-ingress = signedIngressCheck "x86_64-linux";
+      x86_64-linux.pr-warden = prWardenCheck "x86_64-linux";
+      x86_64-linux.archive-only-custodian = archiveOnlyCheck "x86_64-linux";
       aarch64-linux.hm-build = self.homeConfigurations."${username}@linux-aarch64".activationPackage;
+      aarch64-linux.signed-ingress = signedIngressCheck "aarch64-linux";
     };
+
+    packages = nixpkgs.lib.genAttrs linuxSystems (system: {
+      agent-deck-archive-only-custodian = archiveOnlyPackage system;
+      agent-deck-pr-warden = (prWardenConfiguration system false).config.programs.agent-deck-pr-warden.package;
+      agent-deck-signed-ingress = (signedIngressConfiguration system false).config.programs.agent-deck-signed-ingress.package;
+    });
 
     formatter = nixpkgs.lib.genAttrs ([ "aarch64-darwin" ] ++ linuxSystems)
       (system: nixpkgs.legacyPackages.${system}.nixpkgs-fmt);

@@ -108,6 +108,22 @@ The format has one version and no migration engine. Unknown or malformed state f
 registry uses a nonblocking local lock and atomic owner-only writes; concurrent writers,
 distributed ownership, and cross-host state sharing are unsupported.
 
+## Agent Deck Slack gateway watchdog
+
+The optional `agent-deck-slack-watchdog` Home Manager companion checks a direct
+Slack gateway through a qualified owner-only Unix control socket. It requires a
+bounded `hello`/`pong`/`close` exchange that reports the pinned incarnation,
+work-pump freshness, terminal/degraded state, backlog age, egress uncertainty,
+and conductor-turn state. A systemd-active unit alone is never healthy.
+
+Recovery is deliberately narrow: only an identity-matching, already-exited
+retryable-75 runner can consume one persisted restart token for that exact
+binary/config/row-binding incarnation. Terminal, stale, stalled, uncertain,
+unknown, mismatched, and timed-out observations never restart, and the service
+has no restart loop. See
+[`docs/agent-deck-slack-watchdog.md`](docs/agent-deck-slack-watchdog.md) for the
+strict protocol and the current `NOT_VERIFIED` live-interface gate.
+
 ## Agent Deck maintenance collector
 
 `agent-deck-maintenance-collector` is an hourly-capable, read-only inventory companion. It polls the
@@ -147,7 +163,16 @@ diff. Launch success, status, pane state, process arguments, output bodies, lega
 malformed or mismatched receipts, interrupted claims, and indeterminate delivery remain
 `NOT_VERIFIED`; none causes a retry, separate send, or replacement launch.
 
-Controller and collector state remain under the private local state directory. The controller file
+Each trigger has an immutable alias and an owner-only report destination separate from controller
+and collector state. A later tick polls only the accepted immutable session ID. A waiting or idle
+owner returns to the lifecycle's `WAITING` state only after a strict terminal envelope and the
+referenced report's SHA-256 digest match that owner and trigger. Missing, malformed, mismatched,
+or timed-out evidence escalates without retry. Reports and uncertain evidence are retained under
+`NO_DELETION`; no automatic report rotation or cleanup runs.
+
+Controller and collector state share a validated versioned private namespace. An existing
+collector snapshot without its matching controller record fails closed, and changing the declared
+profile or namespace cannot reuse a prior controller record. The controller file
 contains only a schema version, host/profile aliases, the current collector instance, generation,
 and fingerprint, stable trigger IDs and digests, bounded state and reason codes, UTC timestamps, an
 exact verified or unverified session ID, optional
@@ -164,10 +189,12 @@ programs.agent-deck-maintenance = {
   enable = true;
   hostAlias = "build-host";
   profileAlias = "default";
+  stateNamespace = "v3-default-report-only";
   workDirectory = "/home/example";
   repositoryRoots = [ "/home/example/Code/project" ];
   filesystemRoots = [ "/" ];
   fullSurveyHours = 24;
+  reportTimeoutHours = 24;
 };
 ```
 
@@ -184,7 +211,21 @@ and [report-only custodian charter](docs/agent-deck-fleet-custodian-charter.md) 
 Nothing in this module activates cleanup: archive, delete, prune, stop, restart, cache reclamation,
 branch/worktree mutation, external writes, merge, and deploy remain forbidden.
 
+## Archive-only custodian companion
+
+`agent-deck-archive-only-custodian` is a manual Linux companion for copying one
+explicitly named private regular file into a recoverable archive and rehearsing
+an exact restore under a private caller-selected directory. It never changes
+the source. The [archive-only guide](docs/agent-deck-archive-only-custodian.md)
+describes its strict paths, 1 MiB content bound, archive format, and failure
+behavior. The Home Manager module is disabled by default and creates no service
+or timer, even when enabled.
+
 ## Architecture
+
+The disabled-by-default [signed ingress companion](docs/agent-deck-signed-ingress.md) admits
+authenticated GitHub/Linear deliveries into an owner-only, body-free local ledger. Its IPv4
+loopback HTTP listener and Unix-socket control surface perform no Agent Deck or provider API calls.
 
 - **chezmoi** manages dotfiles and clones the private repo via `.chezmoiexternal.toml`
 - **Nix flake** (`~/.config/nix`) defines the full system: packages, shell, git, SSH

@@ -15,10 +15,10 @@ let
       runHook preInstall
       mkdir -p "$out/bin" "$out/libexec" "$out/share/agent-deck-maintenance"
       install -m 0444 \
-        ${../../private_dot_local/bin/executable_agent-deck-maintenance-controller} \
+        ${../../private_dot_local/bin/private_executable_agent-deck-maintenance-controller} \
         "$out/libexec/agent-deck-maintenance-controller.py"
       install -m 0444 \
-        ${../../private_dot_local/bin/executable_agent-deck-maintenance-collector} \
+        ${../../private_dot_local/bin/private_executable_agent-deck-maintenance-collector} \
         "$out/libexec/agent-deck-maintenance-collector.py"
       install -m 0444 \
         ${../../docs/agent-deck-fleet-custodian-charter.md} \
@@ -37,9 +37,13 @@ let
   controllerArgs = [
     "${runtime}/bin/agent-deck-maintenance-controller"
     "--state"
-    "%S/agent-deck-maintenance/controller.json"
+    "%S/agent-deck-maintenance/${cfg.stateNamespace}/controller.json"
     "--collector-state"
-    "%S/agent-deck-maintenance/collector.json"
+    "%S/agent-deck-maintenance/${cfg.stateNamespace}/collector.json"
+    "--state-namespace"
+    cfg.stateNamespace
+    "--report-root"
+    "%S/agent-deck-maintenance-reports/${cfg.stateNamespace}"
     "--collector"
     "${runtime}/bin/agent-deck-maintenance-collector"
     "--agent-deck"
@@ -66,6 +70,8 @@ let
     (toString cfg.collectorTimeoutSeconds)
     "--agent-timeout"
     (toString cfg.agentTimeoutSeconds)
+    "--report-timeout-hours"
+    (toString cfg.reportTimeoutHours)
   ]
   ++ lib.concatMap (path: [
     "--repo"
@@ -91,6 +97,12 @@ in
       type = lib.types.str;
       default = "default";
       description = "One configured Agent Deck profile alias.";
+    };
+
+    stateNamespace = lib.mkOption {
+      type = lib.types.str;
+      default = "v3-default-report-only";
+      description = "Versioned owner namespace shared by controller and collector state, separate from older deployments.";
     };
 
     workDirectory = lib.mkOption {
@@ -153,6 +165,12 @@ in
       description = "Bound for one exact Agent Deck launch, show, or send operation.";
     };
 
+    reportTimeoutHours = lib.mkOption {
+      type = lib.types.ints.between 1 8760;
+      default = 24;
+      description = "Deadline for a submitted report-only turn to produce its verified envelope.";
+    };
+
     serviceTimeout = lib.mkOption {
       type = lib.types.str;
       default = "20m";
@@ -180,6 +198,10 @@ in
       {
         assertion = builtins.match "[A-Za-z0-9][A-Za-z0-9._-]{0,127}" cfg.profileAlias != null;
         message = "programs.agent-deck-maintenance.profileAlias is invalid.";
+      }
+      {
+        assertion = builtins.match "[A-Za-z0-9][A-Za-z0-9._-]{0,127}" cfg.stateNamespace != null;
+        message = "programs.agent-deck-maintenance.stateNamespace is invalid.";
       }
       {
         assertion = cfg.warnPercent < cfg.criticalPercent;
@@ -218,7 +240,7 @@ in
         ExecStart = lib.escapeShellArgs controllerArgs;
         TimeoutStartSec = cfg.serviceTimeout;
         UMask = "0077";
-        StateDirectory = "agent-deck-maintenance";
+        StateDirectory = [ "agent-deck-maintenance" "agent-deck-maintenance-reports" ];
         StateDirectoryMode = "0700";
         NoNewPrivileges = true;
         # These remain best-effort namespace protections in user managers.

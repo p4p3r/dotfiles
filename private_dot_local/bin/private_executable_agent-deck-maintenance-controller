@@ -22,12 +22,14 @@ import uuid
 from typing import Any, Iterator
 
 
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 EVENT_VERSION = 2
 MAX_STATE_BYTES = 1_048_576
 MAX_COMMAND_BYTES = 4_194_304
 MAX_CHARTER_BYTES = 131_072
 MAX_ACCEPTANCE_BYTES = 2_048
+MAX_REPORT_ENVELOPE_BYTES = 2_048
+MAX_REPORT_BODY_BYTES = 4_194_304
 MAX_HISTORY = 64
 MAX_GENERATION = 9_223_372_036_854_775_807
 PATH_LIMIT = 4_096
@@ -41,6 +43,7 @@ EXIT_NOT_VERIFIED = 77
 EXIT_TEST_INTERRUPTED = 78
 
 SESSION_ID_RE = re.compile(r"^[0-9a-f]{8,20}-[0-9]{9,20}$")
+INVALID_SESSION_CONTROL = "00000000-0000000000"
 ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 INSTANCE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -70,11 +73,20 @@ ACCEPTED_TURN_FIELDS = {
     "turn_generation",
     "accepted_at",
 }
+REPORT_FIELDS = {
+    "schema_version", "trigger_alias", "owner_session_id", "status",
+    "report_ref", "report_digest", "completed_at", "result_code",
+}
+REPORT_STATUSES = {
+    "COMPLETE", "COMPLETE_WITH_BACKLOG", "NEEDS_USER", "NEEDS_SCOPE",
+    "NEEDS_FLEET", "FAILED", "CANCELLED",
+}
 
 TOP_FIELDS = {
     "format_version",
     "host_alias",
     "profile_alias",
+    "state_namespace",
     "survey_interval_seconds",
     "lifecycle_state",
     "owner_kind",
@@ -95,11 +107,13 @@ TOP_FIELDS = {
     "handoff_digest",
     "report_ref",
     "report_digest",
+    "result_status",
+    "result_code",
     "retention_code",
     "state_digest",
 }
-TRIGGER_FIELDS = {"id", "digest", "kind", "disposition", "claimed_at"}
-LIFECYCLE_STATES = {"ADMITTED", "ACTIVE", "ESCALATED"}
+TRIGGER_FIELDS = {"id", "alias", "digest", "kind", "disposition", "claimed_at", "owner_session_id"}
+LIFECYCLE_STATES = {"ADMITTED", "ACTIVE", "WAITING", "ESCALATED"}
 OWNER_KINDS = {"CONDUCTOR", "SESSION"}
 SESSION_STATUSES = {
     "NONE",
@@ -136,6 +150,8 @@ TRIGGER_DISPOSITIONS = {
     "PENDING",
     "DEFERRED_ACTIVE_OWNER",
     "COALESCED_FULL_SURVEY",
+    "COMPLETED",
+    "REPORTED",
 }
 REASON_CODES = {
     "BASELINE",
@@ -155,6 +171,10 @@ REASON_CODES = {
     "LAUNCH_ID_UNVERIFIED",
     "DELIVERY_NOT_VERIFIED",
     "TRIGGER_SUBMITTED",
+    "REPORT_VERIFIED",
+    "REPORT_NEEDS_ATTENTION",
+    "REPORT_NOT_VERIFIED",
+    "REPORT_TIMEOUT",
 }
 EVENT_KINDS = {"SESSION", "WORKTREE", "FILESYSTEM", "SOURCE"}
 HEALTH_BANDS = {"ABSENT", "NORMAL", "WARN", "CRITICAL", "UNKNOWN"}
@@ -310,6 +330,13 @@ def validate_trigger(value: Any) -> dict[str, Any]:
         trigger_id.startswith("change:") or trigger_id.startswith("survey:")
     ) or HEX_64_RE.fullmatch(trigger_id.split(":", 1)[1]) is None:
         raise ControllerError("invalid trigger ID")
+    if item["alias"] != trigger_alias(trigger_id):
+        raise ControllerError("invalid trigger alias")
+    owner = item["owner_session_id"]
+    if owner is not None and (
+        not isinstance(owner, str) or SESSION_ID_RE.fullmatch(owner) is None
+    ):
+        raise ControllerError("invalid trigger owner")
     trigger_digest = bounded_string(item["digest"], 64, "trigger digest")
     if HEX_64_RE.fullmatch(trigger_digest) is None:
         raise ControllerError("invalid trigger digest")
@@ -317,8 +344,14 @@ def validate_trigger(value: Any) -> dict[str, Any]:
     disposition = bounded_string(item["disposition"], 32, "trigger disposition")
     if kind not in TRIGGER_KINDS or disposition not in TRIGGER_DISPOSITIONS:
         raise ControllerError("invalid trigger enum")
+    if disposition in {"SUBMITTED", "COMPLETED", "REPORTED"} and owner is None:
+        raise ControllerError("submitted trigger has no exact owner")
     parse_rfc3339(item["claimed_at"], "trigger timestamp")
     return item
+
+
+def trigger_alias(trigger_id: str) -> str:
+    return "trigger-" + digest(trigger_id.encode("ascii"))
 
 
 def validate_state(
@@ -326,6 +359,7 @@ def validate_state(
     *,
     host_alias: str,
     profile_alias: str,
+    state_namespace: str,
     survey_interval_seconds: int,
 ) -> dict[str, Any]:
     state = exact_object(value, TOP_FIELDS, "controller state")
@@ -334,11 +368,13 @@ def validate_state(
         raise ControllerError("unsupported state version")
     if state["host_alias"] != host_alias or state["profile_alias"] != profile_alias:
         raise ControllerError("state owner alias mismatch")
+    if state["state_namespace"] != state_namespace:
+        raise ControllerError("state namespace mismatch")
     if state["survey_interval_seconds"] != survey_interval_seconds:
         raise ControllerError("state survey interval mismatch")
-    if state["lifecycle_state"] not in LIFECYCLE_STATES:
+    if not isinstance(state["lifecycle_state"], str) or state["lifecycle_state"] not in LIFECYCLE_STATES:
         raise ControllerError("invalid lifecycle state")
-    if state["owner_kind"] not in OWNER_KINDS:
+    if not isinstance(state["owner_kind"], str) or state["owner_kind"] not in OWNER_KINDS:
         raise ControllerError("invalid owner kind")
     owner = state["owner_session_id"]
     if owner is not None and (
@@ -355,7 +391,7 @@ def validate_state(
         raise ControllerError("session owner is missing")
     if state["owner_kind"] == "CONDUCTOR" and owner is not None:
         raise ControllerError("conductor state carries a session owner")
-    if state["lifecycle_state"] == "ACTIVE" and state["owner_kind"] != "SESSION":
+    if state["lifecycle_state"] in {"ACTIVE", "WAITING"} and state["owner_kind"] != "SESSION":
         raise ControllerError("active lifecycle has no verified session owner")
     validate_collector_instance_id(
         state["collector_instance_id"], "collector instance ID"
@@ -369,9 +405,9 @@ def validate_state(
     parse_rfc3339(state["last_checked_at"], "last checked timestamp")
     if state["session_observed_at"] is not None:
         parse_rfc3339(state["session_observed_at"], "session observation timestamp")
-    if state["session_status"] not in SESSION_STATUSES:
+    if not isinstance(state["session_status"], str) or state["session_status"] not in SESSION_STATUSES:
         raise ControllerError("invalid session status")
-    if state["reason_code"] not in REASON_CODES:
+    if not isinstance(state["reason_code"], str) or state["reason_code"] not in REASON_CODES:
         raise ControllerError("invalid reason code")
     if state["retention_code"] != "RETAIN":
         raise ControllerError("invalid retention code")
@@ -383,12 +419,26 @@ def validate_state(
         raise ControllerError("incomplete handoff reference")
     if (state["report_ref"] is None) != (state["report_digest"] is None):
         raise ControllerError("incomplete report reference")
+    if state["result_status"] is not None and (
+        not isinstance(state["result_status"], str)
+        or state["result_status"] not in REPORT_STATUSES
+    ):
+        raise ControllerError("invalid result status")
+    if state["result_code"] is not None and (
+        not isinstance(state["result_code"], str)
+        or TOKEN_RE.fullmatch(state["result_code"]) is None
+    ):
+        raise ControllerError("invalid result code")
+    if (state["result_status"] is None) != (state["result_code"] is None):
+        raise ControllerError("incomplete result")
 
     active = state["active_trigger"]
     if active is not None:
         validate_trigger(active)
-        if active["disposition"] not in {"CLAIMED", "SUBMITTED", "NOT_VERIFIED"}:
+        if active["disposition"] not in {"CLAIMED", "SUBMITTED", "NOT_VERIFIED", "REPORTED"}:
             raise ControllerError("invalid active trigger disposition")
+    if state["lifecycle_state"] == "WAITING" and active is not None:
+        raise ControllerError("waiting lifecycle has an active trigger")
     pending = state["pending_due_trigger"]
     if pending is not None:
         validate_trigger(pending)
@@ -433,6 +483,7 @@ def new_state(
     *,
     host_alias: str,
     profile_alias: str,
+    state_namespace: str,
     survey_interval_seconds: int,
     now: datetime,
     now_text: str,
@@ -451,6 +502,7 @@ def new_state(
         "format_version": FORMAT_VERSION,
         "host_alias": host_alias,
         "profile_alias": profile_alias,
+        "state_namespace": state_namespace,
         "survey_interval_seconds": survey_interval_seconds,
         "lifecycle_state": "ADMITTED",
         "owner_kind": "CONDUCTOR",
@@ -473,6 +525,8 @@ def new_state(
         "handoff_digest": None,
         "report_ref": None,
         "report_digest": None,
+        "result_status": None,
+        "result_code": None,
         "retention_code": "RETAIN",
         "state_digest": "0" * 64,
     }
@@ -594,6 +648,7 @@ def load_state(
     *,
     host_alias: str,
     profile_alias: str,
+    state_namespace: str,
     survey_interval_seconds: int,
 ) -> dict[str, Any] | None:
     existing = require_private_regular(path)
@@ -604,6 +659,7 @@ def load_state(
         parse_json_bytes(raw),
         host_alias=host_alias,
         profile_alias=profile_alias,
+        state_namespace=state_namespace,
         survey_interval_seconds=survey_interval_seconds,
     )
 
@@ -660,6 +716,7 @@ class AtomicWriter:
             state,
             host_alias=state["host_alias"],
             profile_alias=state["profile_alias"],
+            state_namespace=state["state_namespace"],
             survey_interval_seconds=state["survey_interval_seconds"],
         )
         payload = (
@@ -853,12 +910,15 @@ def event_trigger(event: dict[str, Any]) -> dict[str, Any]:
         + event["new_fingerprint"]
     ).encode("ascii")
     trigger_digest = digest(material)
+    trigger_id = f"change:{trigger_digest}"
     return {
-        "id": f"change:{trigger_digest}",
+        "id": trigger_id,
+        "alias": trigger_alias(trigger_id),
         "digest": trigger_digest,
         "kind": "COLLECTOR_CHANGE",
         "disposition": "CLAIMED",
         "claimed_at": "1970-01-01T00:00:00Z",
+        "owner_session_id": None,
     }
 
 
@@ -867,12 +927,15 @@ def survey_trigger(
 ) -> dict[str, Any]:
     material = f"FULL_SURVEY\0{host_alias}\0{profile_alias}\0{due_at}".encode("ascii")
     trigger_digest = digest(material)
+    trigger_id = f"survey:{trigger_digest}"
     return {
-        "id": f"survey:{trigger_digest}",
+        "id": trigger_id,
+        "alias": trigger_alias(trigger_id),
         "digest": trigger_digest,
         "kind": "FULL_SURVEY",
         "disposition": "CLAIMED",
         "claimed_at": "1970-01-01T00:00:00Z",
+        "owner_session_id": None,
     }
 
 
@@ -1016,6 +1079,16 @@ def validate_acceptance_result(raw: bytes, owner: str) -> None:
 
 
 def poll_owner(args: argparse.Namespace, owner: str) -> str:
+    control = [
+        args.agent_deck, "-p", args.profile, "session", "show",
+        INVALID_SESSION_CONTROL, "--json",
+    ]
+    try:
+        invalid_result = run_bounded(control, timeout=args.agent_timeout)
+    except CommandFailure as exc:
+        raise ControllerError("invalid-session control failed") from exc
+    if invalid_result.returncode == 0:
+        raise ControllerError("invalid-session control was accepted")
     command = [args.agent_deck, "-p", args.profile, "session", "show", owner, "--json"]
     try:
         result = run_bounded(command, timeout=args.agent_timeout)
@@ -1026,6 +1099,8 @@ def poll_owner(args: argparse.Namespace, owner: str) -> str:
     payload = parse_json_command(result.stdout)
     if payload.get("id") != owner:
         raise ControllerError("owner identity mismatch")
+    if payload.get("profile", args.profile) != args.profile:
+        raise ControllerError("owner profile mismatch")
     raw_status = payload.get("status")
     if not isinstance(raw_status, str) or raw_status not in SESSION_STATUS_MAP:
         raise ControllerError("owner status unknown")
@@ -1033,6 +1108,87 @@ def poll_owner(args: argparse.Namespace, owner: str) -> str:
     if not isinstance(raw_substate, str) or raw_substate not in SESSION_SUBSTATES:
         raise ControllerError("owner substate unknown")
     return SESSION_STATUS_MAP[raw_status]
+
+
+def read_report_file(path: Path, maximum: int) -> bytes:
+    def private_identity(info: os.stat_result) -> tuple[int, ...]:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_size < 0
+            or info.st_size > maximum
+        ):
+            raise ControllerError("report file is unsafe")
+        return (
+            info.st_dev, info.st_ino, info.st_uid, info.st_gid,
+            stat.S_IMODE(info.st_mode), info.st_nlink, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns,
+        )
+
+    try:
+        info = path.lstat()
+        expected = private_identity(info)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if private_identity(opened) != expected:
+                raise ControllerError("report file changed during open")
+            body = bytearray()
+            while True:
+                part = os.read(descriptor, min(65_536, maximum + 1 - len(body)))
+                if not part:
+                    break
+                body.extend(part)
+                if len(body) > maximum:
+                    raise ControllerError("report file exceeds size limit")
+            if len(body) != info.st_size:
+                raise ControllerError("report file size changed during read")
+            if private_identity(os.fstat(descriptor)) != expected:
+                raise ControllerError("report file changed during read")
+            if private_identity(path.lstat()) != expected:
+                raise ControllerError("report path changed during read")
+            return bytes(body)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        raise ControllerError("report file is unavailable") from exc
+
+
+def verify_report(
+    args: argparse.Namespace, trigger: dict[str, Any], owner: str, now: datetime,
+    deadline: datetime,
+) -> tuple[str, str, str, str]:
+    require_private_directory(args.report_root, create=False)
+    alias = trigger["alias"]
+    envelope_name = alias + ".json"
+    raw = read_report_file(args.report_root / envelope_name, MAX_REPORT_ENVELOPE_BYTES)
+    envelope = exact_object(parse_json_bytes(raw), REPORT_FIELDS, "report envelope")
+    if (
+        type(envelope["schema_version"]) is not int
+        or envelope["schema_version"] != 1
+        or envelope["trigger_alias"] != alias
+        or envelope["owner_session_id"] != owner
+        or envelope["report_ref"] != alias + ".md"
+        or not isinstance(envelope["status"], str)
+        or envelope["status"] not in REPORT_STATUSES
+        or not isinstance(envelope["result_code"], str)
+        or TOKEN_RE.fullmatch(envelope["result_code"]) is None
+    ):
+        raise ControllerError("report envelope identity or result is invalid")
+    completed_at = parse_rfc3339(envelope["completed_at"], "report timestamp")
+    if not parse_rfc3339(trigger["claimed_at"], "trigger claim") <= completed_at <= min(now, deadline):
+        raise ControllerError("report timestamp is outside trigger")
+    report_digest = validate_optional_digest(envelope["report_digest"], "report digest")
+    if report_digest is None:
+        raise ControllerError("report digest is missing")
+    report = read_report_file(args.report_root / envelope["report_ref"], MAX_REPORT_BODY_BYTES)
+    if not report or digest(report) != report_digest:
+        raise ControllerError("report body digest mismatch")
+    return envelope["status"], envelope["result_code"], digest(raw), report_digest
 
 
 def read_charter(path: Path) -> str:
@@ -1063,9 +1219,13 @@ def prompt_for_trigger(
         [
             "MAINTENANCE_TRIGGER_VERSION: 1",
             f"TRIGGER_ID: {trigger['id']}",
+            f"TRIGGER_ALIAS: {trigger['alias']}",
             f"TRIGGER_KIND: {trigger['kind']}",
             f"HOST_ALIAS: {args.host_alias}",
             f"PROFILE_ALIAS: {args.profile}",
+            f"REPORT_ENVELOPE: {args.report_root / (trigger['alias'] + '.json')}",
+            f"REPORT_BODY: {args.report_root / (trigger['alias'] + '.md')}",
+            "Use current exact Agent Deck session ID as envelope owner_session_id; write owner-only 0600 files in the 0700 report root, body first and envelope last. Include schema_version=1, trigger_alias, owner_session_id, terminal status, relative report_ref, SHA-256 report_digest, completed_at UTC, and bounded result_code.",
             "The event body is intentionally unavailable. Fetch current evidence yourself.",
             "Configured repository roots (transient scope only): "
             + json.dumps(args.repo, ensure_ascii=True),
@@ -1085,6 +1245,8 @@ def update_trigger(
     for item in state["recent_triggers"]:
         if item["id"] == trigger_id:
             item["disposition"] = disposition
+            if disposition in {"SUBMITTED", "COMPLETED", "REPORTED"}:
+                item["owner_session_id"] = state["owner_session_id"]
             updated = dict(item)
             break
     if updated is None:
@@ -1274,6 +1436,7 @@ def claim_trigger(
     claimed = dict(trigger)
     claimed["claimed_at"] = now_text
     claimed["disposition"] = "CLAIMED"
+    claimed["owner_session_id"] = state["owner_session_id"]
     existing = [
         item for item in state["recent_triggers"] if item["id"] == claimed["id"]
     ]
@@ -1289,6 +1452,7 @@ def claim_trigger(
     else:
         remember_trigger(state, claimed)
     state["active_trigger"] = dict(claimed)
+    state["lifecycle_state"] = "ACTIVE" if state["owner_kind"] == "SESSION" else "ADMITTED"
     state["reason_code"] = "TRIGGER_CLAIMED"
     state["last_checked_at"] = now_text
 
@@ -1296,13 +1460,17 @@ def claim_trigger(
 def process_tick(args: argparse.Namespace, writer: AtomicWriter) -> int:
     now, now_text = current_time(args.now)
     interval_seconds = args.full_survey_hours * 3600
+    require_private_directory(args.report_root, create=True)
     with state_lock(args.state):
         state = load_state(
             args.state,
             host_alias=args.host_alias,
             profile_alias=args.profile,
+            state_namespace=args.state_namespace,
             survey_interval_seconds=interval_seconds,
         )
+        if state is None and require_private_regular(args.collector_state) is not None:
+            raise ControllerError("collector state exists without its controller owner")
         event, checkpoint, collector_error = run_collector(args)
         if collector_error is not None:
             if state is not None and collector_error != "COLLECTOR_EVENT_INVALID":
@@ -1318,6 +1486,7 @@ def process_tick(args: argparse.Namespace, writer: AtomicWriter) -> int:
             state = new_state(
                 host_alias=args.host_alias,
                 profile_alias=args.profile,
+                state_namespace=args.state_namespace,
                 survey_interval_seconds=interval_seconds,
                 now=now,
                 now_text=now_text,
@@ -1347,6 +1516,7 @@ def process_tick(args: argparse.Namespace, writer: AtomicWriter) -> int:
 
         state["last_checked_at"] = now_text
         active = state["active_trigger"]
+        completed_this_tick = False
         if active is not None and active["disposition"] == "CLAIMED":
             state["lifecycle_state"] = "ESCALATED"
             state["reason_code"] = "CLAIM_RECOVERY_REQUIRED"
@@ -1367,6 +1537,45 @@ def process_tick(args: argparse.Namespace, writer: AtomicWriter) -> int:
                 return EXIT_NOT_VERIFIED
             state["session_status"] = observed
             state["session_observed_at"] = now_text
+            if active is not None and active["disposition"] == "SUBMITTED":
+                deadline = parse_rfc3339(active["claimed_at"], "trigger claim") + timedelta(
+                    hours=args.report_timeout_hours
+                )
+                if observed in {"RUNNING", "QUEUED"} and now >= deadline:
+                    update_trigger(state, active["id"], "NOT_VERIFIED")
+                    state["lifecycle_state"] = "ESCALATED"
+                    state["reason_code"] = "REPORT_TIMEOUT"
+                    writer.write(args.state, state)
+                    return EXIT_NOT_VERIFIED
+                if observed in {"WAITING", "IDLE"}:
+                    try:
+                        status, code, envelope_digest, report_digest = verify_report(
+                            args, active, owner, now, deadline
+                        )
+                    except ControllerError:
+                        update_trigger(state, active["id"], "NOT_VERIFIED")
+                        state["lifecycle_state"] = "ESCALATED"
+                        state["reason_code"] = "REPORT_NOT_VERIFIED"
+                        writer.write(args.state, state)
+                        return EXIT_NOT_VERIFIED
+                    state["handoff_ref"] = active["alias"] + ".json"
+                    state["handoff_digest"] = envelope_digest
+                    state["report_ref"] = active["alias"] + ".md"
+                    state["report_digest"] = report_digest
+                    state["result_status"] = status
+                    state["result_code"] = code
+                    if status in {"COMPLETE", "COMPLETE_WITH_BACKLOG"}:
+                        update_trigger(state, active["id"], "COMPLETED")
+                        state["active_trigger"] = None
+                        state["lifecycle_state"] = "WAITING"
+                        state["reason_code"] = "REPORT_VERIFIED"
+                        completed_this_tick = True
+                    else:
+                        update_trigger(state, active["id"], "REPORTED")
+                        state["lifecycle_state"] = "ESCALATED"
+                        state["reason_code"] = "REPORT_NEEDS_ATTENTION"
+                        writer.write(args.state, state)
+                        return EXIT_NOT_VERIFIED
             if observed in {"ERROR", "STOPPED"}:
                 state["lifecycle_state"] = "ESCALATED"
                 state["reason_code"] = "OWNER_TERMINAL_UNVERIFIED"
@@ -1407,7 +1616,8 @@ def process_tick(args: argparse.Namespace, writer: AtomicWriter) -> int:
                     due_at=due_at,
                 )
         if trigger is None:
-            state["reason_code"] = "NO_TRIGGER"
+            if not completed_this_tick:
+                state["reason_code"] = "NO_TRIGGER"
             writer.write(args.state, state)
             return EXIT_OK
 
@@ -1474,6 +1684,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--state", help="private host-local controller state")
     parser.add_argument("--collector-state", help="private collector snapshot")
+    parser.add_argument("--state-namespace", required=True, help="versioned owner namespace")
+    parser.add_argument("--report-root", required=True, help="separate owner-only report directory")
     parser.add_argument(
         "--collector", default="agent-deck-maintenance-collector", help="collector executable"
     )
@@ -1497,6 +1709,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--full-survey-hours", type=int, default=24)
     parser.add_argument("--collector-timeout", type=float, default=120.0)
     parser.add_argument("--agent-timeout", type=float, default=600.0)
+    parser.add_argument("--report-timeout-hours", type=int, default=24)
     parser.add_argument("--now", help="inject an RFC3339 UTC clock for deterministic tests")
     parser.add_argument(
         "--test-fail-write",
@@ -1508,7 +1721,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if ALIAS_RE.fullmatch(args.host_alias) is None or ALIAS_RE.fullmatch(args.profile) is None:
+    if (
+        ALIAS_RE.fullmatch(args.host_alias) is None
+        or ALIAS_RE.fullmatch(args.profile) is None
+        or ALIAS_RE.fullmatch(args.state_namespace) is None
+    ):
         raise ControllerError("invalid host or profile alias")
     if (
         isinstance(args.full_survey_hours, bool)
@@ -1516,17 +1733,34 @@ def validate_args(args: argparse.Namespace) -> None:
         or isinstance(args.warn_percent, bool)
         or isinstance(args.critical_percent, bool)
         or not 0 <= args.warn_percent < args.critical_percent <= 100
+        or isinstance(args.report_timeout_hours, bool)
+        or not 1 <= args.report_timeout_hours <= 8_760
     ):
         raise ControllerError("invalid threshold or survey interval")
     for timeout in (args.collector_timeout, args.agent_timeout):
         if not math.isfinite(timeout) or timeout <= 0 or timeout > 3_600:
             raise ControllerError("invalid command timeout")
-    args.state = absolute_path(
-        args.state or str(default_state_path("maintenance-controller.json"))
-    )
-    args.collector_state = absolute_path(
-        args.collector_state or str(default_state_path("maintenance-collector.json"))
-    )
+    def private_path(raw: str) -> Path:
+        if not raw.startswith("/") or any(part in {".", ".."} for part in raw.split("/")):
+            raise ControllerError("private path is not absolute and canonical")
+        if len(raw) > PATH_LIMIT or "\x00" in raw:
+            raise ControllerError("private path is invalid")
+        return Path(raw)
+
+    args.state = private_path(args.state or str(default_state_path(args.state_namespace) / "controller.json"))
+    args.collector_state = private_path(args.collector_state or str(default_state_path(args.state_namespace) / "collector.json"))
+    args.report_root = private_path(args.report_root)
+    if (
+        args.state.parent != args.collector_state.parent
+        or args.state.parent.name != args.state_namespace
+        or args.report_root.name != args.state_namespace
+        or args.report_root.parent == args.state.parent.parent
+        or args.state.parent in args.report_root.parents
+        or args.report_root in args.state.parent.parents
+        or args.state == args.collector_state
+        or args.report_root == args.state.parent
+    ):
+        raise ControllerError("private roots do not identify separate namespaces")
     args.charter = absolute_path(args.charter)
     args.codex_executable = str(absolute_path(args.codex_executable))
     args.workdir = str(absolute_path(args.workdir))

@@ -9,16 +9,18 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import stat
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 
 REPO = Path(__file__).resolve().parents[1]
-SCRIPT = REPO / "private_dot_local/bin/executable_agent-deck-maintenance-controller"
+SCRIPT = REPO / "private_dot_local/bin/private_executable_agent-deck-maintenance-controller"
 CHARTER = REPO / "docs/agent-deck-fleet-custodian-charter.md"
 MODULE = REPO / "nix/modules/agent-deck-maintenance.nix"
 OWNER = "0123abcd-1700000000"
@@ -85,8 +87,12 @@ class ControllerCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         os.chmod(self.root, 0o700)
-        self.state = self.root / "controller.json"
-        self.collector_state = self.root / "collector.json"
+        self.namespace = "v3-test-profile-report-only"
+        self.state_root = self.root / "state" / self.namespace
+        self.state_root.mkdir(parents=True, mode=0o700)
+        self.state = self.state_root / "controller.json"
+        self.collector_state = self.state_root / "collector.json"
+        self.report_root = self.root / "reports" / self.namespace
         self.collector_log = self.root / "collector-argv.jsonl"
         self.agent_log = self.root / "agent-argv.jsonl"
         self.prompt_log = self.root / "prompt.jsonl"
@@ -259,6 +265,12 @@ class ControllerCase(unittest.TestCase):
 
                 if "show" in argv:
                     session_id = argv[argv.index("show") + 1]
+                    if session_id == "00000000-0000000000":
+                        if mode == "show-bogus-valid":
+                            sys.stdout.write(json.dumps({{"id": session_id, "status": "waiting"}}))
+                            raise SystemExit(0)
+                        sys.stdout.write(json.dumps({{"success": False, "code": "NOT_FOUND"}}))
+                        raise SystemExit(2)
                     if mode in ("show-not-found", "show-bogus"):
                         sys.stdout.write(json.dumps({{"success": False, "code": "NOT_FOUND"}}))
                         raise SystemExit(2)
@@ -315,6 +327,8 @@ class ControllerCase(unittest.TestCase):
         env: dict[str, str] | None = None,
         extra: list[str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        if env and env.get("SESSION_STATUS") in {"waiting", "idle"}:
+            self.write_report(env.get("REPORT_CASE", "valid"))
         command = [
             sys.executable,
             str(SCRIPT),
@@ -322,6 +336,10 @@ class ControllerCase(unittest.TestCase):
             str(self.state),
             "--collector-state",
             str(self.collector_state),
+            "--state-namespace",
+            self.namespace,
+            "--report-root",
+            str(self.report_root),
             "--collector",
             str(self.collector),
             "--agent-deck",
@@ -362,6 +380,39 @@ class ControllerCase(unittest.TestCase):
     def state_json(self) -> dict[str, object]:
         return json.loads(self.state.read_text(encoding="utf-8"))
 
+    def write_report(self, case: str = "valid") -> None:
+        if case == "missing" or not self.state.exists():
+            return
+        active = self.state_json().get("active_trigger")
+        if not active or active.get("disposition") != "SUBMITTED":
+            return
+        self.report_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.report_root.chmod(0o700)
+        alias = active["alias"]
+        body = b"STATUS: COMPLETE\nOUTCOME: report-only inspection\n"
+        body_path = self.report_root / f"{alias}.md"
+        body_path.write_bytes(body)
+        body_path.chmod(0o600)
+        envelope = {
+            "schema_version": 1,
+            "trigger_alias": alias if case != "wrong-trigger" else "trigger-" + "0" * 64,
+            "owner_session_id": OWNER if case != "wrong-owner" else OTHER_OWNER,
+            "status": "COMPLETE",
+            "report_ref": f"{alias}.md" if case != "wrong-ref" else "../other.md",
+            "report_digest": fingerprint("wrong") if case == "digest-mismatch" else hashlib.sha256(body).hexdigest(),
+            "completed_at": active["claimed_at"],
+            "result_code": "SURVEY_RETAINED" if case != "bad-result" else "../../bad",
+        }
+        if case == "needs-user":
+            envelope["status"] = "NEEDS_USER"
+        envelope_path = self.report_root / f"{alias}.json"
+        envelope_path.write_text(
+            "{invalid" if case == "malformed" else json.dumps(envelope), encoding="utf-8"
+        )
+        envelope_path.chmod(0o600)
+        if case == "world-readable":
+            envelope_path.chmod(0o644)
+
     def agent_calls(self) -> list[list[str]]:
         if not self.agent_log.exists():
             return []
@@ -377,6 +428,9 @@ class ControllerCase(unittest.TestCase):
             self.prompt_log,
         ):
             if path.exists() or path.is_symlink():
+                path.unlink()
+        if self.report_root.exists():
+            for path in self.report_root.iterdir():
                 path.unlink()
 
     def baseline(self) -> subprocess.CompletedProcess[str]:
@@ -395,7 +449,7 @@ class ControllerCase(unittest.TestCase):
         self.assertEqual(first.stdout, "")
         self.assertEqual(first.stderr, "")
         state = self.state_json()
-        self.assertEqual(state["format_version"], 2)
+        self.assertEqual(state["format_version"], 3)
         self.assertEqual(state["collector_instance_id"], COLLECTOR_INSTANCE)
         self.assertEqual(state["collector_generation"], 0)
         self.assertEqual(state["collector_fingerprint"], fingerprint("a"))
@@ -426,7 +480,7 @@ class ControllerCase(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.agent_calls()
         self.assertEqual(len([row for row in calls if "launch" in row]), 1)
-        self.assertEqual(len([row for row in calls if "show" in row]), 1)
+        self.assertEqual(len([row for row in calls if "show" in row]), 2)
         self.assertEqual(len([row for row in calls if "send" in row]), 0)
         launch = calls[0]
         self.assertEqual(launch[:2], ["-p", "test-profile"])
@@ -461,7 +515,7 @@ class ControllerCase(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         calls = self.agent_calls()
         self.assertEqual(len([row for row in calls if "launch" in row]), 1)
-        self.assertEqual(len([row for row in calls if "show" in row]), 1)
+        self.assertEqual(len([row for row in calls if "show" in row]), 2)
         self.assertEqual(len([row for row in calls if "send" in row]), 0)
         state = self.state_json()
         self.assertIsNone(state["owner_session_id"])
@@ -590,6 +644,120 @@ class ControllerCase(unittest.TestCase):
         state = self.state_json()
         self.assertEqual(state["active_trigger"]["kind"], "FULL_SURVEY")
         self.assertEqual(state["next_full_survey_at"], "2026-09-22T00:00:00Z")
+
+    def test_terminal_report_verifies_exact_owner_and_returns_to_waiting(self) -> None:
+        self.assertEqual(self.launch_change().returncode, 0)
+        active = self.state_json()["active_trigger"]
+        self.assertEqual(active["owner_session_id"], OWNER)
+        self.assertRegex(active["alias"], r"^trigger-[0-9a-f]{64}$")
+        completed = self.run_controller(
+            now="2026-09-20T02:00:00Z",
+            env={"SESSION_STATUS": "waiting", "SESSION_SUBSTATE": "idle-at-empty-prompt"},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        state = self.state_json()
+        self.assertEqual(state["lifecycle_state"], "WAITING")
+        self.assertIsNone(state["active_trigger"])
+        self.assertEqual(state["result_status"], "COMPLETE")
+        self.assertEqual(state["result_code"], "SURVEY_RETAINED")
+        self.assertEqual(state["report_ref"], active["alias"] + ".md")
+        self.assertEqual(state["handoff_ref"], active["alias"] + ".json")
+        self.assertEqual(stat.S_IMODE(self.report_root.stat().st_mode), 0o700)
+        self.assertTrue(all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in self.report_root.iterdir()))
+        self.assertNotIn(str(self.report_root), self.state.read_text())
+        self.assertEqual(len([row for row in self.agent_calls() if "send" in row]), 0)
+
+    def test_terminal_report_faults_escalate_without_retry(self) -> None:
+        for case in (
+            "missing", "malformed", "wrong-owner", "wrong-trigger", "digest-mismatch",
+            "wrong-ref", "bad-result", "world-readable",
+        ):
+            with self.subTest(case=case):
+                self.reset_runtime()
+                self.assertEqual(self.launch_change().returncode, 0)
+                failed = self.run_controller(
+                    now="2026-09-20T02:00:00Z",
+                    env={
+                        "SESSION_STATUS": "waiting",
+                        "SESSION_SUBSTATE": "idle-at-empty-prompt",
+                        "REPORT_CASE": case,
+                    },
+                )
+                self.assertEqual(failed.returncode, 77, failed.stderr)
+                state = self.state_json()
+                self.assertEqual(state["lifecycle_state"], "ESCALATED")
+                self.assertEqual(state["reason_code"], "REPORT_NOT_VERIFIED")
+                self.assertEqual(state["active_trigger"]["disposition"], "NOT_VERIFIED")
+                self.assertIsNone(state["report_ref"])
+                later = self.run_controller(now="2026-09-20T03:00:00Z")
+                self.assertEqual(later.returncode, 77, later.stderr)
+                self.assertEqual(len([row for row in self.agent_calls() if "launch" in row]), 1)
+                self.assertEqual(len([row for row in self.agent_calls() if "send" in row]), 0)
+
+    def test_verified_noncomplete_report_retains_owner_and_escalates(self) -> None:
+        self.assertEqual(self.launch_change().returncode, 0)
+        result = self.run_controller(
+            now="2026-09-20T02:00:00Z",
+            env={
+                "SESSION_STATUS": "waiting",
+                "SESSION_SUBSTATE": "idle-at-empty-prompt",
+                "REPORT_CASE": "needs-user",
+            },
+        )
+        self.assertEqual(result.returncode, 77, result.stderr)
+        state = self.state_json()
+        self.assertEqual(state["lifecycle_state"], "ESCALATED")
+        self.assertEqual(state["result_status"], "NEEDS_USER")
+        self.assertEqual(state["active_trigger"]["disposition"], "REPORTED")
+        self.assertEqual(state["owner_session_id"], OWNER)
+        self.assertIsNotNone(state["report_digest"])
+
+    def test_report_timeout_and_invalid_session_control_escalate(self) -> None:
+        self.assertEqual(self.launch_change().returncode, 0)
+        timeout = self.run_controller(now="2026-09-21T02:00:00Z")
+        self.assertEqual(timeout.returncode, 77, timeout.stderr)
+        self.assertEqual(self.state_json()["reason_code"], "REPORT_TIMEOUT")
+        self.reset_runtime()
+        invalid = self.launch_change(env={"AGENT_MODE": "show-bogus-valid"})
+        self.assertEqual(invalid.returncode, 77, invalid.stderr)
+        self.assertEqual(self.state_json()["reason_code"], "OWNER_NOT_VERIFIED")
+        shows = [row for row in self.agent_calls() if "show" in row]
+        self.assertEqual(len(shows), 1)
+        self.assertEqual(shows[0][shows[0].index("show") + 1], "00000000-0000000000")
+
+    def test_profile_namespace_and_old_state_are_fail_closed(self) -> None:
+        old_root = self.root / "state"
+        old_files = {
+            "controller.json": b'{"profile_alias":"fixture","overdue":true}\n',
+            "collector.json": b'{"generation":0,"profile":"fixture"}\n',
+            "controller.json.lock": b"",
+        }
+        for name, body in old_files.items():
+            old_path = old_root / name
+            old_path.write_bytes(body)
+            old_path.chmod(0o600)
+        self.baseline()
+        for name, body in old_files.items():
+            self.assertEqual((old_root / name).read_bytes(), body)
+        self.assertEqual(self.state_json()["profile_alias"], "test-profile")
+        self.assertEqual(self.state_json()["state_namespace"], self.namespace)
+        before = self.state.read_bytes()
+        mismatch = self.run_controller(now=EARLY_AT, extra=["--profile", "other-profile"])
+        self.assertEqual(mismatch.returncode, 70)
+        self.assertEqual(self.state.read_bytes(), before)
+        traversal = self.run_controller(
+            now=EARLY_AT,
+            extra=["--report-root", str(self.root / "reports" / ".." / self.namespace)],
+        )
+        self.assertEqual(traversal.returncode, 70)
+        self.assertEqual(self.state.read_bytes(), before)
+        self.reset_runtime()
+        self.collector_state.write_bytes(b'{"profile":"fixture"}\n')
+        self.collector_state.chmod(0o600)
+        reused = self.run_controller(now=BASELINE_AT)
+        self.assertEqual(reused.returncode, 70)
+        self.assertFalse(self.state.exists())
+        self.assertEqual(self.collector_state.read_bytes(), b'{"profile":"fixture"}\n')
 
     def test_duplicate_replayed_event_never_launches_or_sends_twice(self) -> None:
         self.assertEqual(self.launch_change().returncode, 0)
@@ -728,13 +896,7 @@ class ControllerCase(unittest.TestCase):
         }
         for name, event in cases.items():
             with self.subTest(name=name):
-                if self.state.exists():
-                    self.state.unlink()
-                lock = Path(str(self.state) + ".lock")
-                if lock.exists():
-                    lock.unlink()
-                if self.agent_log.exists():
-                    self.agent_log.unlink()
+                self.reset_runtime()
                 self.baseline()
                 before = self.state.read_bytes()
                 result = self.run_controller(
@@ -844,7 +1006,7 @@ class ControllerCase(unittest.TestCase):
         valid = self.state_json()
         cases = {
             "v1": ("format_version", 1),
-            "unknown-version": ("format_version", 3),
+            "unknown-version": ("format_version", 4),
             "boolean-version": ("format_version", True),
             "missing-instance": ("collector_instance_id", None),
             "short-instance": ("collector_instance_id", "0" * 31),
@@ -1092,7 +1254,98 @@ class ControllerCase(unittest.TestCase):
         self.assertLess(self.state.stat().st_size, MAX_STATE_BYTES)
 
 
+class ReportFileSafetyCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.root.chmod(0o700)
+        self.path = self.root / "report.md"
+        self.path.write_bytes(b"ORIGINAL")
+        self.path.chmod(0o600)
+        controller = runpy.run_path(str(SCRIPT))
+        self.read_report_file = controller["read_report_file"]
+        self.ControllerError = controller["ControllerError"]
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_mode_drift_after_open_is_rejected(self) -> None:
+        real_open = os.open
+        opened = []
+
+        def drift(path: Path, flags: int) -> int:
+            descriptor = real_open(path, flags)
+            opened.append(descriptor)
+            os.fchmod(descriptor, 0o644)
+            return descriptor
+
+        with mock.patch("os.open", side_effect=drift):
+            with self.assertRaises(self.ControllerError):
+                self.read_report_file(self.path, 64)
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o644)
+
+    def test_retained_path_replacement_during_read_is_rejected(self) -> None:
+        before = self.path.stat()
+        replacement = self.root / "replacement.md"
+        replacement.write_bytes(b"REPLACED")
+        replacement.chmod(0o600)
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        real_read = os.read
+        replaced = []
+
+        def swap(descriptor: int, length: int) -> bytes:
+            part = real_read(descriptor, length)
+            if part and not replaced:
+                os.replace(self.path, self.root / "previous.md")
+                os.replace(replacement, self.path)
+                replaced.append(True)
+            return part
+
+        with mock.patch("os.read", side_effect=swap):
+            with self.assertRaises(self.ControllerError):
+                self.read_report_file(self.path, 64)
+        self.assertTrue(replaced)
+        after = self.path.stat()
+        self.assertNotEqual(after.st_ino, before.st_ino)
+        self.assertEqual((after.st_size, after.st_mtime_ns), (before.st_size, before.st_mtime_ns))
+
+    def test_open_descriptor_metadata_drift_during_read_is_rejected(self) -> None:
+        for drift_kind in ("mode", "size", "mtime"):
+            with self.subTest(drift_kind=drift_kind):
+                self.path.write_bytes(b"ORIGINAL")
+                self.path.chmod(0o600)
+                real_read = os.read
+                drifted = []
+
+                def drift(descriptor: int, length: int) -> bytes:
+                    part = real_read(descriptor, length)
+                    if part and not drifted:
+                        if drift_kind == "mode":
+                            os.fchmod(descriptor, 0o644)
+                        elif drift_kind == "size":
+                            os.truncate(self.path, 0)
+                        else:
+                            info = os.fstat(descriptor)
+                            os.utime(self.path, ns=(info.st_atime_ns, info.st_mtime_ns + 1))
+                        drifted.append(True)
+                    return part
+
+                with mock.patch("os.read", side_effect=drift):
+                    with self.assertRaises(self.ControllerError):
+                        self.read_report_file(self.path, 64)
+                self.assertTrue(drifted)
+
+
 class ModuleContractCase(unittest.TestCase):
+    def test_module_repository_source_paths_exist(self) -> None:
+        text = MODULE.read_text(encoding="utf-8")
+        source_paths = re.findall(r"\$\{(\.\./\.\./[^}]+)\}", text)
+        self.assertTrue(source_paths, "expected repository source path interpolations")
+        for source_path in source_paths:
+            with self.subTest(source_path=source_path):
+                self.assertTrue((MODULE.parent / source_path).is_file())
+
     def test_public_maintenance_surface_contains_no_host_specific_material(self) -> None:
         readme = (REPO / "README.md").read_text(encoding="utf-8")
         section = readme.split("## Report-only maintenance runtime", 1)[1]

@@ -1,0 +1,868 @@
+#!/usr/bin/env python3
+"""Loopback signed ingress with a body-free, single-writer local ledger.
+
+Exception boundaries deliberately expose only fixed codes and never tracebacks.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import fcntl
+import hmac
+import ipaddress
+import json
+import math
+import os
+import queue
+import re
+import resource
+import signal
+import socket
+import socketserver
+import sqlite3
+import stat
+import struct
+import sys
+import threading
+import time
+import uuid
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, NoReturn
+
+MAX_BODY = 262_144
+MAX_HEADER_LINE = 2048
+MAX_HEADERS = 48
+MAX_HEADER_BYTES = 16_384
+MAX_CONTROL = 1024
+READ_TIMEOUT = 2.0
+WRITE_TIMEOUT = 3.0
+MAX_HANDLERS = 8
+GH_ACTIONS = {"opened", "reopened", "synchronize", "edited", "closed"}
+LINEAR_ACTIONS = {"create", "update", "remove"}
+RESULT_STATES = {"completed": "completed", "api_unavailable": "uncertain",
+                 "indeterminate": "uncertain", "dead_letter": "dead_letter"}
+ALIAS_RE = re.compile(r"[a-z2-7]{52}")
+HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+CONDUCTOR_RE = re.compile(
+    r"(?:[0-9a-f]{8,20}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})-[0-9]{9,20}"
+)
+
+
+class IngressError(Exception):
+    """Only a fixed code may escape a request or storage boundary."""
+
+    def __init__(self, code: str = "INVALID"):
+        super().__init__(code)
+        self.code = code
+
+
+def require(condition: bool, code: str = "INVALID") -> None:
+    if not condition:
+        raise IngressError(code)
+
+
+def json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        require(key not in result)
+        result[key] = value
+    return result
+
+
+def reject_constant(_value: str) -> None:
+    raise IngressError()
+
+
+def finite_float(value: str) -> float:
+    result = float(value)
+    require(math.isfinite(result))
+    return result
+
+
+def strict_json(raw: bytes) -> dict[str, Any]:
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=json_object,
+                           parse_constant=reject_constant, parse_float=finite_float)
+        require(type(value) is dict)
+        return value
+    except (ValueError, UnicodeError, RecursionError):
+        raise IngressError() from None
+
+
+def integer(value: Any, low: int = 1, high: int = 2**63 - 1) -> int:
+    require(type(value) is int and low <= value <= high)
+    return value
+
+
+def canonical_uuid(value: Any, *, v4: bool = False) -> str:
+    require(type(value) is str and len(value) == 36)
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError:
+        raise IngressError() from None
+    require(str(parsed) == value and parsed.int != 0 and (not v4 or parsed.version == 4))
+    return value
+
+
+def mapping(value: Any) -> dict[str, Any]:
+    require(type(value) is dict)
+    return value
+
+
+def shape(value: Any, fields: set[str]) -> dict[str, Any]:
+    result = mapping(value)
+    require(set(result) == fields)
+    return result
+
+
+def outside_store(value: Any) -> Path:
+    require(type(value) is str and 0 < len(value) <= 4096 and "\x00" not in value)
+    path = Path(value)
+    require(path.is_absolute() and ".." not in path.parts and path != Path("/"))
+    require(not path.is_relative_to("/nix/store"))
+    for ancestor in (path, *path.parents):
+        require(not ancestor.is_symlink())
+    return path
+
+
+def private_info(info: os.stat_result, kind: str) -> None:
+    valid_type = {"file": stat.S_ISREG, "directory": stat.S_ISDIR,
+                  "socket": stat.S_ISSOCK}[kind]
+    mode = 0o700 if kind == "directory" else 0o600
+    require(valid_type(info.st_mode) and info.st_uid == os.geteuid()
+            and stat.S_IMODE(info.st_mode) == mode, "UNSAFE_FILE")
+    if kind == "file":
+        require(info.st_nlink == 1, "UNSAFE_FILE")
+
+
+def private_read(path: Path, maximum: int) -> bytes:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            private_info(info, "file")
+            require(info.st_size <= maximum, "UNSAFE_FILE")
+            data = os.read(fd, maximum + 1)
+            require(0 < len(data) <= maximum, "UNSAFE_FILE")
+            return data
+        finally:
+            os.close(fd)
+    except OSError:
+        raise IngressError("UNSAFE_FILE") from None
+
+
+def private_directory(path: Path) -> None:
+    try:
+        if not path.exists():
+            path.mkdir(mode=0o700)
+        private_info(path.lstat(), "directory")
+    except OSError:
+        raise IngressError("UNSAFE_FILE") from None
+
+
+def private_lock(path: Path) -> int:
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            private_info(os.fstat(fd), "file")
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+    except OSError:
+        raise IngressError("BUSY") from None
+
+
+@dataclass(frozen=True)
+class Owner:
+    host: str
+    conductor: str
+
+
+def owner(value: Any) -> Owner:
+    value = shape(value, {"host", "conductor"})
+    require(type(value["host"]) is str and HOST_RE.fullmatch(value["host"]) is not None)
+    require(type(value["conductor"]) is str
+            and CONDUCTOR_RE.fullmatch(value["conductor"]) is not None)
+    return Owner(value["host"], value["conductor"])
+
+
+@dataclass(frozen=True)
+class Provider:
+    path: str
+    actions: frozenset[str]
+    secret: bytes
+    actors: frozenset[Any]
+    sources: frozenset[Any]
+    projects: frozenset[str]
+
+
+@dataclass(frozen=True)
+class Config:
+    owner: Owner
+    listen: str
+    port: int
+    state_dir: Path
+    runtime_dir: Path
+    alias_key: bytes
+    capacity: int
+    retention_seconds: int
+    github: Provider
+    linear: Provider
+
+
+def members(value: Any, validate: Callable[[Any], Any]) -> frozenset[Any]:
+    require(type(value) is list and 0 < len(value) <= 1024)
+    entries = [validate(item) for item in value]
+    require(len(entries) == len(set(entries)))
+    return frozenset(entries)
+
+
+def selection(value: Any, supported: set[str]) -> str:
+    require(type(value) is str and value in supported)
+    return value
+
+
+def load_config(path: Path) -> Config:
+    value = shape(strict_json(private_read(outside_store(str(path)), 65_536)), {
+        "version", "owner", "listen", "port", "state_dir", "runtime_dir", "alias_key_file",
+        "capacity", "retention_seconds", "github", "linear"})
+    require(integer(value["version"]) == 1)
+    declared_owner = owner(value["owner"])
+    try:
+        require(type(value["listen"]) is str)
+        address = ipaddress.ip_address(value["listen"])
+    except ValueError:
+        raise IngressError() from None
+    require(address == ipaddress.IPv4Address("127.0.0.1")
+            and value["listen"] == "127.0.0.1")
+    providers = []
+    files = [outside_store(value["alias_key_file"])]
+    for name in ("github", "linear"):
+        gh = name == "github"
+        fields = {"path", "owner", "secret_file", "actions", "actor_ids"}
+        fields |= {"repository_ids"} if gh else {"team_ids", "project_ids"}
+        item = shape(value[name], fields)
+        require(owner(item["owner"]) == declared_owner, "WRONG_OWNER")
+        require(type(item["path"]) is str
+                and re.fullmatch(r"/[A-Za-z0-9/_-]{1,127}", item["path"]) is not None)
+        files.append(outside_store(item["secret_file"]))
+        providers.append(Provider(
+            item["path"], members(item["actions"], lambda v, actions=GH_ACTIONS if gh else LINEAR_ACTIONS: selection(v, actions)),
+            private_read(files[-1], 4096), members(item["actor_ids"], integer if gh else canonical_uuid),
+            members(item["repository_ids" if gh else "team_ids"], integer if gh else canonical_uuid),
+            frozenset() if gh else members(item["project_ids"], canonical_uuid)))
+    require(len(set(files)) == 3 and providers[0].path != providers[1].path)
+    key = private_read(files[0], 32)
+    require(len(key) == 32 and key != providers[0].secret and key != providers[1].secret
+            and providers[0].secret != providers[1].secret)
+    state_dir, runtime_dir = outside_store(value["state_dir"]), outside_store(value["runtime_dir"])
+    require(state_dir != runtime_dir)
+    # Existing unsafe files fail before binding; directories are created only by the daemon.
+    for directory in (state_dir, runtime_dir):
+        if directory.exists():
+            private_info(directory.lstat(), "directory")
+    return Config(declared_owner, str(address), integer(value["port"], 0, 65535), state_dir,
+                  runtime_dir, key, integer(value["capacity"], 1, 100_000),
+                  integer(value["retention_seconds"], 60, 31_536_000), *providers)
+
+
+def alias(key: bytes, domain: str, *components: str) -> str:
+    parts = [domain.encode("ascii"), *(part.encode("ascii") for part in components)]
+    raw = b"".join(len(part).to_bytes(4, "big") + part for part in parts)
+    return base64.b32encode(hmac.digest(key, raw, "sha256")).decode("ascii").rstrip("=").lower()
+
+
+def utc(milliseconds: int) -> str:
+    integer(milliseconds, 946_684_800_000, 253_402_300_799_999)
+    return datetime.fromtimestamp(milliseconds / 1000, timezone.utc).isoformat(
+        timespec="milliseconds").replace("+00:00", "Z")
+
+
+@dataclass(frozen=True)
+class Envelope:
+    provider: str
+    event: str
+    action: str
+    event_alias: str
+    object_type: str
+    object_alias: str
+    owner_host: str
+    owner_conductor: str
+    received_at: str
+
+
+def normalize(config: Config, provider: str, headers: dict[str, str], raw: bytes,
+              now: int) -> Envelope:
+    require(provider in {"github", "linear"})
+    gh = provider == "github"
+    settings = config.github if gh else config.linear
+    signature = headers.get("x-hub-signature-256" if gh else "linear-signature", "")
+    pattern = r"sha256=[0-9a-fA-F]{64}" if gh else r"[0-9a-fA-F]{64}"
+    require(re.fullmatch(pattern, signature) is not None, "SIGNATURE")
+    supplied = bytes.fromhex(signature[7:] if gh else signature)
+    require(hmac.compare_digest(hmac.digest(settings.secret, raw, "sha256"), supplied), "SIGNATURE")
+    payload = strict_json(raw)
+    delivery = canonical_uuid(headers.get("x-github-delivery" if gh else "linear-delivery"), v4=not gh)
+    event = "pull_request" if gh else "Issue"
+    require(headers.get("x-github-event" if gh else "linear-event") == event, "UNSUPPORTED")
+    action = selection(payload.get("action"), set(settings.actions))
+    if gh:
+        source = integer(mapping(payload.get("repository")).get("id"))
+        actor = integer(mapping(payload.get("sender")).get("id"))
+        object_id = str(integer(mapping(payload.get("pull_request")).get("id")))
+    else:
+        require(payload.get("type") == "Issue", "UNSUPPORTED")
+        timestamp = integer(payload.get("webhookTimestamp"))
+        require(headers.get("linear-timestamp") == str(timestamp), "FRESHNESS")
+        require(abs(now - timestamp) <= 60_000, "FRESHNESS")
+        data = mapping(payload.get("data"))
+        source = canonical_uuid(data.get("teamId"))
+        project = canonical_uuid(data.get("projectId"))
+        actor = canonical_uuid(mapping(payload.get("actor")).get("id"))
+        object_id = canonical_uuid(data.get("id"))
+        require(project in settings.projects, "FORBIDDEN")
+    require(source in settings.sources and actor in settings.actors, "FORBIDDEN")
+    return Envelope(provider, event, action,
+                    alias(config.alias_key, "signed-ingress.event.v1", provider, delivery),
+                    event, alias(config.alias_key, "signed-ingress.object.v1",
+                                 provider, event, object_id),
+                    config.owner.host, config.owner.conductor, utc(now))
+
+
+SCHEMA = """
+CREATE TABLE metadata (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    owner_host TEXT NOT NULL CHECK(length(owner_host) BETWEEN 1 AND 64),
+    owner_conductor TEXT NOT NULL CHECK(length(owner_conductor) BETWEEN 18 AND 64),
+    key_alias TEXT NOT NULL CHECK(length(key_alias)=52 AND key_alias NOT GLOB '*[^a-z2-7]*')
+) STRICT;
+CREATE TABLE events (
+    version INTEGER NOT NULL CHECK(version=2),
+    provider TEXT NOT NULL CHECK(provider IN ('github','linear')),
+    event TEXT NOT NULL CHECK(event IN ('pull_request','Issue')),
+    action TEXT NOT NULL,
+    event_alias TEXT PRIMARY KEY CHECK(length(event_alias)=52 AND event_alias NOT GLOB '*[^a-z2-7]*'),
+    object_type TEXT NOT NULL CHECK(object_type=event),
+    object_alias TEXT NOT NULL CHECK(length(object_alias)=52 AND object_alias NOT GLOB '*[^a-z2-7]*'),
+    owner_host TEXT NOT NULL CHECK(length(owner_host) BETWEEN 1 AND 64),
+    owner_conductor TEXT NOT NULL CHECK(length(owner_conductor) BETWEEN 18 AND 64),
+    received_at TEXT NOT NULL CHECK(length(received_at)=24 AND received_at GLOB '????-??-??T??:??:??.???Z'),
+    accepted_at TEXT NOT NULL CHECK(length(accepted_at)=24 AND accepted_at GLOB '????-??-??T??:??:??.???Z'),
+    claimed_at TEXT CHECK(claimed_at IS NULL OR (length(claimed_at)=24 AND claimed_at GLOB '????-??-??T??:??:??.???Z')),
+    settled_at TEXT CHECK(settled_at IS NULL OR (length(settled_at)=24 AND settled_at GLOB '????-??-??T??:??:??.???Z')),
+    state TEXT NOT NULL CHECK(state IN ('accepted','claimed','completed','uncertain','dead_letter')),
+    result TEXT NOT NULL CHECK(result IN ('none','completed','api_unavailable','indeterminate','dead_letter')),
+    CHECK((provider='github' AND event='pull_request' AND action IN ('opened','reopened','synchronize','edited','closed'))
+       OR (provider='linear' AND event='Issue' AND action IN ('create','update','remove'))),
+    CHECK((state='accepted' AND claimed_at IS NULL AND settled_at IS NULL AND result='none')
+       OR (state='claimed' AND claimed_at IS NOT NULL AND settled_at IS NULL AND result='none')
+       OR (claimed_at IS NOT NULL AND settled_at IS NOT NULL AND
+            ((state='completed' AND result='completed') OR
+             (state='uncertain' AND result IN ('api_unavailable','indeterminate')) OR
+             (state='dead_letter' AND result='dead_letter'))))
+) STRICT;
+CREATE TABLE dedupe_tombstones (
+    event_alias TEXT PRIMARY KEY CHECK(length(event_alias)=52 AND event_alias NOT GLOB '*[^a-z2-7]*'),
+    owner_host TEXT NOT NULL CHECK(length(owner_host) BETWEEN 1 AND 64),
+    owner_conductor TEXT NOT NULL CHECK(length(owner_conductor) BETWEEN 18 AND 64),
+    state TEXT NOT NULL CHECK(state='completed'),
+    result TEXT NOT NULL CHECK(result='completed')
+) STRICT;
+CREATE INDEX completed_retention ON events(state, settled_at, event_alias);
+"""
+EVENT_COLUMNS = (
+    "version", "provider", "event", "action", "event_alias", "object_type", "object_alias",
+    "owner_host", "owner_conductor", "received_at", "accepted_at", "claimed_at", "settled_at",
+    "state", "result",
+)
+TOMBSTONE_COLUMNS = ("event_alias", "owner_host", "owner_conductor", "state", "result")
+
+
+def validate_schema(db: sqlite3.Connection) -> None:
+    # Only the compiled schema is admissible; changed ledgers require an explicit migration.
+    definitions = [statement.strip() for statement in SCHEMA.split(";") if statement.strip()]
+    expected = [("table", "metadata", "metadata", definitions[0]),
+                ("table", "events", "events", definitions[1]),
+                ("table", "dedupe_tombstones", "dedupe_tombstones", definitions[2]),
+                ("index", "completed_retention", "events", definitions[3]),
+                ("index", "sqlite_autoindex_events_1", "events", None),
+                ("index", "sqlite_autoindex_dedupe_tombstones_1",
+                 "dedupe_tombstones", None)]
+    actual = [tuple(row) for row in db.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name")]
+    require(actual == sorted(expected), "SCHEMA")
+    columns = [(index, name, "INTEGER" if index == 0 else "TEXT",
+                int(name not in {"claimed_at", "settled_at"}), None,
+                int(name == "event_alias"), 0)
+               for index, name in enumerate(EVENT_COLUMNS)]
+    require([tuple(row) for row in db.execute("PRAGMA table_xinfo(events)")] == columns, "SCHEMA")
+    tombstone_columns = [(index, name, "TEXT", 1, None,
+                          int(name == "event_alias"), 0)
+                         for index, name in enumerate(TOMBSTONE_COLUMNS)]
+    require([tuple(row) for row in db.execute(
+        "PRAGMA table_xinfo(dedupe_tombstones)")] == tombstone_columns, "SCHEMA")
+
+
+@dataclass
+class Job:
+    op: str
+    value: Any
+    reply: queue.Queue[dict[str, Any]]
+
+
+class Writer:
+    def __init__(self, daemon: Daemon):
+        self.daemon = daemon
+        self.jobs: queue.Queue[Job | None] = queue.Queue(32)
+        self.ready: queue.Queue[bool] = queue.Queue(1)
+        self.thread = threading.Thread(target=self.run, name="ledger-writer", daemon=True)
+
+    def request(self, op: str, value: Any = None) -> dict[str, Any]:
+        reply: queue.Queue[dict[str, Any]] = queue.Queue(1)
+        try:
+            self.jobs.put_nowait(Job(op, value, reply))
+            return reply.get(timeout=WRITE_TIMEOUT)
+        except (queue.Full, queue.Empty):
+            raise IngressError("BUSY") from None
+
+    def open(self) -> sqlite3.Connection:
+        path = self.daemon.config.state_dir / "ledger.sqlite3"
+        for existing in self.daemon.config.state_dir.iterdir():
+            private_info(existing.lstat(), "file")
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            private_info(os.fstat(fd), "file")
+        finally:
+            os.close(fd)
+        db = sqlite3.connect(path, timeout=1.0, isolation_level=None)
+        try:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA trusted_schema=OFF")
+            require(db.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete", "STORAGE")
+            db.execute("PRAGMA synchronous=FULL")
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            identity = (self.daemon.config.owner.host, self.daemon.config.owner.conductor,
+                        alias(self.daemon.config.alias_key, "signed-ingress.key.v1", "ledger"))
+            if version == 0:
+                require(not db.execute("SELECT name FROM sqlite_master").fetchall(), "STORAGE")
+                db.executescript("BEGIN IMMEDIATE;" + SCHEMA)
+                db.execute("INSERT INTO metadata VALUES(1,?,?,?)", identity)
+                db.execute("PRAGMA user_version=2")
+                db.commit()
+                directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            else:
+                require(version == 2, "SCHEMA")
+            validate_schema(db)
+            require(tuple(db.execute("SELECT owner_host,owner_conductor,key_alias FROM metadata WHERE singleton=1").fetchone()) == identity, "WRONG_OWNER")
+            require(db.execute("PRAGMA quick_check").fetchone()[0] == "ok", "STORAGE")
+            require(db.execute("SELECT count(*) FROM events WHERE owner_host!=? OR owner_conductor!=?", identity[:2]).fetchone()[0] == 0, "WRONG_OWNER")
+            require(db.execute("SELECT count(*) FROM dedupe_tombstones WHERE owner_host!=? OR owner_conductor!=?", identity[:2]).fetchone()[0] == 0, "WRONG_OWNER")
+            require(db.execute("SELECT count(*) FROM events JOIN dedupe_tombstones USING(event_alias)").fetchone()[0] == 0, "SCHEMA")
+            require(db.execute("SELECT (SELECT count(*) FROM events) + (SELECT count(*) FROM dedupe_tombstones)").fetchone()[0] <= self.daemon.config.capacity, "CAPACITY")
+            return db
+        except BaseException:
+            db.close()
+            raise
+
+    def run(self) -> None:
+        try:
+            db = self.open()
+        except Exception:  # noqa: BLE001
+            self.ready.put(False)
+            return
+        self.ready.put(True)
+        try:
+            while (job := self.jobs.get()) is not None:
+                try:
+                    response = self.execute(db, job)
+                except Exception:  # noqa: BLE001
+                    if db.in_transaction:
+                        db.rollback()
+                    response = {"code": "STORAGE"}
+                job.reply.put(response)
+        finally:
+            db.close()
+
+    def execute(self, db: sqlite3.Connection, job: Job) -> dict[str, Any]:
+        now = utc(self.daemon.clock())
+        if job.op == "list":
+            return {"code": "OK", "rows": [dict(row) for row in db.execute(
+                "SELECT " + ",".join(EVENT_COLUMNS)
+                + " FROM events ORDER BY accepted_at,event_alias LIMIT ?", (integer(job.value, 1, 100),))]}
+        db.execute("BEGIN IMMEDIATE")
+        if job.op == "accept":
+            event: Envelope = job.value
+            existing = db.execute(
+                "SELECT event_alias,state,result FROM events WHERE event_alias=?",
+                (event.event_alias,)).fetchone()
+            if existing is None:
+                existing = db.execute(
+                    "SELECT event_alias,state,result FROM dedupe_tombstones WHERE event_alias=?",
+                    (event.event_alias,)).fetchone()
+            if existing:
+                db.rollback()
+                return {"code": "DUPLICATE", "event_alias": existing[0],
+                        "state": existing[1], "result": existing[2]}
+            if db.execute("SELECT (SELECT count(*) FROM events) + (SELECT count(*) FROM dedupe_tombstones)").fetchone()[0] >= self.daemon.config.capacity:
+                db.rollback()
+                return {"code": "CAPACITY"}
+            fields = asdict(event)
+            db.execute("INSERT INTO events(version,provider,event,action,event_alias,object_type,object_alias,owner_host,owner_conductor,received_at,accepted_at,state,result) VALUES(2,:provider,:event,:action,:event_alias,:object_type,:object_alias,:owner_host,:owner_conductor,:received_at,:accepted_at,'accepted','none')",
+                       {**fields, "accepted_at": now})
+            self.daemon.fault("before_commit")
+            db.commit()
+            return {"code": "ACCEPTED", "event_alias": event.event_alias}
+        if job.op == "claim":
+            changed = db.execute("UPDATE events SET state='claimed',claimed_at=? WHERE event_alias=? AND state='accepted'", (now, job.value)).rowcount
+            db.commit()
+            if changed:
+                self.daemon.fault("after_claim")
+            return {"code": "CLAIMED" if changed else "CONFLICT"}
+        if job.op == "settle":
+            event_alias, result = job.value
+            changed = db.execute("UPDATE events SET state=?,result=?,settled_at=? WHERE event_alias=? AND state='claimed'",
+                                 (RESULT_STATES[result], result, now, event_alias)).rowcount
+            db.commit()
+            return {"code": "SETTLED" if changed else "CONFLICT"}
+        if job.op == "prune":
+            cutoff = utc(self.daemon.clock() - self.daemon.config.retention_seconds * 1000)
+            changed = db.execute(
+                "INSERT INTO dedupe_tombstones(event_alias,owner_host,owner_conductor,state,result) "
+                "SELECT event_alias,owner_host,owner_conductor,state,result FROM events "
+                "WHERE state='completed' AND settled_at<? ORDER BY settled_at,event_alias",
+                (cutoff,)).rowcount
+            removed = db.execute(
+                "DELETE FROM events WHERE state='completed' AND settled_at<?", (cutoff,)).rowcount
+            require(changed == removed, "STORAGE")
+            db.commit()
+            return {"code": "PRUNED", "removed": changed}
+        db.rollback()
+        raise IngressError()
+
+    def close(self) -> None:
+        if self.thread.is_alive():
+            self.jobs.put(None, timeout=WRITE_TIMEOUT)
+            self.thread.join(WRITE_TIMEOUT + 1)
+            require(not self.thread.is_alive(), "BUSY")
+
+
+class Reader:
+    def __init__(self, client: socket.socket):
+        self.client = client
+        self.deadline = time.monotonic() + READ_TIMEOUT
+        self.buffer = b""
+
+    def receive(self, maximum: int) -> None:
+        remaining = self.deadline - time.monotonic()
+        require(remaining > 0, "TIMEOUT")
+        self.client.settimeout(remaining)
+        chunk = self.client.recv(maximum)
+        require(bool(chunk))
+        self.buffer += chunk
+
+    def line(self, maximum: int) -> bytes:
+        while b"\n" not in self.buffer:
+            require(len(self.buffer) < maximum)
+            self.receive(min(4096, maximum - len(self.buffer)))
+        end = self.buffer.index(b"\n") + 1
+        require(end <= maximum)
+        result, self.buffer = self.buffer[:end], self.buffer[end:]
+        return result
+
+    def body(self, length: int) -> bytes:
+        require(len(self.buffer) <= length)
+        while len(self.buffer) < length:
+            self.receive(min(65_536, length - len(self.buffer)))
+        result, self.buffer = self.buffer, b""
+        return result
+
+
+def parse_http(reader: Reader, config: Config) -> tuple[str, dict[str, str], bytes]:
+    line = reader.line(MAX_HEADER_LINE)
+    require(line.endswith(b"\r\n"))
+    parts = line[:-2].split(b" ")
+    require(len(parts) == 3 and parts[0] == b"POST" and parts[2] in {b"HTTP/1.0", b"HTTP/1.1"})
+    paths = {config.github.path.encode(): "github", config.linear.path.encode(): "linear"}
+    require(parts[1] in paths, "UNSUPPORTED")
+    headers: dict[str, str] = {}
+    total = len(line)
+    for _ in range(MAX_HEADERS + 1):
+        line = reader.line(MAX_HEADER_LINE)
+        total += len(line)
+        require(total <= MAX_HEADER_BYTES and line.endswith(b"\r\n"))
+        if line == b"\r\n":
+            break
+        require(len(headers) < MAX_HEADERS)
+        name, separator, value = line[:-2].partition(b":")
+        require(bool(separator) and re.fullmatch(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name) is not None)
+        require(all(32 <= byte < 127 or byte == 9 for byte in value))
+        key = name.decode("ascii").lower()
+        require(key not in headers)
+        headers[key] = value.decode("ascii").strip(" \t")
+    else:
+        raise IngressError()
+    require(not {"transfer-encoding", "content-encoding", "expect", "trailer"}.intersection(headers))
+    require(headers.get("content-type", "").lower() in {
+        "application/json", "application/json; charset=utf-8"})
+    if parts[2] == b"HTTP/1.1":
+        require(bool(headers.get("host")))
+    length = headers.get("content-length", "")
+    require(re.fullmatch(r"[1-9][0-9]{0,6}", length) is not None)
+    count = int(length)
+    require(count <= MAX_BODY, "OVERSIZED")
+    return paths[parts[1]], headers, reader.body(count)
+
+
+def http_response(client: socket.socket, status: int, value: dict[str, Any]) -> None:
+    body = json.dumps(value, separators=(",", ":")).encode("ascii")
+    client.settimeout(READ_TIMEOUT)
+    reason = {200: "OK", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
+              413: "Content Too Large", 503: "Service Unavailable"}[status]
+    head = f"HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+    client.sendall(head.encode("ascii") + body)
+
+
+class HTTPHandler(socketserver.BaseRequestHandler):
+    def handle(self) -> None:
+        daemon = self.server.daemon  # type: ignore[attr-defined]
+        try:
+            provider, headers, raw = parse_http(Reader(self.request), daemon.config)
+            event = normalize(daemon.config, provider, headers, raw, daemon.clock())
+            del raw, headers
+            result = daemon.writer.request("accept", event)
+            if result["code"] not in {"ACCEPTED", "DUPLICATE"}:
+                http_response(self.request, 503, result)
+                return
+            daemon.fault("before_ack")
+            http_response(self.request, 200, result)
+        except IngressError as error:
+            status = {"SIGNATURE": 401, "FRESHNESS": 401, "FORBIDDEN": 403,
+                      "OVERSIZED": 413, "BUSY": 503, "STORAGE": 503}.get(error.code, 400)
+            http_response(self.request, status, {"code": error.code})
+        except Exception:  # noqa: BLE001
+            try:
+                http_response(self.request, 503, {"code": "UNAVAILABLE"})
+            except Exception:  # noqa: BLE001
+                return
+
+
+def control_request(writer: Writer, raw: bytes) -> dict[str, Any]:
+    value = strict_json(raw)
+    op = value.get("op")
+    require(type(op) is str)
+    if op == "list":
+        shape(value, {"op", "limit"})
+        return writer.request(op, integer(value["limit"], 1, 100))
+    if op in {"claim", "settle"}:
+        shape(value, {"op", "event_alias", "result"} if op == "settle" else {"op", "event_alias"})
+        event_alias = value["event_alias"]
+        require(type(event_alias) is str and ALIAS_RE.fullmatch(event_alias) is not None)
+        if op == "settle":
+            result = selection(value["result"], set(RESULT_STATES))
+            return writer.request(op, (event_alias, result))
+        return writer.request(op, event_alias)
+    require(op == "prune")
+    shape(value, {"op"})
+    return writer.request("prune")
+
+
+class ControlHandler(socketserver.BaseRequestHandler):
+    def handle(self) -> None:
+        daemon = self.server.daemon  # type: ignore[attr-defined]
+        try:
+            credentials = self.request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+            require(struct.unpack("3i", credentials)[1] == os.geteuid(), "FORBIDDEN")
+            reader = Reader(self.request)
+            raw = reader.line(MAX_CONTROL)
+            require(raw.endswith(b"\n") and not reader.buffer)
+            result = control_request(daemon.writer, raw)
+        except IngressError as error:
+            result = {"code": error.code}
+        except Exception:  # noqa: BLE001
+            result = {"code": "UNAVAILABLE"}
+        try:
+            self.request.settimeout(READ_TIMEOUT)
+            self.request.sendall(json.dumps(result, separators=(",", ":")).encode("ascii") + b"\n")
+        except Exception:  # noqa: BLE001
+            return
+
+
+class BoundedServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    daemon_threads = False
+    block_on_close = True
+    allow_reuse_address = False
+    request_queue_size = 8
+
+    def __init__(self, address: Any, handler: Any, daemon: Daemon, family: int):
+        self.daemon = daemon
+        self.address_family = family
+        self.slots = threading.BoundedSemaphore(MAX_HANDLERS)
+        super().__init__(address, handler)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # Tracebacks can retain request bytes; handler failures have no text sink.
+        pass
+
+
+class Daemon:
+    def __init__(self, config: Config, *, clock: Callable[[], int] | None = None,
+                 fault: Callable[[str], None] | None = None):
+        self.config = config
+        self.clock = clock or (lambda: time.time_ns() // 1_000_000)
+        self.fault = fault or (lambda _point: None)
+        self.socket_path = config.runtime_dir / "control.sock"
+        self.writer = Writer(self)
+        self.locks: list[int] = []
+        self.servers: list[BoundedServer] = []
+        self.threads: list[threading.Thread] = []
+        self.http_address: Any = None
+        self.owns_socket = False
+
+    def start(self) -> None:
+        try:
+            require(self.config.listen == "127.0.0.1")
+            for directory in (self.config.state_dir, self.config.runtime_dir):
+                outside_store(str(directory))
+                private_directory(directory)
+                self.locks.append(private_lock(directory / "daemon.lock"))
+            self.writer.thread.start()
+            require(self.writer.ready.get(timeout=WRITE_TIMEOUT), "STORAGE")
+            if self.socket_path.exists():
+                private_info(self.socket_path.lstat(), "socket")
+                self.socket_path.unlink()
+            self.servers.append(BoundedServer(str(self.socket_path), ControlHandler, self, socket.AF_UNIX))
+            self.owns_socket = True
+            self.socket_path.chmod(0o600)
+            self.servers.append(BoundedServer(
+                (self.config.listen, self.config.port), HTTPHandler, self, socket.AF_INET))
+            self.http_address = self.servers[-1].server_address
+            for server in self.servers:
+                thread = threading.Thread(target=server.serve_forever,
+                                          kwargs={"poll_interval": 0.05}, daemon=True)
+                thread.start()
+                self.threads.append(thread)
+        except Exception:  # noqa: BLE001
+            self.close()
+            raise IngressError("STARTUP") from None
+
+    def close(self) -> None:
+        for server, thread in zip(self.servers, self.threads):
+            server.shutdown()
+            thread.join(READ_TIMEOUT + 1)
+        for server in self.servers:
+            server.server_close()
+        self.servers.clear()
+        self.threads.clear()
+        self.writer.close()
+        if self.owns_socket:
+            self.socket_path.unlink(missing_ok=True)
+            self.owns_socket = False
+        for fd in reversed(self.locks):
+            os.close(fd)
+        self.locks.clear()
+
+
+def control(path: Path, value: dict[str, Any]) -> dict[str, Any]:
+    try:
+        outside_store(str(path))
+        private_info(path.parent.lstat(), "directory")
+        private_info(path.lstat(), "socket")
+        raw = json.dumps(value, separators=(",", ":")).encode("ascii") + b"\n"
+        require(len(raw) <= MAX_CONTROL)
+        with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(READ_TIMEOUT + WRITE_TIMEOUT)
+            client.connect(str(path))
+            client.sendall(raw)
+            chunks = bytearray()
+            while not chunks.endswith(b"\n"):
+                data = client.recv(4096)
+                require(bool(data) and len(chunks) + len(data) <= 131_072, "UNAVAILABLE")
+                chunks.extend(data)
+            return strict_json(bytes(chunks))
+    except OSError:
+        raise IngressError("UNAVAILABLE") from None
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message: str) -> NoReturn:
+        raise IngressError()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = Parser(description="Signed loopback ingress and owner-only local ledger control.")
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--socket", type=Path)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("serve")
+    listing = commands.add_parser("list")
+    listing.add_argument("--limit", type=int, default=100)
+    claim = commands.add_parser("claim")
+    claim.add_argument("event_alias")
+    settle = commands.add_parser("settle")
+    settle.add_argument("event_alias")
+    settle.add_argument("--result", required=True, choices=tuple(RESULT_STATES))
+    commands.add_parser("prune")
+    try:
+        args = parser.parse_args(argv)
+        os.umask(0o077)
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        if args.command == "serve":
+            config_path = args.config
+            if config_path is None or args.socket is not None:
+                raise IngressError()
+            daemon = Daemon(load_config(config_path))
+            stopped = threading.Event()
+            signal.signal(signal.SIGTERM, lambda *_: stopped.set())
+            signal.signal(signal.SIGINT, lambda *_: stopped.set())
+            try:
+                daemon.start()
+                stopped.wait()
+            finally:
+                daemon.close()
+            return 0
+        socket_path = args.socket
+        if socket_path is None or args.config is not None:
+            raise IngressError()
+        request = {"op": args.command}
+        if args.command == "list":
+            request["limit"] = args.limit
+        if args.command in {"claim", "settle"}:
+            request["event_alias"] = args.event_alias
+        if args.command == "settle":
+            request["result"] = args.result
+        result = control(socket_path, request)
+        sys.stdout.write(json.dumps(result, separators=(",", ":")) + "\n")
+        return 0 if result["code"] in {"OK", "CLAIMED", "SETTLED", "PRUNED"} else 1
+    except Exception:  # noqa: BLE001
+        sys.stderr.write("ERROR: UNAVAILABLE\n")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

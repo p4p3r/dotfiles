@@ -16,7 +16,7 @@ import unittest
 
 
 REPO = Path(__file__).resolve().parents[1]
-SCRIPT = REPO / "private_dot_local/bin/executable_agent-deck-work-registry"
+SCRIPT = REPO / "private_dot_local/bin/private_executable_agent-deck-work-registry"
 NOW = "2026-09-15T12:00:00Z"
 OWNER_A = "0123abcd-1700000000"
 OWNER_B = "89abcdef-1700000001"

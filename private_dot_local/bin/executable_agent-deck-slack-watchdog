@@ -1,0 +1,561 @@
+#!/usr/bin/env python3
+"""Fail-closed watchdog for a qualified Agent Deck Slack gateway control socket."""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+from typing import Any, Iterator
+
+
+PROTOCOL_VERSION = 1
+STATE_VERSION = 1
+MAX_SETTINGS_BYTES = 16_384
+MAX_STATE_BYTES = 4_096
+MAX_FRAME_BYTES = 16_384
+HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+ALIAS_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,198}\.service$")
+
+SETTINGS_FIELDS = {
+    "version",
+    "control_socket",
+    "gateway_unit",
+    "expected_incarnation",
+    "timeouts",
+}
+INCARNATION_FIELDS = {"binary_sha256", "config_sha256", "row_binding_alias"}
+TIMEOUT_FIELDS = {"connect_ms", "io_ms", "restart_ms"}
+PONG_FIELDS = {
+    "version",
+    "type",
+    "nonce",
+    "identity",
+    "runner",
+    "pump",
+    "backlog",
+    "egress",
+    "conductor",
+}
+RUNNER_FIELDS = {"state", "exit_code", "terminal", "degraded"}
+PUMP_FIELDS = {"state", "last_progress_age_seconds"}
+BACKLOG_FIELDS = {"state", "oldest_age_seconds"}
+EGRESS_FIELDS = {"state"}
+CONDUCTOR_FIELDS = {"state", "turn_age_seconds"}
+STATE_FIELDS = {"version", "incarnation_digest", "retry_used", "restart_attempted_at"}
+
+
+class Refusal(Exception):
+    """A fixed-code refusal that must not expose its underlying input."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def exact_object(value: Any, fields: set[str], reason: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != fields:
+        raise Refusal(reason)
+    return value
+
+
+def bounded_int(value: Any, *, lower: int, upper: int, reason: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not lower <= value <= upper:
+        raise Refusal(reason)
+    return value
+
+
+def private_regular(path: Path, max_bytes: int, reason: str) -> bytes:
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise Refusal(reason) from exc
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or before.st_uid != os.getuid()
+        or before.st_nlink != 1
+        or before.st_size > max_bytes
+    ):
+        raise Refusal(reason)
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(max_bytes + 1)
+            opened = os.fstat(handle.fileno())
+        after = path.lstat()
+    except OSError as exc:
+        raise Refusal(reason) from exc
+    identity = lambda value: (
+        value.st_dev,
+        value.st_ino,
+        value.st_uid,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+    if identity(before) != identity(opened) or identity(opened) != identity(after) or len(data) > max_bytes:
+        raise Refusal(reason)
+    return data
+
+
+def load_json_bytes(data: bytes, reason: str) -> Any:
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise Refusal(reason) from exc
+
+
+def load_settings(path: Path) -> dict[str, Any]:
+    value = exact_object(
+        load_json_bytes(private_regular(path, MAX_SETTINGS_BYTES, "SETTINGS_UNSAFE"), "SETTINGS_INVALID"),
+        SETTINGS_FIELDS,
+        "SETTINGS_INVALID",
+    )
+    if value["version"] != PROTOCOL_VERSION:
+        raise Refusal("SETTINGS_INVALID")
+    control_socket = value["control_socket"]
+    if not isinstance(control_socket, str) or not control_socket.startswith("/") or "\x00" in control_socket:
+        raise Refusal("SETTINGS_INVALID")
+    if not isinstance(value["gateway_unit"], str) or UNIT_RE.fullmatch(value["gateway_unit"]) is None:
+        raise Refusal("SETTINGS_INVALID")
+    identity = exact_object(value["expected_incarnation"], INCARNATION_FIELDS, "SETTINGS_INVALID")
+    if not HASH_RE.fullmatch(identity["binary_sha256"] or ""):
+        raise Refusal("SETTINGS_INVALID")
+    if not HASH_RE.fullmatch(identity["config_sha256"] or ""):
+        raise Refusal("SETTINGS_INVALID")
+    if not isinstance(identity["row_binding_alias"], str) or ALIAS_RE.fullmatch(identity["row_binding_alias"]) is None:
+        raise Refusal("SETTINGS_INVALID")
+    timeouts = exact_object(value["timeouts"], TIMEOUT_FIELDS, "SETTINGS_INVALID")
+    bounded_int(timeouts["connect_ms"], lower=50, upper=5_000, reason="SETTINGS_INVALID")
+    bounded_int(timeouts["io_ms"], lower=50, upper=5_000, reason="SETTINGS_INVALID")
+    bounded_int(timeouts["restart_ms"], lower=100, upper=60_000, reason="SETTINGS_INVALID")
+    return value
+
+
+def incarnation_digest(identity: dict[str, str]) -> str:
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("ascii")
+    return hashlib.sha256(b"agent-deck-slack-watchdog-incarnation-v1\x00" + encoded).hexdigest()
+
+
+def secure_state_parent(path: Path) -> None:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise Refusal("STATE_UNSAFE")
+
+
+@contextmanager
+def state_lock(state_path: Path) -> Iterator[None]:
+    secure_state_parent(state_path.parent)
+    lock_path = state_path.with_name(state_path.name + ".lock")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise Refusal("STATE_UNSAFE") from exc
+    try:
+        os.fchmod(descriptor, 0o600)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise Refusal("STATE_UNSAFE")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise Refusal("CONCURRENT_RUN") from exc
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def load_state(path: Path, digest: str) -> dict[str, Any]:
+    if not path.exists():
+        return {
+            "version": STATE_VERSION,
+            "incarnation_digest": digest,
+            "retry_used": False,
+            "restart_attempted_at": None,
+        }
+    value = exact_object(
+        load_json_bytes(private_regular(path, MAX_STATE_BYTES, "STATE_UNSAFE"), "STATE_INVALID"),
+        STATE_FIELDS,
+        "STATE_INVALID",
+    )
+    if (
+        value["version"] != STATE_VERSION
+        or not isinstance(value["incarnation_digest"], str)
+        or HASH_RE.fullmatch(value["incarnation_digest"]) is None
+        or not isinstance(value["retry_used"], bool)
+        or (value["restart_attempted_at"] is not None and not isinstance(value["restart_attempted_at"], str))
+    ):
+        raise Refusal("STATE_INVALID")
+    if value["incarnation_digest"] != digest:
+        return {
+            "version": STATE_VERSION,
+            "incarnation_digest": digest,
+            "retry_used": False,
+            "restart_attempted_at": None,
+        }
+    return value
+
+
+def save_state(path: Path, value: dict[str, Any]) -> None:
+    data = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+    if len(data) > MAX_STATE_BYTES:
+        raise Refusal("STATE_INVALID")
+    secure_state_parent(path.parent)
+    descriptor, temporary = tempfile.mkstemp(prefix=".watchdog-", dir=path.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def socket_identity(path: Path) -> tuple[int, int]:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise Refusal("CONTROL_UNAVAILABLE") from exc
+    if (
+        not stat.S_ISSOCK(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+    ):
+        raise Refusal("CONTROL_UNSAFE")
+    return info.st_dev, info.st_ino
+
+
+def send_frame(connection: socket.socket, value: dict[str, Any], timeout: float) -> None:
+    data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+    if len(data) > MAX_FRAME_BYTES:
+        raise Refusal("STATUS_PROTOCOL")
+    connection.settimeout(timeout)
+    try:
+        connection.sendall(data)
+    except socket.timeout as exc:
+        raise Refusal("STATUS_TIMEOUT") from exc
+    except OSError as exc:
+        raise Refusal("CONTROL_UNAVAILABLE") from exc
+
+
+def receive_frame(connection: socket.socket, timeout: float) -> Any:
+    connection.settimeout(timeout)
+    data = bytearray()
+    while True:
+        try:
+            chunk = connection.recv(min(4_096, MAX_FRAME_BYTES + 1 - len(data)))
+        except socket.timeout as exc:
+            raise Refusal("STATUS_TIMEOUT") from exc
+        except OSError as exc:
+            raise Refusal("CONTROL_UNAVAILABLE") from exc
+        if not chunk:
+            raise Refusal("STATUS_PROTOCOL")
+        data.extend(chunk)
+        if len(data) > MAX_FRAME_BYTES:
+            raise Refusal("STATUS_PROTOCOL")
+        if b"\n" in chunk:
+            break
+    line, separator, remainder = bytes(data).partition(b"\n")
+    if separator != b"\n" or remainder:
+        raise Refusal("STATUS_PROTOCOL")
+    return load_json_bytes(line, "STATUS_PROTOCOL")
+
+
+def validate_age(value: Any, *, required: bool) -> int | None:
+    if not required and value is None:
+        return None
+    return bounded_int(value, lower=0, upper=315_360_000, reason="STATUS_PROTOCOL")
+
+
+def validate_pong(value: Any, nonce: str) -> dict[str, Any]:
+    pong = exact_object(value, PONG_FIELDS, "STATUS_PROTOCOL")
+    if pong["version"] != PROTOCOL_VERSION or pong["type"] != "pong" or pong["nonce"] != nonce:
+        raise Refusal("STATUS_PROTOCOL")
+    identity = exact_object(pong["identity"], INCARNATION_FIELDS, "STATUS_PROTOCOL")
+    if not HASH_RE.fullmatch(identity["binary_sha256"] or "") or not HASH_RE.fullmatch(identity["config_sha256"] or ""):
+        raise Refusal("STATUS_PROTOCOL")
+    if not isinstance(identity["row_binding_alias"], str) or ALIAS_RE.fullmatch(identity["row_binding_alias"]) is None:
+        raise Refusal("STATUS_PROTOCOL")
+    runner = exact_object(pong["runner"], RUNNER_FIELDS, "STATUS_PROTOCOL")
+    if runner["state"] not in {"running", "exited"} or not isinstance(runner["terminal"], bool) or not isinstance(runner["degraded"], bool):
+        raise Refusal("STATUS_PROTOCOL")
+    if runner["state"] == "running":
+        if runner["exit_code"] is not None:
+            raise Refusal("STATUS_PROTOCOL")
+    else:
+        bounded_int(runner["exit_code"], lower=0, upper=255, reason="STATUS_PROTOCOL")
+    pump = exact_object(pong["pump"], PUMP_FIELDS, "STATUS_PROTOCOL")
+    if pump["state"] not in {"idle", "fresh", "stale", "stalled", "unknown"}:
+        raise Refusal("STATUS_PROTOCOL")
+    validate_age(pump["last_progress_age_seconds"], required=pump["state"] in {"fresh", "stale", "stalled"})
+    if pump["state"] in {"idle", "unknown"} and pump["last_progress_age_seconds"] is not None:
+        raise Refusal("STATUS_PROTOCOL")
+    backlog = exact_object(pong["backlog"], BACKLOG_FIELDS, "STATUS_PROTOCOL")
+    if backlog["state"] not in {"empty", "pending", "unknown"}:
+        raise Refusal("STATUS_PROTOCOL")
+    validate_age(backlog["oldest_age_seconds"], required=backlog["state"] == "pending")
+    if backlog["state"] != "pending" and backlog["oldest_age_seconds"] is not None:
+        raise Refusal("STATUS_PROTOCOL")
+    egress = exact_object(pong["egress"], EGRESS_FIELDS, "STATUS_PROTOCOL")
+    if egress["state"] not in {"clear", "uncertain", "unknown"}:
+        raise Refusal("STATUS_PROTOCOL")
+    conductor = exact_object(pong["conductor"], CONDUCTOR_FIELDS, "STATUS_PROTOCOL")
+    if conductor["state"] not in {"idle", "working", "unknown"}:
+        raise Refusal("STATUS_PROTOCOL")
+    validate_age(conductor["turn_age_seconds"], required=conductor["state"] == "working")
+    if conductor["state"] != "working" and conductor["turn_age_seconds"] is not None:
+        raise Refusal("STATUS_PROTOCOL")
+    if runner["state"] == "running" and backlog["state"] == "pending" and pump["state"] == "idle":
+        raise Refusal("STATUS_PROTOCOL")
+    return pong
+
+
+def probe(settings: dict[str, Any]) -> dict[str, Any]:
+    path = Path(settings["control_socket"])
+    expected_socket = socket_identity(path)
+    timeouts = settings["timeouts"]
+    connect_timeout = timeouts["connect_ms"] / 1000
+    io_timeout = timeouts["io_ms"] / 1000
+    nonce = secrets.token_hex(16)
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        connection.settimeout(connect_timeout)
+        try:
+            connection.connect(str(path))
+        except socket.timeout as exc:
+            raise Refusal("STATUS_TIMEOUT") from exc
+        except OSError as exc:
+            raise Refusal("CONTROL_UNAVAILABLE") from exc
+        if sys.platform.startswith("linux"):
+            try:
+                _, peer_uid, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            except OSError as exc:
+                raise Refusal("PEER_UNVERIFIED") from exc
+            if peer_uid != os.getuid():
+                raise Refusal("PEER_UNVERIFIED")
+        send_frame(connection, {"version": 1, "type": "hello", "nonce": nonce}, io_timeout)
+        pong = validate_pong(receive_frame(connection, io_timeout), nonce)
+        send_frame(connection, {"version": 1, "type": "close", "nonce": nonce}, io_timeout)
+        closed = exact_object(receive_frame(connection, io_timeout), {"version", "type", "nonce"}, "STATUS_PROTOCOL")
+        if closed != {"version": 1, "type": "closed", "nonce": nonce}:
+            raise Refusal("STATUS_PROTOCOL")
+    finally:
+        connection.close()
+    if socket_identity(path) != expected_socket:
+        raise Refusal("CONTROL_UNSAFE")
+    return pong
+
+
+def age_band(value: int | None) -> str:
+    if value is None:
+        return "none"
+    if value < 60:
+        return "lt_1m"
+    if value < 300:
+        return "lt_5m"
+    if value < 900:
+        return "lt_15m"
+    if value < 3_600:
+        return "lt_1h"
+    return "gte_1h"
+
+
+def classify(pong: dict[str, Any], expected: dict[str, str]) -> tuple[str, bool]:
+    if pong["identity"] != expected:
+        return "IDENTITY_MISMATCH", False
+    runner = pong["runner"]
+    if runner["terminal"] or runner["exit_code"] == 78:
+        return "TERMINAL", False
+    if runner["degraded"]:
+        return "DEGRADED", False
+    if pong["egress"]["state"] == "uncertain":
+        return "EGRESS_UNCERTAIN", False
+    if pong["egress"]["state"] != "clear":
+        return "UNKNOWN", False
+    if pong["backlog"]["state"] == "unknown" or pong["conductor"]["state"] == "unknown":
+        return "UNKNOWN", False
+    pump = pong["pump"]["state"]
+    if pump == "stale":
+        return "PUMP_STALE", False
+    if pump == "stalled":
+        return "PUMP_STALLED", False
+    if pump == "unknown":
+        return "UNKNOWN", False
+    if runner["state"] == "exited":
+        if runner["exit_code"] == 75:
+            return "RETRYABLE_EXIT", True
+        return "EXITED", False
+    return "OK", False
+
+
+def report(pong: dict[str, Any] | None, *, status: str, reason: str, action: str) -> None:
+    value: dict[str, Any] = {
+        "version": 1,
+        "status": status,
+        "reason": reason,
+        "action": action,
+        "runner": "unknown",
+        "terminal": "unknown",
+        "degraded": "unknown",
+        "pump": "unknown",
+        "backlog": "unknown",
+        "backlog_age_band": "unknown",
+        "egress": "unknown",
+        "conductor": "unknown",
+        "conductor_age_band": "unknown",
+    }
+    if pong is not None:
+        value.update(
+            {
+                "runner": pong["runner"]["state"],
+                "terminal": pong["runner"]["terminal"],
+                "degraded": pong["runner"]["degraded"],
+                "pump": pong["pump"]["state"],
+                "backlog": pong["backlog"]["state"],
+                "backlog_age_band": age_band(pong["backlog"]["oldest_age_seconds"]),
+                "egress": pong["egress"]["state"],
+                "conductor": pong["conductor"]["state"],
+                "conductor_age_band": age_band(pong["conductor"]["turn_age_seconds"]),
+            }
+        )
+    print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+
+
+def restart_gateway(systemctl: Path, unit: str, timeout_ms: int) -> str:
+    if not systemctl.is_absolute() or not systemctl.is_file() or not os.access(systemctl, os.X_OK):
+        return "RESTART_EXECUTABLE_INVALID"
+    environment = {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/nonexistent"}
+    runtime_directory = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_directory:
+        runtime_path = Path(runtime_directory)
+        try:
+            runtime_info = runtime_path.stat()
+        except OSError:
+            return "RESTART_ENVIRONMENT_INVALID"
+        if (
+            not runtime_path.is_absolute()
+            or not stat.S_ISDIR(runtime_info.st_mode)
+            or runtime_info.st_uid != os.getuid()
+            or stat.S_IMODE(runtime_info.st_mode) & 0o077
+        ):
+            return "RESTART_ENVIRONMENT_INVALID"
+        environment["XDG_RUNTIME_DIR"] = runtime_directory
+    try:
+        result = subprocess.run(
+            [str(systemctl), "--user", "restart", unit],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=timeout_ms / 1000,
+            env=environment,
+        )
+    except subprocess.TimeoutExpired:
+        return "RESTART_TIMEOUT"
+    except OSError:
+        return "RESTART_FAILED"
+    return "RESTART_REQUESTED" if result.returncode == 0 else "RESTART_FAILED"
+
+
+def parse_now(value: str | None) -> str:
+    if value is None:
+        return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise Refusal("NOW_INVALID") from exc
+    if parsed.tzinfo is None:
+        raise Refusal("NOW_INVALID")
+    return parsed.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def run(args: argparse.Namespace) -> int:
+    pong: dict[str, Any] | None = None
+    try:
+        settings = load_settings(args.settings)
+        now = parse_now(args.now)
+        with state_lock(args.state):
+            pong = probe(settings)
+            reason, retryable = classify(pong, settings["expected_incarnation"])
+            digest = incarnation_digest(settings["expected_incarnation"])
+            state_existed = args.state.exists()
+            state = load_state(args.state, digest)
+            if not state_existed:
+                save_state(args.state, state)
+            else:
+                # A changed settings incarnation is normalized by load_state and
+                # persisted before any recovery decision.
+                current = load_json_bytes(private_regular(args.state, MAX_STATE_BYTES, "STATE_UNSAFE"), "STATE_INVALID")
+                if current.get("incarnation_digest") != digest:
+                    save_state(args.state, state)
+            if reason == "OK":
+                report(pong, status="HEALTHY", reason=reason, action="none")
+                return 0
+            if not retryable:
+                report(pong, status="UNHEALTHY", reason=reason, action="none")
+                return 1
+            if state["retry_used"]:
+                report(pong, status="UNHEALTHY", reason="RETRY_BUDGET_USED", action="none")
+                return 1
+            state["retry_used"] = True
+            state["restart_attempted_at"] = now
+            # Consume the one-shot budget durably before an outcome-ambiguous
+            # systemd call. A timeout or crash can never cause a blind retry.
+            save_state(args.state, state)
+            result = restart_gateway(args.systemctl, settings["gateway_unit"], settings["timeouts"]["restart_ms"])
+            if result == "RESTART_REQUESTED":
+                report(pong, status="RECOVERY_REQUESTED", reason=result, action="restart")
+                return 0
+            report(pong, status="UNHEALTHY", reason=result, action="restart_attempted")
+            return 1
+    except Refusal as exc:
+        report(pong, status="UNHEALTHY", reason=exc.reason, action="none")
+        return 2
+    except Exception:
+        report(pong, status="UNHEALTHY", reason="INTERNAL_ERROR", action="none")
+        return 2
+
+
+def parser() -> argparse.ArgumentParser:
+    value = argparse.ArgumentParser(description=__doc__)
+    value.add_argument("--settings", required=True, type=Path)
+    value.add_argument("--state", required=True, type=Path)
+    value.add_argument("--systemctl", required=True, type=Path)
+    value.add_argument("--now", help=argparse.SUPPRESS)
+    return value
+
+
+def main() -> int:
+    return run(parser().parse_args())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

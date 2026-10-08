@@ -297,3 +297,37 @@ mcp_default_scope = ""
   show_only_installed_tools = false
   footer = ""
   new_session_enter_advances = false
+
+# Remote agent-deck instances.
+#
+# This file is XDG-first: its existence makes ~/.agent-deck/config.toml be
+# ignored entirely, so the remotes have to be declared here or they disappear
+# (which is exactly what happened on 2026-10-08, when this file first landed
+# without them).
+#
+# The fleet is NOT hardcoded — this repo is public and the box hostnames and
+# private IPs are not. The tables below are rendered from ~/.sbx/machines.json,
+# which is private and already the source of truth for the fleet.
+#
+# Only machines that run as the local user become remotes: AWS boxes carry no
+# "user" key and default to it, external entries must name it explicitly. That
+# skips other people's boxes shared into machines.json (e.g. an ubuntu@ host),
+# which are reachable but are not our agent-deck instances.
+#
+# A box without ~/.sbx/machines.json renders no remotes rather than failing.
+{{- $machinesPath := joinPath .chezmoi.homeDir ".sbx/machines.json" }}
+{{- if stat $machinesPath }}
+{{- $user := .chezmoi.username }}
+{{- range $name, $m := (include $machinesPath | fromJson) }}
+{{- $remoteUser := default $user (get $m "user") }}
+{{- if eq $remoteUser $user }}
+{{- /* AWS boxes have no "host" and are reached by their hostname; external
+       entries carry an explicit host (usually an IP). */}}
+{{- $host := default $name (get $m "host") }}
+{{- /* "claudio-box-1" -> "box1": drop the fleet-owner prefix and the dashes,
+       so the short names stay what they have always been. */}}
+  [remotes.{{ $name | trimPrefix "claudio-" | replace "-" "" }}]
+    host = {{ printf "%s@%s" $remoteUser $host | quote }}
+{{- end }}
+{{- end }}
+{{- end }}

@@ -337,7 +337,7 @@
       }
     ]
   }{{ end }},
-  "model" : "opus",
+  "model" : "sonnet",
   "permissions" : {
     "allow" : [
       "Read",
@@ -478,6 +478,10 @@
   "remoteControlAtStartup" : true,
   "skipAutoPermissionPrompt" : true,
   "skipDangerousModePermissionPrompt" : true,
+  "statusLine" : {
+    "command" : "bash \"$HOME/.claude/hooks/caveman-statusline-wrapper.sh\"",
+    "type" : "command"
+  },
   "theme" : "dark",
   "tui" : "fullscreen"
 }

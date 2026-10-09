@@ -20,6 +20,9 @@
       # Others
       "nikitabobko/tap"
       "FelixKratz/formulae"
+
+      # coder CLI, required by lightspeed (`lx`) — semgrep/lightspeed.
+      "coder/coder"
     ];
 
     brews = [
@@ -56,6 +59,10 @@
       # nixpkgs has it, but brew's macOS packaging of wg-quick/wireguard-go is
       # the better-tested one here.
       "wireguard-tools"
+
+      # The coder CLI that lightspeed (`lx`) wraps. Its README installs it from
+      # this tap, which tracks upstream releases more closely than nixpkgs.
+      "coder/coder/coder"
 
       # ripgrep, terraform-docs and graphite-cli are in home-manager
       # (nix/modules/common.nix, the latter two via pkgs-unstable), so they
@@ -108,6 +115,9 @@
       "superset"
       "stats"
       "switchresx"
+      # lightspeed's `lx t3` hands a Coder workspace to this app, which it
+      # expects to find in /Applications.
+      "t3-code"
       "visual-studio-code"
       "visual-studio-code@insiders"
       "vlc"

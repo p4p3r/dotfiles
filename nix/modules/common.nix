@@ -65,6 +65,13 @@ in {
     # 26.05 stable channel.
     terraform-docs
     clang-tools
+
+    # Go on the plain login PATH, not only inside a devshell. lightspeed
+    # (`lx`, semgrep/lightspeed) builds itself with Go: `make install` for the
+    # initial install, and its self-update prompt fetches and rebuilds main
+    # with gh + git + Go. Both run from an ordinary shell, where the devshell
+    # toolchains in nix/devshells and nix/lib/devtoolchain.nix are not active.
+    go
   ] ++ lib.optionals pkgs.stdenv.isDarwin [
     # graphite-cli is Darwin-only on purpose. It is used heavily here (11 repos
     # carry a .graphite_repo_config) but not at all on the sbx boxes (zero

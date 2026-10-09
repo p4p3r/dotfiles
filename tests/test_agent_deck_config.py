@@ -430,6 +430,7 @@ exit "$result"
 
     @unittest.skipUnless(CHEZMOI, "chezmoi is required for the render contract")
     def test_slack_v2_opt_in_renders_only_exact_environment_references(self) -> None:
+        self.maxDiff = None
         with tempfile.TemporaryDirectory(prefix="agent-deck-slack-v2-config.") as temp:
             root = Path(temp)
             home = root / "home"
@@ -476,8 +477,12 @@ exit "$result"
                 {
                     "app_token": "$SLACK_APP_TOKEN",
                     "bot_token": "$SLACK_BOT_TOKEN",
+                    "app_id": "$SLACK_DECK_APP_ID",
+                    "team_id": "$SLACK_DECK_TEAM_ID",
                     "channel_id": "$SLACK_DECK_CHANNEL",
                     "allowed_user_ids": ["$SLACK_DECK_USER"],
+                    "row_instance_id": "$AGENTDECK_CONDUCTOR_ROW_ID",
+                    "row_binding_token": "$AGENTDECK_CONDUCTOR_ROW_BINDING",
                     "codex_executable": str(home / ".npm-global/bin/codex"),
                 },
                 conductor["slack_v2"],

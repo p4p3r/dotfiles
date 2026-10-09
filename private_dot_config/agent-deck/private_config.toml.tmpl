@@ -228,8 +228,12 @@ mcp_default_scope = ""
   [conductors.{{ $namedConductor | quote }}.slack_v2]
     app_token = "$SLACK_APP_TOKEN"
     bot_token = "$SLACK_BOT_TOKEN"
+    app_id = "$SLACK_DECK_APP_ID"
+    team_id = "$SLACK_DECK_TEAM_ID"
     channel_id = "$SLACK_DECK_CHANNEL"
     allowed_user_ids = ["$SLACK_DECK_USER"]
+    row_instance_id = "$AGENTDECK_CONDUCTOR_ROW_ID"
+    row_binding_token = "$AGENTDECK_CONDUCTOR_ROW_BINDING"
     codex_executable = {{ printf "%s/.npm-global/bin/codex" .chezmoi.homeDir | quote }}
 {{ end }}
 

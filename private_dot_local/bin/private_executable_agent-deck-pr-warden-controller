@@ -896,7 +896,7 @@ def process_admit(config: dict[str, Any], args: argparse.Namespace, state_path: 
     command = [
         deck["executable"], "-p", deck["profile"], "launch", deck["work_directory"], "--no-parent",
         "--cmd", f"{shlex.quote(deck['codex_executable'])} --dangerously-bypass-approvals-and-sandbox",
-        "--effort", "xhigh", "--title", "pr-warden", "--message-file", "-",
+        "--effort", "high", "--title", "pr-warden", "--message-file", "-",
         "--acceptance-only", "--json",
     ]
     result = run_command(command, deck["start_timeout_seconds"] + 30, prompt(config, alias, admission=True))

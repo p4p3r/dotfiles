@@ -1303,7 +1303,7 @@ def launch_custodian(
             "--dangerously-bypass-approvals-and-sandbox"
         ),
         "--effort",
-        "xhigh",
+        "high",
         "--title",
         "fleet-custodian",
         "--message-file",

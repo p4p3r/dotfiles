@@ -94,6 +94,8 @@ elif "show" in args: op = "show"
 elif "archive" in args: op = "archive"
 alias_match = re.search(r"^TRIGGER_ALIAS: (.+)$", stdin, re.MULTILINE)
 calls.append({"op": op, "alias": alias_match.group(1) if alias_match else None, "stdin_bytes": len(stdin.encode())})
+if op == "launch":
+    calls[-1]["effort"] = args[args.index("--effort") + 1] if "--effort" in args else None
 calls_path.write_text(json.dumps(calls, sort_keys=True), encoding="utf-8")
 calls_path.chmod(0o600)
 
@@ -366,6 +368,8 @@ class WardenCase(unittest.TestCase):
         self.assertNotEqual(duplicate.returncode, 0)
         self.assertIn("DUPLICATE_ADMISSION", duplicate.stderr)
         self.assertEqual([call["op"] for call in self.agent_history()].count("launch"), 1)
+        launch = next(call for call in self.agent_history() if call["op"] == "launch")
+        self.assertEqual(launch["effort"], "high")
         for directory in ("state", "runtime", "results", "handoffs"):
             path = self.root / directory
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)

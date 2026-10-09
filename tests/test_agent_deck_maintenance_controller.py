@@ -487,6 +487,7 @@ class ControllerCase(unittest.TestCase):
         self.assertIn("--no-parent", launch)
         self.assertIn("--message-file", launch)
         self.assertEqual(launch[launch.index("--message-file") + 1], "-")
+        self.assertEqual(launch[launch.index("--effort") + 1], "high")
         self.assertEqual(
             launch[launch.index("--cmd") + 1],
             f"'{self.root}/managed codex;touch SHOULD_NOT_EXIST_CODEX' "

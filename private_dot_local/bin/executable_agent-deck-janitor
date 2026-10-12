@@ -35,7 +35,10 @@ FORBIDDEN_ROOTS = frozenset({
     "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/nix", "/opt",
     "/proc", "/root", "/run", "/sbin", "/srv", "/sys", "/usr", "/var",
 })
-MAX_ENTRIES_PER_ROOT = 4096
+# A real /tmp carries thousands of entries. The first cap was 4096, which a
+# live box exceeded immediately: the sweep stopped at an alphabetical prefix
+# and the rest of the root was never reached on any run, however often it ran.
+MAX_ENTRIES_PER_ROOT = 65536
 DEFAULT_COMMAND_TIMEOUT = 300
 
 

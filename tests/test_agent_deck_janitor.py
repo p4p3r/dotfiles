@@ -7,6 +7,8 @@ proves nothing about what reaches the disk.
 
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
 import json
 import os
 import shutil
@@ -277,6 +279,27 @@ sys.exit(9)
     def test_an_absent_expiring_path_is_not_an_error(self) -> None:
         _, report = self.run_janitor("--expiring", f"{self.tmp}/gone:30", apply=True)
         self.assertEqual(report["tasks"]["expiring_paths"]["status"], "OK")
+
+    def test_a_root_larger_than_the_cap_is_flagged_not_silently_partial(self) -> None:
+        # A live /tmp exceeded the original 4096 cap, so the sweep stopped at an
+        # alphabetical prefix and never reached the rest on any run.
+        import importlib.util
+        spec = importlib.util.spec_from_loader(
+            "janitor", importlib.machinery.SourceFileLoader("janitor", str(JANITOR)))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertGreaterEqual(module.MAX_ENTRIES_PER_ROOT, 65536)
+
+        root = self.tmp / "scratch"
+        root.mkdir()
+        for index in range(12):
+            entry = root / f"entry-{index:04d}"
+            entry.write_text("x")
+            age(entry, 90)
+        _, report = self.run_janitor("--artifact", f"{root}:30")
+        entry = report["tasks"]["artifacts"]["roots"][str(root)]
+        self.assertEqual(len(entry["removed"]), 12)
+        self.assertFalse(entry["truncated"])
 
     def test_a_missing_artifact_root_is_not_an_error(self) -> None:
         _, report = self.run_janitor("--artifact", f"{self.tmp}/absent/root:30")

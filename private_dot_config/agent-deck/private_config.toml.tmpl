@@ -65,7 +65,15 @@ mcp_default_scope = ""
   # keeps non-interactive and tmux spawns independent of shell PATH ordering.
   command = {{ printf "%s/.npm-global/bin/codex" .chezmoi.homeDir | quote }}
   config_dir = ""
-  yolo_mode = false
+  # Whether Codex sessions this host spawns run without the approval gate.
+  # Defaults off, which is what a workstation renders.
+  #
+  # A host that wants it exports AGENTDECK_CODEX_YOLO=1 from its own private
+  # configuration, next to AGENTDECK_CONDUCTOR_NAME above; this repository is
+  # public and holds neither that decision nor the identity of the host making
+  # it. The flag is appended when a session is spawned and never written into a
+  # session row, so a row still reads command = "codex" with an empty wrapper.
+  yolo_mode = {{ if eq (env "AGENTDECK_CODEX_YOLO") "1" }}true{{ else }}false{{ end }}
   env_file = ""
 
 [copilot]

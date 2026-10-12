@@ -68,14 +68,8 @@ let
       "--profile"
       name
     ]) cfg.profiles
-    ++ lib.concatMap (name: [
-      "--protect-group"
-      name
-    ]) cfg.protectedGroups
-    ++ lib.concatMap (title: [
-      "--protect-session-title"
-      title
-    ]) cfg.protectedSessionTitles
+    ++ map (name: "--protect-group=${name}") cfg.protectedGroups
+    ++ map (title: "--protect-session-title=${title}") cfg.protectedSessionTitles
     ++ lib.concatMap (path: [
       "--repo"
       (systemdLiteral path)
@@ -88,10 +82,10 @@ let
       "--expiring"
       (systemdLiteral "${rule.path}:${toString rule.olderThanDays}")
     ]) cfg.expiringPaths
-    ++ lib.concatMap (pattern: [
-      "--keep-pattern"
-      pattern
-    ]) cfg.keepPatterns
+    # A regular expression may legitimately begin with "-", which argparse
+    # would read as an option: the first armed run died on --keep-pattern
+    # -1000$ before doing anything. The --opt=value form has no such ambiguity.
+    ++ map (pattern: "--keep-pattern=${pattern}") cfg.keepPatterns
     ++ lib.optionals (cfg.reclaimRepositoryRoots != [ ]) [
       "--gh"
       (systemdLiteral cfg.ghExecutable)

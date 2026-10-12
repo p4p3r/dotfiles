@@ -326,6 +326,23 @@ sys.exit(9)
         self.assertEqual(len(entry["removed"]), 12)
         self.assertFalse(entry["truncated"])
 
+    def test_a_keep_pattern_may_begin_with_a_dash(self) -> None:
+        # The first armed run died here: argparse read the regular expression
+        # -1000$ as an option name and the whole janitor exited before acting.
+        root = self.tmp / "scratch"
+        root.mkdir()
+        keep = root / "codex-1000"
+        keep.mkdir()
+        drop = root / "other"
+        drop.mkdir()
+        age(keep, 90)
+        age(drop, 90)
+        done, report = self.run_janitor("--artifact", f"{root}:30",
+                                        "--keep-pattern=-1000$", apply=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(keep.exists())
+        self.assertFalse(drop.exists())
+
     def test_a_missing_artifact_root_is_not_an_error(self) -> None:
         _, report = self.run_janitor("--artifact", f"{self.tmp}/absent/root:30")
         self.assertEqual(report["tasks"]["artifacts"]["status"], "OK")

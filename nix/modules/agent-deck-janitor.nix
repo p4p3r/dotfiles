@@ -87,7 +87,17 @@ let
     ++ lib.concatMap (pattern: [
       "--keep-pattern"
       pattern
-    ]) cfg.keepPatterns;
+    ]) cfg.keepPatterns
+    ++ lib.optionals (cfg.reclaimRepositoryRoots != [ ]) [
+      "--gh"
+      (systemdLiteral cfg.ghExecutable)
+      "--reclaim-grace-days"
+      (toString cfg.reclaimGraceDays)
+    ]
+    ++ lib.concatMap (path: [
+      "--reclaim-repo"
+      (systemdLiteral path)
+    ]) cfg.reclaimRepositoryRoots;
 in
 {
   options.programs.agent-deck-janitor = {
@@ -186,6 +196,37 @@ in
         and naming it explicitly means no pattern can expand to something
         unintended.
       '';
+    };
+
+    reclaimRepositoryRoots = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = ''
+        Repositories whose worktrees are reclaimed once their pull request has
+        merged. A worktree is removed only when its branch has a MERGED pull
+        request, its HEAD still equals that pull request's head, it holds no
+        uncommitted changes, and no session is using it.
+
+        The pull request is the load-bearing evidence and local git cannot
+        replace it: squash-merge rewrites the commits, so a fully merged branch
+        still reports commits ahead of the trunk and `git cherry` still reports
+        unmerged patches.
+      '';
+    };
+
+    reclaimGraceDays = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 0;
+      description = ''
+        Keep a worktree for this long after its pull request merged, so a
+        follow-up does not lose its tree moments after the merge lands.
+      '';
+    };
+
+    ghExecutable = lib.mkOption {
+      type = lib.types.str;
+      default = "gh";
+      description = "GitHub CLI used for read-only pull request state.";
     };
 
     keepPatterns = lib.mkOption {
@@ -298,6 +339,7 @@ in
             lib.makeBinPath [
               pkgs.coreutils
               pkgs.git
+              pkgs.gh
               pkgs.nix
               pkgs.tmux
               pkgs.bash

@@ -15,6 +15,7 @@ in {
     ./agent-deck-pr-warden.nix
     ./agent-deck-slack-watchdog.nix
     ./agent-deck-signed-ingress.nix
+    ./sccache.nix
     ./shell/fish.nix
   ];
 

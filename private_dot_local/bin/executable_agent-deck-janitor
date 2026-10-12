@@ -50,11 +50,11 @@ def utc() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def run(argv, timeout=DEFAULT_COMMAND_TIMEOUT):
+def run(argv, timeout=DEFAULT_COMMAND_TIMEOUT, cwd=None):
     """Run one argv with no shell. Returns (ok, stdout, summary)."""
     try:
         done = subprocess.run(argv, capture_output=True, text=True,
-                              timeout=timeout, check=False)
+                              timeout=timeout, check=False, cwd=cwd)
     except FileNotFoundError:
         return False, "", "executable not found"
     except subprocess.TimeoutExpired:
@@ -65,6 +65,17 @@ def run(argv, timeout=DEFAULT_COMMAND_TIMEOUT):
         tail = (done.stderr or done.stdout or "").strip().splitlines()
         return False, done.stdout, f"exit {done.returncode}: {tail[-1] if tail else 'no output'}"
     return True, done.stdout, "ok"
+
+
+def real(path: str) -> str:
+    """Resolve symlinks before comparing paths.
+
+    git reports a worktree by its resolved path while a session or a
+    configuration may name it through a symlink -- a symlinked home or, on
+    macOS, /var versus /private/var. Comparing the two unresolved made an
+    occupied worktree look free.
+    """
+    return os.path.realpath(path)
 
 
 def load_json(text):
@@ -410,6 +421,162 @@ class Janitor:
             detail[path] = entry
         self.record("expiring_paths", worst, applied=self.apply, paths=detail)
 
+
+    # -- merged worktrees ---------------------------------------------------
+
+    def live_session_paths(self):
+        """Paths currently held by a session, which are never reclaimed."""
+        held = set()
+        for profile in self.profiles():
+            ok, out, _ = run([self.args.agent_deck, "-p", profile, "list", "--json"],
+                             timeout=120)
+            if not ok:
+                # Unknown occupancy is not empty occupancy. Returning None makes
+                # the caller skip reclaim entirely rather than delete a worktree
+                # an agent is sitting in.
+                return None
+            rows = load_json(out)
+            if not isinstance(rows, list):
+                return None
+            for row in rows:
+                if isinstance(row, dict) and isinstance(row.get("path"), str):
+                    held.add(real(row["path"]))
+        return held
+
+    def worktrees(self, repo):
+        ok, out, summary = run([self.args.git, "-C", repo, "worktree", "list",
+                                "--porcelain"], timeout=120)
+        if not ok:
+            return None, summary
+        trees, current = [], None
+        for line in out.splitlines():
+            if line.startswith("worktree "):
+                current = {"path": line.split(" ", 1)[1]}
+            elif line.startswith("branch ") and current is not None:
+                ref = line.split(" ", 1)[1]
+                prefix = "refs/heads/"
+                current["branch"] = ref[len(prefix):] if ref.startswith(prefix) else ref
+                trees.append(current)
+                current = None
+            elif line.startswith("detached"):
+                current = None
+        return trees, "ok"
+
+    def pull_requests(self, repo):
+        """Head branch -> pull request, read-only.
+
+        A merged pull request is the only evidence that reviewed work is safely
+        upstream. Local git cannot supply it: squash-merge rewrites the commits,
+        so the branch still looks ahead of main and `git cherry` still reports
+        unmerged patches long after the merge landed.
+        """
+        ok, out, summary = run([self.args.gh, "pr", "list", "--state", "all",
+                                "--limit", str(self.args.reclaim_pr_limit),
+                                "--json", "headRefName,headRefOid,state,number,mergedAt"],
+                               timeout=self.args.gh_timeout, cwd=repo)
+        if not ok:
+            return None, summary
+        rows = load_json(out)
+        if not isinstance(rows, list):
+            return None, "pull request list was not a list"
+        return {row.get("headRefName"): row for row in rows
+                if isinstance(row, dict) and isinstance(row.get("headRefName"), str)}, "ok"
+
+    def reclaim_merged_worktrees(self):
+        if not self.args.reclaim_repo:
+            self.record("merged_worktrees", "SKIPPED")
+            return
+        held = self.live_session_paths()
+        if held is None:
+            self.record("merged_worktrees", "DEGRADED",
+                        reason="session occupancy could not be established")
+            return
+
+        now = time.time()
+        grace = self.args.reclaim_grace_days * 86400
+        detail = {}
+        worst = "OK"
+        for repo in self.args.reclaim_repo:
+            entry = {"reclaimed": [], "retained": [], "failed": [], "bytes": 0}
+            trees, summary = self.worktrees(repo)
+            if trees is None:
+                entry["error"] = summary
+                worst = "DEGRADED"
+                detail[repo] = entry
+                continue
+            prs, summary = self.pull_requests(repo)
+            if prs is None:
+                entry["error"] = summary
+                worst = "DEGRADED"
+                detail[repo] = entry
+                continue
+
+            root = real(repo)
+            for tree in trees:
+                path = real(tree["path"])
+                branch = tree.get("branch", "")
+                reason = self.retain_reason(root, path, branch, prs, held, now, grace)
+                if reason:
+                    entry["retained"].append({"branch": branch, "reason": reason})
+                    continue
+                size = self.size_of(path)
+                if not self.apply:
+                    entry["reclaimed"].append({"branch": branch, "bytes": size})
+                    entry["bytes"] += size
+                    continue
+                ok, _, summary = run([self.args.git, "-C", root, "worktree",
+                                      "remove", path], timeout=600)
+                if not ok:
+                    # The only objection left is ignored content, typically a
+                    # build directory, because tracked cleanliness was checked
+                    # above and is what --force would otherwise override.
+                    ok, _, summary = run([self.args.git, "-C", root, "worktree",
+                                          "remove", "--force", path], timeout=600)
+                if ok:
+                    entry["reclaimed"].append({"branch": branch, "bytes": size})
+                    entry["bytes"] += size
+                else:
+                    entry["failed"].append({"branch": branch, "summary": summary})
+                    worst = "DEGRADED"
+            detail[repo] = entry
+        self.record("merged_worktrees", worst, applied=self.apply,
+                    grace_days=self.args.reclaim_grace_days, repositories=detail)
+
+    def retain_reason(self, root, path, branch, prs, held, now, grace):
+        """Why this worktree is kept, or "" when it is safe to reclaim."""
+        if path == root:
+            return "primary worktree"
+        if not branch:
+            return "detached head"
+        if path in held:
+            return "a session is using it"
+        pr = prs.get(branch)
+        if not pr:
+            return "no pull request"
+        if pr.get("state") != "MERGED":
+            return str(pr.get("state", "unknown")).lower()
+        ok, head, _ = run([self.args.git, "-C", path, "rev-parse", "HEAD"],
+                          timeout=60)
+        if not ok:
+            return "head could not be read"
+        if head.strip() != pr.get("headRefOid"):
+            return "commits after the merged head"
+        ok, status, _ = run([self.args.git, "-C", path, "status", "--porcelain"],
+                            timeout=120)
+        if not ok:
+            return "status could not be read"
+        if status.strip():
+            return "uncommitted changes"
+        merged_at = pr.get("mergedAt")
+        if grace and isinstance(merged_at, str):
+            try:
+                stamp = time.mktime(time.strptime(merged_at, "%Y-%m-%dT%H:%M:%SZ"))
+            except ValueError:
+                return "merge time could not be read"
+            if stamp - time.timezone > now - grace:
+                return "inside the grace window"
+        return ""
+
     # -- drift --------------------------------------------------------------
 
     def report_drift(self):
@@ -443,6 +610,7 @@ class Janitor:
         self.collect_nix_garbage()
         self.sweep_artifacts()
         self.sweep_expiring_paths()
+        self.reclaim_merged_worktrees()
         self.report_drift()
         degraded = [t for t, r in self.results.items() if r["status"] == "DEGRADED"]
         return {
@@ -472,6 +640,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expiring", action="append", default=[],
                         metavar="PATH:DAYS")
     parser.add_argument("--keep-pattern", action="append", default=[])
+    parser.add_argument("--gh", default="gh")
+    parser.add_argument("--gh-timeout", type=int, default=120)
+    parser.add_argument("--reclaim-repo", action="append", default=[])
+    parser.add_argument("--reclaim-grace-days", type=int, default=0)
+    parser.add_argument("--reclaim-pr-limit", type=int, default=500)
     parser.add_argument("--nix-generations-days", type=int, default=None)
     parser.add_argument("--nix-timeout", type=int, default=1800)
     parser.add_argument("--apply", action="store_true",

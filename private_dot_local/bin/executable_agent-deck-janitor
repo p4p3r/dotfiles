@@ -172,8 +172,18 @@ class Janitor:
                 detail[profile] = {"ok": False, "summary": summary}
                 worst = "DEGRADED"
                 continue
-            payload = load_json(out) or {}
+            payload = load_json(out)
+            if not isinstance(payload, dict):
+                detail[profile] = {"ok": False, "summary": "cleanup did not return an object"}
+                worst = "DEGRADED"
+                continue
+            # With nothing to purge the CLI answers in a different shape --
+            # {"count": 0, "removed": [], "skipped": 0, "success": true} and no
+            # candidates key at all -- so an absent list means an empty one,
+            # not a malformed reply.
             candidates = payload.get("candidates")
+            if candidates is None and (payload.get("success") or payload.get("count") == 0):
+                candidates = []
             if not isinstance(candidates, list):
                 detail[profile] = {"ok": False, "summary": "candidate list was not a list"}
                 worst = "DEGRADED"
@@ -337,7 +347,7 @@ class Janitor:
             root, days = rule
             cutoff = now - days * 86400
             entry = {"older_than_days": days, "removed": [], "failed": [],
-                     "bytes": 0, "truncated": False}
+                     "foreign": 0, "bytes": 0, "truncated": False}
             if os.path.islink(root) or not os.path.isdir(root):
                 entry["skipped"] = "root is missing or not a directory"
                 detail[root] = entry
@@ -358,6 +368,15 @@ class Janitor:
                     continue
                 if self.args.keep_pattern and any(
                         re.search(p, name) for p in self.args.keep_pattern):
+                    continue
+                # A shared scratch root holds other people's files. Those are
+                # not ours to delete, and failing to delete one is the correct
+                # outcome rather than a fault to report.
+                try:
+                    if os.lstat(path).st_uid != os.getuid():
+                        entry["foreign"] = entry.get("foreign", 0) + 1
+                        continue
+                except OSError:
                     continue
                 entry["bytes"] += self.size_of(path)
                 if not self.apply:

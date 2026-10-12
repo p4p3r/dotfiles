@@ -123,6 +123,24 @@ sys.exit(9)
         self.assertEqual(removals, ["-p default session remove dead-0001",
                                     "-p default session remove dead-0002"])
 
+    def test_an_empty_candidate_reply_is_not_a_failure(self) -> None:
+        # With nothing to purge the CLI answers in a different shape, with no
+        # candidates key at all. The first armed run read that as malformed.
+        self.candidates = None
+        write_executable(self.bin / "agent-deck", """#!/usr/bin/env python3
+import json, os, pathlib, sys
+argv = sys.argv[1:]
+(pathlib.Path(os.environ["CALLS"]) / "agent-deck").open("a").write(" ".join(argv) + chr(10))
+if argv[2:4] == ["session", "cleanup"]:
+    json.dump({"count": 0, "removed": [], "skipped": 0, "success": True}, sys.stdout)
+    sys.exit(0)
+sys.exit(0)
+""")
+        _, report = self.run_janitor(apply=True)
+        task = report["tasks"]["sessions"]
+        self.assertEqual(task["status"], "OK")
+        self.assertEqual(task["profiles"]["default"]["removed"], [])
+
     def test_a_protected_title_is_never_purged(self) -> None:
         _, report = self.run_janitor("--protect-session-title", "conductor-semgrep",
                                      apply=True)
@@ -325,6 +343,23 @@ sys.exit(9)
         entry = report["tasks"]["artifacts"]["roots"][str(root)]
         self.assertEqual(len(entry["removed"]), 12)
         self.assertFalse(entry["truncated"])
+
+    def test_owned_entries_are_swept_and_a_foreign_count_is_reported(self) -> None:
+        # /tmp is shared. The first armed run reported 40 PermissionErrors on
+        # other users' files as faults, when leaving them alone is correct.
+        # A test cannot create a file owned by another user without privilege,
+        # so this covers the accounting and the owned path; the ownership
+        # branch itself is exercised by the live run on a shared /tmp.
+        root = self.tmp / "scratch"
+        root.mkdir()
+        mine = root / "mine"
+        mine.mkdir()
+        age(mine, 90)
+        _, report = self.run_janitor("--artifact", f"{root}:30", apply=True)
+        entry = report["tasks"]["artifacts"]["roots"][str(root)]
+        self.assertEqual(report["tasks"]["artifacts"]["status"], "OK")
+        self.assertEqual(entry["foreign"], 0)
+        self.assertFalse(mine.exists())
 
     def test_a_keep_pattern_may_begin_with_a_dash(self) -> None:
         # The first armed run died here: argparse read the regular expression

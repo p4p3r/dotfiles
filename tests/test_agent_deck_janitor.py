@@ -229,11 +229,54 @@ sys.exit(9)
         self.assertTrue(nested.exists(),
                         "a stale grandchild under a fresh parent is out of scope")
 
-    def test_shallow_or_relative_artifact_roots_are_refused(self) -> None:
-        for rule in ("/tmp:30", "relative/path:30", "/:30", f"{self.tmp}:0"):
+    def test_unsafe_artifact_roots_are_refused(self) -> None:
+        home = os.path.expanduser("~")
+        for rule in ("/:30", "/home:30", "/usr:30", "/nix:30", "/etc:30",
+                     "relative/path:30", f"{home}:30", f"{self.tmp}:0",
+                     f"{self.tmp}:notanumber"):
             done, _ = self.run_janitor("--artifact", rule, apply=True)
             self.assertEqual(done.returncode, 2, f"{rule!r} must be refused")
             self.assertIn("REJECTED", done.stderr)
+
+    def test_a_scratch_root_like_tmp_is_allowed(self) -> None:
+        # The first guard was a path-depth heuristic, which refused /tmp -- the
+        # single largest thing worth sweeping -- while accepting /home/someone.
+        scratch = self.tmp / "tmplike"
+        scratch.mkdir()
+        done, report = self.run_janitor("--artifact", f"{scratch}:30")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(report["tasks"]["artifacts"]["status"], "OK")
+
+    # -- expiring paths -----------------------------------------------------
+
+    def test_an_expiring_path_removes_itself_not_its_children(self) -> None:
+        target = self.tmp / "build-cache"
+        (target / "inner").mkdir(parents=True)
+        age(target / "inner", 200)
+        age(target, 200)
+        _, report = self.run_janitor("--expiring", f"{target}:30", apply=True)
+        self.assertFalse(target.exists())
+        self.assertTrue(report["tasks"]["expiring_paths"]["paths"][str(target)]["removed"])
+
+    def test_an_expiring_path_inside_the_window_survives(self) -> None:
+        target = self.tmp / "build-cache"
+        target.mkdir()
+        _, report = self.run_janitor("--expiring", f"{target}:30", apply=True)
+        self.assertTrue(target.exists())
+        entry = report["tasks"]["expiring_paths"]["paths"][str(target)]
+        self.assertEqual(entry["skipped"], "within the window")
+
+    def test_an_expiring_path_is_a_preview_without_apply(self) -> None:
+        target = self.tmp / "build-cache"
+        target.mkdir()
+        age(target, 400)
+        _, report = self.run_janitor("--expiring", f"{target}:30")
+        self.assertTrue(target.exists())
+        self.assertTrue(report["tasks"]["expiring_paths"]["paths"][str(target)]["removed"])
+
+    def test_an_absent_expiring_path_is_not_an_error(self) -> None:
+        _, report = self.run_janitor("--expiring", f"{self.tmp}/gone:30", apply=True)
+        self.assertEqual(report["tasks"]["expiring_paths"]["status"], "OK")
 
     def test_a_missing_artifact_root_is_not_an_error(self) -> None:
         _, report = self.run_janitor("--artifact", f"{self.tmp}/absent/root:30")

@@ -27,9 +27,14 @@ import time
 VERSION = 1
 NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 GROUP_PATH = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._/-]{0,255}\Z")
-# A destructive root must be specific. Fewer components than this and a typo
-# reaches a home directory or a filesystem root.
-MIN_ARTIFACT_DEPTH = 2
+# A depth heuristic was the first attempt and it was wrong in both directions:
+# it refused /tmp, which is the single largest thing worth sweeping, while
+# happily accepting /home/someone. An explicit denylist says what is actually
+# unsafe. The home directory is added at runtime.
+FORBIDDEN_ROOTS = frozenset({
+    "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/nix", "/opt",
+    "/proc", "/root", "/run", "/sbin", "/srv", "/sys", "/usr", "/var",
+})
 MAX_ENTRIES_PER_ROOT = 4096
 DEFAULT_COMMAND_TIMEOUT = 300
 
@@ -78,9 +83,22 @@ def parse_artifact_rule(value: str) -> tuple[str, int]:
     normalized = os.path.normpath(path)
     if normalized != path.rstrip("/") and normalized != path:
         raise Rejected(f"artifact root {path!r} must already be normalized")
-    if len([p for p in normalized.split("/") if p]) < MIN_ARTIFACT_DEPTH:
-        raise Rejected(f"artifact root {path!r} is too shallow to delete under")
+    if normalized in FORBIDDEN_ROOTS:
+        raise Rejected(f"artifact root {path!r} is never safe to sweep")
+    if normalized == os.path.expanduser("~").rstrip("/"):
+        raise Rejected("the home directory is never swept as an artifact root")
     return normalized, int(days)
+
+
+def parse_expiring_rule(value: str) -> tuple[str, int]:
+    """PATH:DAYS for a path that is itself removed once it is old enough.
+
+    Sweeping the children of a root is wrong for a single large build
+    directory: the directory itself is the thing to remove, and naming it
+    explicitly means no pattern can ever expand to something unintended.
+    """
+    path, days = parse_artifact_rule(value)
+    return path, days
 
 
 class Janitor:
@@ -354,6 +372,41 @@ class Janitor:
                     continue
         return total
 
+    def sweep_expiring_paths(self):
+        """Remove exactly the configured paths, once unused for long enough."""
+        if not self.args.expiring:
+            self.record("expiring_paths", "SKIPPED")
+            return
+        now = time.time()
+        detail = {}
+        worst = "OK"
+        for path, days in self.args.expiring:
+            entry = {"older_than_days": days, "removed": False, "bytes": 0}
+            if not os.path.exists(path) and not os.path.islink(path):
+                entry["skipped"] = "absent"
+                detail[path] = entry
+                continue
+            if self.effective_mtime(path) >= now - days * 86400:
+                entry["skipped"] = "within the window"
+                detail[path] = entry
+                continue
+            entry["bytes"] = self.size_of(path)
+            if not self.apply:
+                entry["removed"] = True
+                detail[path] = entry
+                continue
+            try:
+                if os.path.islink(path) or not os.path.isdir(path):
+                    os.unlink(path)
+                else:
+                    shutil.rmtree(path)
+                entry["removed"] = True
+            except OSError as exc:
+                entry["error"] = exc.__class__.__name__
+                worst = "DEGRADED"
+            detail[path] = entry
+        self.record("expiring_paths", worst, applied=self.apply, paths=detail)
+
     # -- drift --------------------------------------------------------------
 
     def report_drift(self):
@@ -386,6 +439,7 @@ class Janitor:
         self.prune_worktrees()
         self.collect_nix_garbage()
         self.sweep_artifacts()
+        self.sweep_expiring_paths()
         self.report_drift()
         degraded = [t for t, r in self.results.items() if r["status"] == "DEGRADED"]
         return {
@@ -412,6 +466,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", action="append", default=[])
     parser.add_argument("--artifact", action="append", default=[],
                         metavar="ROOT:DAYS")
+    parser.add_argument("--expiring", action="append", default=[],
+                        metavar="PATH:DAYS")
     parser.add_argument("--keep-pattern", action="append", default=[])
     parser.add_argument("--nix-generations-days", type=int, default=None)
     parser.add_argument("--nix-timeout", type=int, default=1800)
@@ -426,6 +482,7 @@ def main(argv=None) -> int:
         if args.session_retention_days < 1:
             raise Rejected("--session-retention-days must be positive")
         args.artifact = [parse_artifact_rule(rule) for rule in args.artifact]
+        args.expiring = [parse_expiring_rule(rule) for rule in args.expiring]
         for pattern in args.keep_pattern:
             re.compile(pattern)
     except (Rejected, re.error) as exc:

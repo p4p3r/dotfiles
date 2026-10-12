@@ -24,6 +24,26 @@ let
     '';
   };
   systemdLiteral = value: lib.replaceStrings [ "%" ] [ "%%" ] value;
+  forbiddenRoots = [
+    "/"
+    "/bin"
+    "/boot"
+    "/dev"
+    "/etc"
+    "/home"
+    "/lib"
+    "/nix"
+    "/opt"
+    "/proc"
+    "/root"
+    "/run"
+    "/sbin"
+    "/srv"
+    "/sys"
+    "/usr"
+    "/var"
+    config.home.homeDirectory
+  ];
   janitorArgs =
     [
       "${runtime}/bin/agent-deck-janitor"
@@ -60,6 +80,10 @@ let
       "--artifact"
       (systemdLiteral "${rule.path}:${toString rule.olderThanDays}")
     ]) cfg.artifactRoots
+    ++ lib.concatMap (rule: [
+      "--expiring"
+      (systemdLiteral "${rule.path}:${toString rule.olderThanDays}")
+    ]) cfg.expiringPaths
     ++ lib.concatMap (pattern: [
       "--keep-pattern"
       pattern
@@ -140,6 +164,30 @@ in
       '';
     };
 
+    expiringPaths = lib.mkOption {
+      type = lib.types.listOf (
+        lib.types.submodule {
+          options = {
+            path = lib.mkOption {
+              type = lib.types.str;
+              description = "Absolute path removed in full once it is old enough.";
+            };
+            olderThanDays = lib.mkOption {
+              type = lib.types.ints.positive;
+              description = "Age in days at which this exact path is removed.";
+            };
+          };
+        }
+      );
+      default = [ ];
+      description = ''
+        Paths that are themselves the candidate, rather than roots whose
+        children expire. A single large build directory is removed as a whole,
+        and naming it explicitly means no pattern can expand to something
+        unintended.
+      '';
+    };
+
     keepPatterns = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -210,15 +258,13 @@ in
         message = "programs.agent-deck-janitor.repositoryRoots must be absolute.";
       }
       {
-        # The runtime rejects a shallow root as well. Failing here too means a
-        # typo is caught when the configuration is built rather than on the
-        # first live run against a box.
+        # The runtime refuses these too. Failing here as well means a typo is
+        # caught when the configuration is built rather than on the first live
+        # run against a box.
         assertion = lib.all (
-          rule:
-          lib.hasPrefix "/" rule.path
-          && builtins.length (lib.filter (part: part != "") (lib.splitString "/" rule.path)) >= 2
-        ) cfg.artifactRoots;
-        message = "programs.agent-deck-janitor.artifactRoots entries must be absolute and specific.";
+          rule: lib.hasPrefix "/" rule.path && !(builtins.elem rule.path forbiddenRoots)
+        ) (cfg.artifactRoots ++ cfg.expiringPaths);
+        message = "programs.agent-deck-janitor paths must be absolute and never a system root.";
       }
     ];
 

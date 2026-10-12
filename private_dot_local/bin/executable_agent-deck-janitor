@@ -470,10 +470,19 @@ class Janitor:
         so the branch still looks ahead of main and `git cherry` still reports
         unmerged patches long after the merge landed.
         """
-        ok, out, summary = run([self.args.gh, "pr", "list", "--state", "all",
-                                "--limit", str(self.args.reclaim_pr_limit),
-                                "--json", "headRefName,headRefOid,state,number,mergedAt"],
-                               timeout=self.args.gh_timeout, cwd=repo)
+        # The first live run met HTTP 502 and 504 from the GraphQL API on most
+        # repositories at once. A failed query is safe -- that repository simply
+        # retains everything -- but a daily task that half-fails on a flaky API
+        # never finishes its job, so transient failures are retried.
+        argv = [self.args.gh, "pr", "list", "--state", "all",
+                "--limit", str(self.args.reclaim_pr_limit),
+                "--json", "headRefName,headRefOid,state,number,mergedAt"]
+        for attempt in range(self.args.gh_attempts):
+            ok, out, summary = run(argv, timeout=self.args.gh_timeout, cwd=repo)
+            if ok:
+                break
+            if attempt + 1 < self.args.gh_attempts:
+                time.sleep(min(2 ** attempt * 5, 30))
         if not ok:
             return None, summary
         rows = load_json(out)
@@ -644,7 +653,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gh-timeout", type=int, default=120)
     parser.add_argument("--reclaim-repo", action="append", default=[])
     parser.add_argument("--reclaim-grace-days", type=int, default=0)
-    parser.add_argument("--reclaim-pr-limit", type=int, default=500)
+    parser.add_argument("--reclaim-pr-limit", type=int, default=200)
+    parser.add_argument("--gh-attempts", type=int, default=3)
     parser.add_argument("--nix-generations-days", type=int, default=None)
     parser.add_argument("--nix-timeout", type=int, default=1800)
     parser.add_argument("--apply", action="store_true",

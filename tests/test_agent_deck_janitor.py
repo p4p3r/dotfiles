@@ -536,6 +536,37 @@ sys.exit(0)
         self.assertTrue(path.exists(), "a preview must delete nothing")
         self.assertGreater(entry["bytes"], 2000)
 
+    def test_a_transient_api_failure_is_retried_then_degrades_safely(self):
+        # The first live run met HTTP 502/504 on most repositories at once.
+        path, branch, head = self.add_worktree("merged")
+        counter = self.tmp / "gh-attempts"
+        write_executable(self.bin / "gh", f"""#!/usr/bin/env python3
+import pathlib, sys
+c = pathlib.Path({str(counter)!r})
+n = int(c.read_text()) + 1 if c.exists() else 1
+c.write_text(str(n))
+if n < 3:
+    sys.stderr.write("HTTP 502: Bad Gateway" + chr(10)); sys.exit(1)
+import json
+sys.stdout.write(json.dumps([{{"headRefName": {branch!r}, "headRefOid": {head!r},
+                              "state": "MERGED", "number": 9,
+                              "mergedAt": "2026-01-01T00:00:00Z"}}]))
+""")
+        _, task = self.run_janitor("--gh-attempts", "3", apply=True)
+        self.assertEqual(int(counter.read_text()), 3, "the query must be retried")
+        reclaimed, _, _ = self.outcome(task)
+        self.assertEqual(reclaimed, {branch})
+        self.assertFalse(path.exists())
+
+    def test_an_api_failure_that_persists_retains_everything(self):
+        path, branch, _ = self.add_worktree("merged")
+        write_executable(self.bin / "gh",
+                         "#!/bin/sh\necho 'HTTP 504' >&2\nexit 1\n")
+        _, task = self.run_janitor("--gh-attempts", "2", apply=True)
+        self.assertEqual(task["status"], "DEGRADED")
+        self.assertTrue(path.exists(),
+                        "an unreadable pull request state must never reclaim")
+
     def test_unreadable_session_occupancy_stops_reclaim_entirely(self):
         path, branch, head = self.add_worktree("merged")
         self.write_gh([{"headRefName": branch, "headRefOid": head, "state": "MERGED",

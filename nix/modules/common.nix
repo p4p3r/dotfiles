@@ -9,6 +9,7 @@ in {
   imports = [
     ./agent-cli-updates.nix
     ./agent-deck-archive-only-custodian.nix
+    ./agent-deck-channel-liveness.nix
     ./agent-deck-control.nix
     ./agent-deck-janitor.nix
     ./agent-deck-maintenance.nix

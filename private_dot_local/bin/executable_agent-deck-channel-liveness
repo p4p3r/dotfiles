@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Keep a channel conductor's inbound path alive.
+
+Two failures this guards against, both seen on a live host:
+
+1. The unit is dead and nothing restarts it, because the service is Restart=no.
+2. The unit is `active/running` with an established TCP socket, and receives
+   nothing. The provider rotates its socket periodically; if the client does not
+   re-establish, it sits on a live-but-silent connection. systemd sees a healthy
+   service, outbound still works, and only inbound stops. Nothing notices until
+   a person observes being ignored.
+
+The second has no honest local detector. A quiet channel and a dead socket look
+identical from the gateway: both are an absence of events. So this does not
+diagnose, it recycles -- after a silence long enough to be worth a restart, and
+only when no turn is in flight. A restart is cheap and loses nothing, because
+accepted events and turns are durable in the gateway database. The cost of
+being wrong is one reconnect on a quiet channel; the cost of not acting is an
+outage that lasts until someone complains.
+
+Restarts are capped per day so a genuinely broken service cannot be flapped.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+
+VERSION = 1
+DEFAULT_MAX_SILENCE_MINUTES = 45
+DEFAULT_DAILY_RESTART_CAP = 6
+COMMAND_TIMEOUT = 60
+
+
+def utc() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def run(argv, timeout=COMMAND_TIMEOUT):
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True,
+                              timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, "", exc.__class__.__name__
+    return done.returncode == 0, done.stdout.strip(), done.stderr.strip()
+
+
+def unit_property(systemctl, unit, name):
+    ok, out, _ = run([systemctl, "--user", "show", unit, "-p", name, "--value"])
+    return out if ok else ""
+
+
+def newest_inbound(database):
+    """Newest accepted inbound event, and whether a turn is in flight.
+
+    The database is copied before reading: the gateway owns it, holds it in WAL
+    mode, and a monitor must never take locks on the thing it is monitoring.
+    """
+    if not os.path.exists(database):
+        return None, False, "database is absent"
+    tmp = tempfile.mkdtemp()
+    try:
+        for suffix in ("", "-wal", "-shm"):
+            if os.path.exists(database + suffix):
+                shutil.copy(database + suffix, os.path.join(tmp, "g.sqlite" + suffix))
+        connection = sqlite3.connect(os.path.join(tmp, "g.sqlite"))
+        try:
+            row = connection.execute("select max(seen_at) from inbound_events").fetchone()
+            newest = float(row[0]) if row and row[0] is not None else None
+            active = connection.execute(
+                "select count(*) from turns where status not in ('completed','failed')"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        return newest, bool(active), ""
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        return None, False, exc.__class__.__name__
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def restart_ledger(path, cap):
+    """Restarts recorded in the last 24 hours, oldest first."""
+    cutoff = time.time() - 86400
+    entries = []
+    try:
+        with open(path) as handle:
+            entries = [float(line.strip()) for line in handle if line.strip()]
+    except (OSError, ValueError):
+        entries = []
+    entries = [stamp for stamp in entries if stamp >= cutoff]
+    return entries, len(entries) >= cap
+
+
+def record_restart(path, entries):
+    entries = entries + [time.time()]
+    tmp = path + ".tmp"
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:
+        handle.write("\n".join(f"{stamp:.0f}" for stamp in entries) + "\n")
+    os.replace(tmp, path)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--unit", required=True)
+    parser.add_argument("--database", required=True)
+    parser.add_argument("--state-dir", required=True)
+    parser.add_argument("--systemctl", default="/usr/bin/systemctl")
+    parser.add_argument("--max-silence-minutes", type=int,
+                        default=DEFAULT_MAX_SILENCE_MINUTES)
+    parser.add_argument("--daily-restart-cap", type=int,
+                        default=DEFAULT_DAILY_RESTART_CAP)
+    parser.add_argument("--apply", action="store_true",
+                        help="restart when warranted; without it this only reports")
+    args = parser.parse_args(argv)
+
+    if args.max_silence_minutes < 5 or args.daily_restart_cap < 1:
+        print(json.dumps({"status": "REJECTED",
+                          "reason": "silence window or restart cap is too small"}),
+              file=sys.stderr)
+        return 2
+
+    os.makedirs(args.state_dir, mode=0o700, exist_ok=True)
+    ledger = os.path.join(args.state_dir, "restarts")
+    now = time.time()
+
+    active = unit_property(args.systemctl, args.unit, "ActiveState")
+    newest, turn_in_flight, note = newest_inbound(args.database)
+    silent_for = None if newest is None else (now - newest) / 60.0
+
+    verdict, reason = "OK", ""
+    if active == "failed":
+        verdict, reason = "RESTART", "the unit is failed and nothing restarts it"
+    elif active != "active":
+        verdict, reason = "SKIPPED", f"unit is {active or 'unknown'}"
+    elif note:
+        verdict, reason = "DEGRADED", note
+    elif turn_in_flight:
+        verdict, reason = "OK", "a turn is in flight, so the inbound path is live"
+    elif newest is None:
+        verdict, reason = "OK", "no inbound event has ever been recorded"
+    elif silent_for >= args.max_silence_minutes:
+        verdict, reason = "RESTART", (
+            f"no inbound event for {silent_for:.0f} minutes while the unit is active")
+
+    entries, capped = restart_ledger(ledger, args.daily_restart_cap)
+    restarted = False
+    if verdict == "RESTART":
+        if capped:
+            verdict, reason = "CAPPED", (
+                f"{len(entries)} restarts in the last 24 hours reached the cap; "
+                "not flapping a service that is not recovering")
+        elif args.apply:
+            ok, _, err = run([args.systemctl, "--user", "restart", args.unit])
+            restarted = ok
+            if ok:
+                record_restart(ledger, entries)
+            else:
+                verdict, reason = "DEGRADED", f"restart failed: {err or 'unknown'}"
+
+    report = {
+        "version": VERSION,
+        "observed": utc(),
+        "unit": args.unit,
+        "active_state": active,
+        "silent_minutes": None if silent_for is None else round(silent_for, 1),
+        "max_silence_minutes": args.max_silence_minutes,
+        "turn_in_flight": turn_in_flight,
+        "restarts_last_24h": len(entries),
+        "verdict": verdict,
+        "reason": reason,
+        "applied": args.apply,
+        "restarted": restarted,
+    }
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 1 if verdict == "DEGRADED" else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -160,15 +160,50 @@ class Janitor:
         detail = {}
         worst = "OK"
         for profile in self.profiles():
-            argv = [self.args.agent_deck, "-p", profile, "session", "cleanup",
-                    "--days", str(self.args.session_retention_days)]
-            if self.apply:
-                argv.append("--yes")
-            ok, out, summary = run(argv)
-            detail[profile] = {"ok": ok, "summary": summary,
-                               "output": out.strip()[-2000:]}
+            # The CLI decides what is dead and idle; we only decide what is
+            # exempt. Its own --force is the single flag for "ignore pins", and
+            # pins have no CLI setter, so protection by title is done here by
+            # taking its candidate list and removing the exempt rows one by one.
+            ok, out, summary = run([self.args.agent_deck, "-p", profile, "session",
+                                    "cleanup", "--days",
+                                    str(self.args.session_retention_days),
+                                    "--dry-run", "--json"])
             if not ok:
+                detail[profile] = {"ok": False, "summary": summary}
                 worst = "DEGRADED"
+                continue
+            payload = load_json(out) or {}
+            candidates = payload.get("candidates")
+            if not isinstance(candidates, list):
+                detail[profile] = {"ok": False, "summary": "candidate list was not a list"}
+                worst = "DEGRADED"
+                continue
+
+            purge, exempt = [], []
+            for row in candidates:
+                if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+                    continue
+                if row.get("title") in self.args.protect_session_title:
+                    exempt.append({"id": row["id"], "title": row.get("title")})
+                    continue
+                purge.append(row)
+
+            removed, failed = [], []
+            for row in purge:
+                if not self.apply:
+                    removed.append({"id": row["id"], "title": row.get("title"),
+                                    "idle_days": row.get("idle_days")})
+                    continue
+                ok, _, summary = run([self.args.agent_deck, "-p", profile,
+                                      "session", "remove", row["id"]])
+                if ok:
+                    removed.append({"id": row["id"], "title": row.get("title"),
+                                    "idle_days": row.get("idle_days")})
+                else:
+                    failed.append({"id": row["id"], "summary": summary})
+                    worst = "DEGRADED"
+            detail[profile] = {"ok": True, "removed": removed, "exempt": exempt,
+                               "failed": failed}
         self.record("sessions", worst, retention_days=self.args.session_retention_days,
                     applied=self.apply, profiles=detail)
 
@@ -642,6 +677,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile", action="append", default=[])
     parser.add_argument("--session-retention-days", type=int, default=30)
     parser.add_argument("--empty-groups", action="store_true")
+    parser.add_argument("--protect-session-title", action="append", default=[])
     parser.add_argument("--protect-group", action="append", default=[])
     parser.add_argument("--repo", action="append", default=[])
     parser.add_argument("--artifact", action="append", default=[],

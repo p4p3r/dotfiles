@@ -72,6 +72,10 @@ let
       "--protect-group"
       name
     ]) cfg.protectedGroups
+    ++ lib.concatMap (title: [
+      "--protect-session-title"
+      title
+    ]) cfg.protectedSessionTitles
     ++ lib.concatMap (path: [
       "--repo"
       (systemdLiteral path)
@@ -139,6 +143,17 @@ in
       type = lib.types.listOf lib.types.str;
       default = [ ];
       description = "Group names or paths never deleted, however empty.";
+    };
+
+    protectedSessionTitles = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = ''
+        Session titles never purged, however long they have been dead. The CLI
+        retains pinned sessions, but a pin has no command to set it, so
+        exemption is applied here: the CLI still decides what is dead and idle,
+        and these titles are removed from its candidate list.
+      '';
     };
 
     repositoryRoots = lib.mkOption {

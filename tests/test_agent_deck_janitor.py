@@ -50,12 +50,19 @@ class JanitorCase(unittest.TestCase):
             {"name": "child", "path": "parent/child", "session_count": 1},
             {"name": "keepme", "path": "keepme", "session_count": 0},
         ]
+        self.candidates = [
+            {"id": "dead-0001", "title": "old-work", "idle_days": 40,
+             "status": "stopped", "archived": False},
+            {"id": "dead-0002", "title": "conductor-semgrep", "idle_days": 99,
+             "status": "stopped", "archived": False},
+        ]
         self.write_agent_deck()
         write_executable(self.bin / "git",
                          "#!/bin/sh\necho \"git $*\" >> \"$CALLS/git\"\nexit 0\n")
 
     def write_agent_deck(self, cleanup_exit: int = 0) -> None:
-        payload = json.dumps({"groups": self.groups})
+        payload = json.dumps({"groups": self.groups,
+                              "candidates": getattr(self, "candidates", [])})
         write_executable(self.bin / "agent-deck", f"""#!/usr/bin/env python3
 import json, os, pathlib, sys
 argv = sys.argv[1:]
@@ -67,7 +74,11 @@ if argv[2:] == ["group", "list", "--json"]:
 if argv[2:4] == ["group", "delete"]:
     sys.exit(0)
 if argv[2:4] == ["session", "cleanup"]:
-    sys.exit({cleanup_exit})
+    if {cleanup_exit}:
+        sys.exit({cleanup_exit})
+    sys.stdout.write({payload!r}); sys.exit(0)
+if argv[2:4] == ["session", "remove"]:
+    sys.exit(0)
 sys.exit(9)
 """)
 
@@ -95,18 +106,32 @@ sys.exit(9)
     def test_session_cleanup_is_a_preview_without_apply(self) -> None:
         done, report = self.run_janitor("--session-retention-days", "30")
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(report["tasks"]["sessions"]["status"], "OK")
-        line = [c for c in self.agent_deck_calls() if "session cleanup" in c]
-        self.assertEqual(len(line), 1)
-        self.assertIn("--days 30", line[0])
-        self.assertNotIn("--yes", line[0],
-                         "a preview must never pass --yes")
+        task = report["tasks"]["sessions"]
+        self.assertEqual(task["status"], "OK")
+        self.assertEqual([r["id"] for r in task["profiles"]["default"]["removed"]],
+                         ["dead-0001", "dead-0002"])
+        line = [c for c in self.agent_deck_calls() if "session cleanup" in c][0]
+        self.assertIn("--days 30", line)
+        self.assertIn("--dry-run", line)
+        self.assertEqual([c for c in self.agent_deck_calls() if "session remove" in c],
+                         [], "a preview must remove nothing")
 
-    def test_session_cleanup_applies_only_with_apply(self) -> None:
+    def test_session_cleanup_removes_candidates_with_apply(self) -> None:
         _, report = self.run_janitor("--session-retention-days", "30", apply=True)
         self.assertTrue(report["tasks"]["sessions"]["applied"])
-        line = [c for c in self.agent_deck_calls() if "session cleanup" in c][0]
-        self.assertIn("--yes", line)
+        removals = [c for c in self.agent_deck_calls() if "session remove" in c]
+        self.assertEqual(removals, ["-p default session remove dead-0001",
+                                    "-p default session remove dead-0002"])
+
+    def test_a_protected_title_is_never_purged(self) -> None:
+        _, report = self.run_janitor("--protect-session-title", "conductor-semgrep",
+                                     apply=True)
+        profile = report["tasks"]["sessions"]["profiles"]["default"]
+        self.assertEqual([r["id"] for r in profile["removed"]], ["dead-0001"])
+        self.assertEqual([r["title"] for r in profile["exempt"]], ["conductor-semgrep"])
+        removals = [c for c in self.agent_deck_calls() if "session remove" in c]
+        self.assertEqual(removals, ["-p default session remove dead-0001"],
+                         "the conductor row must survive even when dead and idle")
 
     def test_worktrees_are_never_pruned_by_the_session_sweep(self) -> None:
         # --prune-worktree destroys uncommitted work and is not this tool's call.

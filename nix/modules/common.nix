@@ -10,6 +10,7 @@ in {
     ./agent-cli-updates.nix
     ./agent-deck-archive-only-custodian.nix
     ./agent-deck-control.nix
+    ./agent-deck-janitor.nix
     ./agent-deck-maintenance.nix
     ./agent-deck-pr-warden.nix
     ./agent-deck-slack-watchdog.nix
@@ -66,8 +67,8 @@ in {
     terraform-docs
     clang-tools
 
-    # Go on the plain login PATH, not only inside a devshell. lightspeed
-    # (`lx`, semgrep/lightspeed) builds itself with Go: `make install` for the
+    # Go on the plain login PATH, not only inside a devshell. A work CLI
+    # installed outside Nix builds itself with Go: `make install` for the
     # initial install, and its self-update prompt fetches and rebuilds main
     # with gh + git + Go. Both run from an ordinary shell, where the devshell
     # toolchains in nix/devshells and nix/lib/devtoolchain.nix are not active.

@@ -21,7 +21,7 @@
       "nikitabobko/tap"
       "FelixKratz/formulae"
 
-      # coder CLI, required by lightspeed (`lx`) — semgrep/lightspeed.
+      # coder CLI, required by a work CLI installed outside Nix.
       "coder/coder"
     ];
 
@@ -60,7 +60,7 @@
       # the better-tested one here.
       "wireguard-tools"
 
-      # The coder CLI that lightspeed (`lx`) wraps. Its README installs it from
+      # The coder CLI that a work CLI wraps. Its README installs it from
       # this tap, which tracks upstream releases more closely than nixpkgs.
       "coder/coder/coder"
 
@@ -115,7 +115,7 @@
       "superset"
       "stats"
       "switchresx"
-      # lightspeed's `lx t3` hands a Coder workspace to this app, which it
+      # A work CLI hands a Coder workspace to this app, which it
       # expects to find in /Applications.
       "t3-code"
       "visual-studio-code"

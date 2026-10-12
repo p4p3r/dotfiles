@@ -1,0 +1,465 @@
+#!/usr/bin/env python3
+"""Deterministic Agent Deck and workspace janitor.
+
+The maintenance controller and fleet custodian in this repository are
+report-only by charter: they observe and never act. This is the acting half,
+and it is deliberately not an agent turn. Every rule here is mechanical, every
+destructive step is bounded by an explicit configured root, and nothing runs
+without --apply.
+
+Tasks are independent. One failing task degrades its own result and never
+suppresses or aborts another, because a janitor that stops at the first error
+silently stops maintaining everything behind it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+VERSION = 1
+NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+GROUP_PATH = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._/-]{0,255}\Z")
+# A destructive root must be specific. Fewer components than this and a typo
+# reaches a home directory or a filesystem root.
+MIN_ARTIFACT_DEPTH = 2
+MAX_ENTRIES_PER_ROOT = 4096
+DEFAULT_COMMAND_TIMEOUT = 300
+
+
+class Rejected(Exception):
+    """An input that cannot be made safe, so it is never partially applied."""
+
+
+def utc() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def run(argv, timeout=DEFAULT_COMMAND_TIMEOUT):
+    """Run one argv with no shell. Returns (ok, stdout, summary)."""
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True,
+                              timeout=timeout, check=False)
+    except FileNotFoundError:
+        return False, "", "executable not found"
+    except subprocess.TimeoutExpired:
+        return False, "", f"timed out after {timeout}s"
+    except OSError as exc:
+        return False, "", f"{exc.__class__.__name__}"
+    if done.returncode != 0:
+        tail = (done.stderr or done.stdout or "").strip().splitlines()
+        return False, done.stdout, f"exit {done.returncode}: {tail[-1] if tail else 'no output'}"
+    return True, done.stdout, "ok"
+
+
+def load_json(text):
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
+def parse_artifact_rule(value: str) -> tuple[str, int]:
+    """ROOT:DAYS, where ROOT is absolute and DAYS is a positive integer."""
+    path, _, days = value.rpartition(":")
+    if not path or not days:
+        raise Rejected(f"artifact rule {value!r} must be ROOT:DAYS")
+    if not days.isdigit() or int(days) < 1:
+        raise Rejected(f"artifact rule {value!r} needs a positive day count")
+    if not path.startswith("/"):
+        raise Rejected(f"artifact root {path!r} must be absolute")
+    normalized = os.path.normpath(path)
+    if normalized != path.rstrip("/") and normalized != path:
+        raise Rejected(f"artifact root {path!r} must already be normalized")
+    if len([p for p in normalized.split("/") if p]) < MIN_ARTIFACT_DEPTH:
+        raise Rejected(f"artifact root {path!r} is too shallow to delete under")
+    return normalized, int(days)
+
+
+class Janitor:
+    def __init__(self, args):
+        self.args = args
+        self.apply = args.apply
+        self.results = {}
+
+    def record(self, task, status, **fields):
+        entry = {"status": status, "observed": utc()}
+        entry.update(fields)
+        self.results[task] = entry
+
+    # -- profiles -----------------------------------------------------------
+
+    def profiles(self):
+        """Configured profiles, or every valid local one when none are given."""
+        if self.args.profile:
+            return list(self.args.profile)
+        root = os.path.expanduser("~/.local/share/agent-deck/profiles")
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            return ["default"]
+        found = []
+        for name in names:
+            if not NAME.match(name):
+                continue
+            path = os.path.join(root, name)
+            if os.path.islink(path) or not os.path.isdir(path):
+                continue
+            found.append(name)
+        return found or ["default"]
+
+    # -- sessions -----------------------------------------------------------
+
+    def sweep_sessions(self):
+        """Delegate to `session cleanup`, which already encodes the hard rules.
+
+        It purges only sessions with no live tmux pane that have also been
+        inactive for the retention window, skips archived, retains pinned, and
+        keeps worktrees and transcripts. --prune-worktree is deliberately never
+        passed: uncommitted work is not this tool's to destroy.
+        """
+        detail = {}
+        worst = "OK"
+        for profile in self.profiles():
+            argv = [self.args.agent_deck, "-p", profile, "session", "cleanup",
+                    "--days", str(self.args.session_retention_days)]
+            if self.apply:
+                argv.append("--yes")
+            ok, out, summary = run(argv)
+            detail[profile] = {"ok": ok, "summary": summary,
+                               "output": out.strip()[-2000:]}
+            if not ok:
+                worst = "DEGRADED"
+        self.record("sessions", worst, retention_days=self.args.session_retention_days,
+                    applied=self.apply, profiles=detail)
+
+    # -- groups -------------------------------------------------------------
+
+    def sweep_groups(self):
+        """Delete only groups that hold no sessions and nothing beneath them.
+
+        A group whose path is a prefix of another group's path is a parent, and
+        deleting it would reparent or strand its children, so it is retained
+        however empty it looks.
+        """
+        if not self.args.empty_groups:
+            self.record("groups", "SKIPPED")
+            return
+        detail = {}
+        worst = "OK"
+        for profile in self.profiles():
+            ok, out, summary = run([self.args.agent_deck, "-p", profile,
+                                    "group", "list", "--json"])
+            if not ok:
+                detail[profile] = {"ok": False, "summary": summary}
+                worst = "DEGRADED"
+                continue
+            payload = load_json(out)
+            groups = payload.get("groups") if isinstance(payload, dict) else payload
+            if not isinstance(groups, list):
+                detail[profile] = {"ok": False, "summary": "group list was not a list"}
+                worst = "DEGRADED"
+                continue
+
+            paths = [g.get("path") for g in groups if isinstance(g, dict)]
+            removed, kept, failed = [], [], []
+            for group in groups:
+                if not isinstance(group, dict):
+                    continue
+                name, path = group.get("name"), group.get("path")
+                count = group.get("session_count")
+                if not isinstance(name, str) or not isinstance(path, str):
+                    continue
+                if not GROUP_PATH.match(path) or not NAME.match(name):
+                    kept.append({"path": path, "reason": "unsafe name"})
+                    continue
+                if count != 0:
+                    continue
+                if name in self.args.protect_group or path in self.args.protect_group:
+                    kept.append({"path": path, "reason": "protected"})
+                    continue
+                if any(other != path and other.startswith(path + "/") for other in paths
+                       if isinstance(other, str)):
+                    kept.append({"path": path, "reason": "has descendants"})
+                    continue
+                if not self.apply:
+                    removed.append(path)
+                    continue
+                ok, _, summary = run([self.args.agent_deck, "-p", profile,
+                                      "group", "delete", path])
+                if ok:
+                    removed.append(path)
+                else:
+                    failed.append({"path": path, "summary": summary})
+                    worst = "DEGRADED"
+            detail[profile] = {"ok": True, "removed": removed, "kept": kept,
+                               "failed": failed}
+        self.record("groups", worst, applied=self.apply, profiles=detail)
+
+    # -- worktrees ----------------------------------------------------------
+
+    def prune_worktrees(self):
+        """`git worktree prune` only.
+
+        This removes administrative entries whose working directory is already
+        gone. It cannot delete a worktree that still exists, so it can never
+        destroy work. Removing live worktrees would need clean/pushed/protected
+        checks and stays out of scope.
+        """
+        if not self.args.repo:
+            self.record("worktrees", "SKIPPED")
+            return
+        detail = {}
+        worst = "OK"
+        for repo in self.args.repo:
+            if not os.path.isdir(os.path.join(repo, ".git")) and not os.path.isdir(repo):
+                detail[repo] = {"ok": False, "summary": "not a directory"}
+                worst = "DEGRADED"
+                continue
+            argv = [self.args.git, "-C", repo, "worktree", "prune", "-v"]
+            if not self.apply:
+                argv.append("--dry-run")
+            ok, out, summary = run(argv)
+            detail[repo] = {"ok": ok, "summary": summary,
+                            "pruned": [l for l in out.strip().splitlines() if l][:64]}
+            if not ok:
+                worst = "DEGRADED"
+        self.record("worktrees", worst, applied=self.apply, repositories=detail)
+
+    # -- nix store ----------------------------------------------------------
+
+    def collect_nix_garbage(self):
+        if self.args.nix_generations_days is None:
+            self.record("nix", "SKIPPED")
+            return
+        nix_collect = shutil.which("nix-collect-garbage")
+        if not nix_collect:
+            self.record("nix", "SKIPPED", reason="nix-collect-garbage not on PATH")
+            return
+        argv = [nix_collect, "--delete-older-than", f"{self.args.nix_generations_days}d"]
+        if not self.apply:
+            argv.append("--dry-run")
+        ok, out, summary = run(argv, timeout=self.args.nix_timeout)
+        self.record("nix", "OK" if ok else "DEGRADED", applied=self.apply,
+                    summary=summary, output=out.strip()[-2000:])
+
+    # -- build artifacts ----------------------------------------------------
+
+    def sweep_artifacts(self):
+        """Delete entries directly under each configured root, by age.
+
+        Only the immediate children of a root are considered, so one stale rule
+        cannot walk a whole filesystem. Symlinks are removed as links and never
+        followed, which keeps a symlink inside a scratch root from reaching
+        anything outside it.
+        """
+        if not self.args.artifact:
+            self.record("artifacts", "SKIPPED")
+            return
+        now = time.time()
+        detail = {}
+        worst = "OK"
+        for rule in self.args.artifact:
+            root, days = rule
+            cutoff = now - days * 86400
+            entry = {"older_than_days": days, "removed": [], "failed": [],
+                     "bytes": 0, "truncated": False}
+            if os.path.islink(root) or not os.path.isdir(root):
+                entry["skipped"] = "root is missing or not a directory"
+                detail[root] = entry
+                continue
+            try:
+                names = sorted(os.listdir(root))
+            except OSError as exc:
+                entry["skipped"] = exc.__class__.__name__
+                worst = "DEGRADED"
+                detail[root] = entry
+                continue
+            if len(names) > MAX_ENTRIES_PER_ROOT:
+                names = names[:MAX_ENTRIES_PER_ROOT]
+                entry["truncated"] = True
+            for name in names:
+                path = os.path.join(root, name)
+                if self.effective_mtime(path) >= cutoff:
+                    continue
+                if self.args.keep_pattern and any(
+                        re.search(p, name) for p in self.args.keep_pattern):
+                    continue
+                entry["bytes"] += self.size_of(path)
+                if not self.apply:
+                    entry["removed"].append(path)
+                    continue
+                try:
+                    if os.path.islink(path) or not os.path.isdir(path):
+                        os.unlink(path)
+                    else:
+                        shutil.rmtree(path)
+                    entry["removed"].append(path)
+                except OSError as exc:
+                    entry["failed"].append({"path": path,
+                                            "error": exc.__class__.__name__})
+                    worst = "DEGRADED"
+            detail[root] = entry
+        self.record("artifacts", worst, applied=self.apply, roots=detail)
+
+    @staticmethod
+    def effective_mtime(path) -> float:
+        """Age of an entry, counting its immediate children.
+
+        A directory's own mtime moves only when its direct entries change, so a
+        build tree whose churn happens deeper down can look untouched for
+        months while it is in active use. Checking one level in catches that at
+        the cost of a single listdir. ctime is deliberately not consulted: it
+        moves for metadata changes that say nothing about whether the content
+        is still wanted.
+        """
+        try:
+            newest = os.lstat(path).st_mtime
+        except OSError:
+            return time.time()
+        if os.path.islink(path) or not os.path.isdir(path):
+            return newest
+        try:
+            names = os.listdir(path)[:MAX_ENTRIES_PER_ROOT]
+        except OSError:
+            return time.time()
+        for name in names:
+            try:
+                newest = max(newest, os.lstat(os.path.join(path, name)).st_mtime)
+            except OSError:
+                continue
+        return newest
+
+    @staticmethod
+    def size_of(path) -> int:
+        try:
+            info = os.lstat(path)
+        except OSError:
+            return 0
+        if not os.path.isdir(path) or os.path.islink(path):
+            return info.st_size
+        total = 0
+        for current, dirs, files in os.walk(path, followlinks=False):
+            for name in files:
+                try:
+                    total += os.lstat(os.path.join(current, name)).st_size
+                except OSError:
+                    continue
+        return total
+
+    # -- drift --------------------------------------------------------------
+
+    def report_drift(self):
+        """Observation only. Source is never pulled or applied by a timer."""
+        if not self.args.repo:
+            self.record("drift", "SKIPPED")
+            return
+        detail = {}
+        for repo in self.args.repo:
+            ok, out, summary = run([self.args.git, "-C", repo, "status",
+                                    "--porcelain=v1", "--branch"], timeout=60)
+            if not ok:
+                detail[repo] = {"ok": False, "summary": summary}
+                continue
+            lines = out.splitlines()
+            branch = lines[0] if lines else ""
+            detail[repo] = {
+                "ok": True,
+                "dirty_files": max(0, len(lines) - 1),
+                "ahead": "ahead" in branch,
+                "behind": "behind" in branch,
+            }
+        self.record("drift", "OK", repositories=detail)
+
+    # -- driver -------------------------------------------------------------
+
+    def run_all(self):
+        self.sweep_sessions()
+        self.sweep_groups()
+        self.prune_worktrees()
+        self.collect_nix_garbage()
+        self.sweep_artifacts()
+        self.report_drift()
+        degraded = [t for t, r in self.results.items() if r["status"] == "DEGRADED"]
+        return {
+            "version": VERSION,
+            "started": self.started,
+            "finished": utc(),
+            "applied": self.apply,
+            "status": "DEGRADED" if degraded else "OK",
+            "degraded_tasks": sorted(degraded),
+            "tasks": self.results,
+        }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--agent-deck", required=True)
+    parser.add_argument("--git", default="git")
+    parser.add_argument("--state-dir", required=True)
+    parser.add_argument("--report-root")
+    parser.add_argument("--profile", action="append", default=[])
+    parser.add_argument("--session-retention-days", type=int, default=30)
+    parser.add_argument("--empty-groups", action="store_true")
+    parser.add_argument("--protect-group", action="append", default=[])
+    parser.add_argument("--repo", action="append", default=[])
+    parser.add_argument("--artifact", action="append", default=[],
+                        metavar="ROOT:DAYS")
+    parser.add_argument("--keep-pattern", action="append", default=[])
+    parser.add_argument("--nix-generations-days", type=int, default=None)
+    parser.add_argument("--nix-timeout", type=int, default=1800)
+    parser.add_argument("--apply", action="store_true",
+                        help="perform deletions; without it every task is a preview")
+    return parser
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        if args.session_retention_days < 1:
+            raise Rejected("--session-retention-days must be positive")
+        args.artifact = [parse_artifact_rule(rule) for rule in args.artifact]
+        for pattern in args.keep_pattern:
+            re.compile(pattern)
+    except (Rejected, re.error) as exc:
+        print(json.dumps({"status": "REJECTED", "reason": str(exc)}), file=sys.stderr)
+        return 2
+
+    os.makedirs(args.state_dir, mode=0o700, exist_ok=True)
+    lock_path = os.path.join(args.state_dir, "janitor.lock")
+    handle = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # Another invocation owns the box. Overlapping deletions are how a
+            # janitor races itself into deleting what the other is reading.
+            print(json.dumps({"status": "LOCKED"}), file=sys.stderr)
+            return 3
+
+        janitor = Janitor(args)
+        janitor.started = utc()
+        report = janitor.run_all()
+    finally:
+        os.close(handle)
+
+    body = json.dumps(report, indent=2, sort_keys=True)
+    if args.report_root:
+        os.makedirs(args.report_root, mode=0o700, exist_ok=True)
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        path = os.path.join(args.report_root, f"janitor-{stamp}.json")
+        with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as fh:
+            fh.write(body + "\n")
+    print(body)
+    return 1 if report["status"] == "DEGRADED" else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

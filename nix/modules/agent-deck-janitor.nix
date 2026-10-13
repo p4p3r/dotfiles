@@ -284,9 +284,11 @@ in
       type = lib.types.listOf lib.types.str;
       default = [ ];
       description = ''
-        Socket names that are never probed, killed or deleted. The socket the
-        conductor's panes live on belongs here, so a transient probe failure
-        can never unlink it.
+        Socket files that are never deleted, whatever their server reports.
+        The socket the conductor's panes live on belongs here, so a transient
+        probe failure can never unlink it. Sessions on a protected socket are
+        still judged by the ordinary rules: that socket is also where test
+        harnesses leave their litter.
       '';
     };
 

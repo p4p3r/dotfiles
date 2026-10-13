@@ -775,7 +775,8 @@ class Janitor:
         Three conditions must all hold before a session is killed, and any one
         of them alone keeps it: no Agent Deck row claims the name, no client is
         attached, and the session has been idle past the window. A socket file
-        is deleted only when its server does not answer at all.
+        is deleted only when its server does not answer at all, and a protected
+        socket file is never deleted whatever its server says.
         """
         if not self.args.tmux_socket_root:
             self.record("tmux", "SKIPPED")
@@ -822,9 +823,13 @@ class Janitor:
                 if info.st_uid != os.getuid():
                     entry["foreign"] += 1
                     continue
-                if name in protected:
+                # Protection covers the socket file, not the sessions on it.
+                # The conductor's socket also carries the test harness litter
+                # this task exists for, and skipping it whole hid 45 abandoned
+                # sessions. A live pane is already safe three other ways.
+                keep_socket = name in protected
+                if keep_socket:
                     entry["protected"] += 1
-                    continue
                 alive, sessions = self.tmux_sessions(path)
                 if alive:
                     for session, attached, activity in sessions:
@@ -846,7 +851,7 @@ class Janitor:
                     # A server exits with its last session, so ask again rather
                     # than assume either outcome.
                     alive, _ = self.tmux_sessions(path)
-                if alive:
+                if alive or keep_socket:
                     continue
                 if not self.apply:
                     entry["sockets_removed"].append(name)

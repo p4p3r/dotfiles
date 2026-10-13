@@ -833,7 +833,7 @@ sys.exit(2)
         self.assertEqual(self.entry(task)["killed"], [])
         self.assertEqual(self.entry(task)["retained"], 1)
 
-    def test_a_protected_socket_is_never_probed_or_removed(self) -> None:
+    def test_a_protected_socket_file_is_never_removed(self) -> None:
         path = self.add_socket("agent-deck")
         _, task = self.run_janitor("--protect-tmux-socket", "agent-deck", apply=True)
         entry = self.entry(task)
@@ -841,6 +841,22 @@ sys.exit(2)
         self.assertEqual(entry["sockets_removed"], [])
         self.assertTrue(path.exists(),
                         "the conductor's socket must survive a dead-server probe")
+
+    def test_litter_on_a_protected_socket_is_still_reaped(self) -> None:
+        # The conductor's socket is also where a test harness left 45 abandoned
+        # sessions. Protecting the file must not protect what runs on it.
+        self.rows = [{"id": "row-1", "tmux_session": "agentdeck_conductor-semgrep_cae48990"}]
+        self.write_agent_deck()
+        path = self.add_socket("agent-deck",
+                               [["agentdeck_conductor-semgrep_cae48990", 0, self.idle(400)],
+                                ["agentdeck_test-svcok-04c15a74_6511100d", 0, self.idle(30)]])
+        _, task = self.run_janitor("--protect-tmux-socket", "agent-deck", apply=True)
+        entry = self.entry(task)
+        self.assertEqual([k["session"] for k in entry["killed"]],
+                         ["agentdeck_test-svcok-04c15a74_6511100d"])
+        self.assertEqual(entry["retained"], 1, "the claimed conductor pane stays")
+        self.assertEqual(entry["sockets_removed"], [])
+        self.assertTrue(path.exists())
 
     def test_only_one_session_of_a_server_is_killed_and_the_socket_stays(self) -> None:
         path = self.add_socket("mixed", [["agentdeck_old_1", 0, self.idle(30)],

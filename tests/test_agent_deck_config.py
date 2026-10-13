@@ -134,7 +134,12 @@ class AgentDeckConfigCase(unittest.TestCase):
 
     @staticmethod
     def _render_agent_deck_template(
-        root: Path, state_tag: str, *, conductor_name: str, backend: str
+        root: Path,
+        state_tag: str,
+        *,
+        conductor_name: str,
+        backend: str,
+        extra_env: dict[str, str] | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], dict]:
         home = root / "home"
         home.mkdir(exist_ok=True)
@@ -149,6 +154,7 @@ class AgentDeckConfigCase(unittest.TestCase):
             "SLACK_DECK_CHANNEL": "synthetic-channel",
             "SLACK_DECK_USER": "synthetic-user-id",
         }
+        env.update(extra_env or {})
         result = subprocess.run(
             [
                 CHEZMOI,
@@ -524,6 +530,34 @@ exit "$result"
             )
             self.assertEqual(0, absent.returncode, absent.stdout + absent.stderr)
             self.assertNotIn("conductors", legacy_config)
+
+    @unittest.skipUnless(CHEZMOI, "chezmoi is required for the render contract")
+    def test_segment_mode_defaults_to_channel_stream_and_opts_in_by_env(self) -> None:
+        # The public template carries the switch; the decision and the identity
+        # of the host making it stay in private configuration.
+        with tempfile.TemporaryDirectory(prefix="agent-deck-segment-mode.") as temp:
+            root = Path(temp)
+            default, default_config = self._render_agent_deck_template(
+                root, "default", conductor_name="example-conductor", backend="slack-v2"
+            )
+            self.assertEqual(0, default.returncode, default.stdout + default.stderr)
+            self.assertEqual(
+                "channel_stream",
+                default_config["conductors"]["example-conductor"]["slack_v2"]["segment_mode"],
+            )
+
+            opted, opted_config = self._render_agent_deck_template(
+                root,
+                "opted",
+                conductor_name="example-conductor",
+                backend="slack-v2",
+                extra_env={"AGENTDECK_SLACK_SEGMENT_MODE": "thread_segments"},
+            )
+            self.assertEqual(0, opted.returncode, opted.stdout + opted.stderr)
+            self.assertEqual(
+                "thread_segments",
+                opted_config["conductors"]["example-conductor"]["slack_v2"]["segment_mode"],
+            )
 
     def test_pinned_custom_policy_skips_agent_deck_but_keeps_other_updates(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent-deck-update-pinned.") as temp:

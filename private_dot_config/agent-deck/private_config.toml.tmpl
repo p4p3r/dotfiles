@@ -232,6 +232,15 @@ mcp_default_scope = ""
     allowed_user_ids = ["$SLACK_DECK_USER"]
     row_instance_id = "$AGENTDECK_CONDUCTOR_ROW_ID"
     row_binding_token = "$AGENTDECK_CONDUCTOR_ROW_BINDING"
+    # channel_stream treats the channel as a flat log and answers every allowed
+    # message: correct when a channel carries exactly one conductor.
+    # thread_segments answers a top-level message only when it mentions this
+    # bot, then keeps the thread it opened without another mention, which is
+    # what lets several conductors share one channel. A host that wants it
+    # exports AGENTDECK_SLACK_SEGMENT_MODE=thread_segments from its own private
+    # configuration; this repository is public and holds neither that decision
+    # nor the identity of the host making it.
+    segment_mode = "{{ env "AGENTDECK_SLACK_SEGMENT_MODE" | default "channel_stream" }}"
     codex_executable = {{ printf "%s/.npm-global/bin/codex" .chezmoi.homeDir | quote }}
 {{ end }}
 

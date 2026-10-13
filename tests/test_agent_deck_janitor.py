@@ -906,6 +906,93 @@ sys.exit(2)
         self.assertEqual(json.loads(done.stderr)["status"], "REJECTED")
 
 
+class RetentionWindowCase(JanitorCase):
+    """Different kinds of row age out at different rates."""
+
+    def write_cleanup(self, rows) -> None:
+        payload = json.dumps({"candidates": rows, "groups": self.groups})
+        write_executable(self.bin / "agent-deck", f"""#!/usr/bin/env python3
+import json, os, pathlib, sys
+argv = sys.argv[1:]
+(pathlib.Path(os.environ["CALLS"]) / "agent-deck").open("a").write(" ".join(argv) + chr(10))
+if argv[2:4] == ["session", "cleanup"]:
+    sys.stdout.write({payload!r}); sys.exit(0)
+if argv[2:4] == ["session", "remove"]:
+    sys.exit(0)
+sys.stdout.write({payload!r}); sys.exit(0)
+""")
+
+    def removed_ids(self, report):
+        return [r["id"] for r in report["tasks"]["sessions"]["profiles"]["default"]["removed"]]
+
+    def test_a_stopped_row_ages_out_faster_than_a_quiet_one(self) -> None:
+        # A conductor fleet makes stopped rows by the dozen for one piece of
+        # work and never returns to them; a merely quiet row may still be live
+        # work an operator left running.
+        self.write_cleanup([
+            {"id": "stopped-old", "title": "impl", "status": "stopped", "idle_days": 4, "archived": False},
+            {"id": "stopped-young", "title": "impl", "status": "stopped", "idle_days": 1, "archived": False},
+            {"id": "quiet-mid", "title": "orch", "status": "waiting", "idle_days": 4, "archived": False},
+            {"id": "quiet-old", "title": "orch", "status": "waiting", "idle_days": 9, "archived": False},
+        ])
+        _, report = self.run_janitor("--session-retention-days", "7",
+                                     "--stopped-retention-days", "3", apply=True)
+        self.assertEqual(["stopped-old", "quiet-old"], self.removed_ids(report))
+        self.assertEqual(2, report["tasks"]["sessions"]["profiles"]["default"]["young"])
+
+    def test_archived_rows_are_purged_only_when_a_window_exists(self) -> None:
+        # Nothing has ever reclaimed an archived row: the CLI does not offer
+        # one unless asked, so they are invisible in the TUI and permanent in
+        # the registry.
+        rows = [{"id": "archived-old", "title": "old", "status": "stopped",
+                 "idle_days": 40, "archived": True}]
+        self.write_cleanup(rows)
+        _, without = self.run_janitor("--session-retention-days", "7", apply=True)
+        self.assertEqual([], self.removed_ids(without))
+        self.assertNotIn("--include-archived", " ".join(self.agent_deck_calls()))
+
+        self.write_cleanup(rows)
+        _, with_window = self.run_janitor("--session-retention-days", "7",
+                                          "--archived-retention-days", "30", apply=True)
+        self.assertEqual(["archived-old"], self.removed_ids(with_window))
+        self.assertIn("--include-archived", " ".join(self.agent_deck_calls()))
+
+    def test_an_archived_row_inside_its_window_is_kept(self) -> None:
+        self.write_cleanup([{"id": "archived-young", "title": "recent", "status": "stopped",
+                             "idle_days": 10, "archived": True}])
+        _, report = self.run_janitor("--session-retention-days", "7",
+                                     "--stopped-retention-days", "3",
+                                     "--archived-retention-days", "30", apply=True)
+        self.assertEqual([], self.removed_ids(report))
+
+    def test_the_widest_window_is_asked_for_once(self) -> None:
+        # Asking per window would race: a row can change status between two
+        # listings, and then belong to neither answer.
+        self.write_cleanup([])
+        self.run_janitor("--session-retention-days", "7", "--stopped-retention-days", "3",
+                         "--archived-retention-days", "30", apply=True)
+        cleanups = [c for c in self.agent_deck_calls() if "session cleanup" in c]
+        self.assertEqual(1, len(cleanups), cleanups)
+        self.assertIn("--days 3", cleanups[0])
+
+    def test_a_stopped_window_longer_than_the_general_one_is_rejected(self) -> None:
+        done, _ = self.run_janitor("--session-retention-days", "7",
+                                   "--stopped-retention-days", "30")
+        self.assertEqual(2, done.returncode)
+        self.assertEqual("REJECTED", json.loads(done.stderr)["status"])
+
+    def test_a_protected_title_survives_every_window(self) -> None:
+        self.write_cleanup([{"id": "conductor", "title": "conductor-semgrep",
+                             "status": "stopped", "idle_days": 99, "archived": True}])
+        _, report = self.run_janitor("--session-retention-days", "7",
+                                     "--stopped-retention-days", "3",
+                                     "--archived-retention-days", "30",
+                                     "--protect-session-title", "conductor-semgrep", apply=True)
+        self.assertEqual([], self.removed_ids(report))
+        profile = report["tasks"]["sessions"]["profiles"]["default"]
+        self.assertEqual(["conductor-semgrep"], [r["title"] for r in profile["exempt"]])
+
+
 class RemovalEdgeCase(JanitorCase):
     """Two failures seen on the first armed run of a live box."""
 

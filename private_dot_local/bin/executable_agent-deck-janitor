@@ -171,52 +171,94 @@ class Janitor:
 
     # -- sessions -----------------------------------------------------------
 
+    def cleanup_candidates(self, profile, days, include_archived):
+        """One `session cleanup --dry-run` listing, or None when it fails.
+
+        The CLI decides what is dead and idle; this only reads its answer.
+        """
+        argv = [self.args.agent_deck, "-p", profile, "session", "cleanup",
+                "--days", str(days), "--dry-run", "--json"]
+        if include_archived:
+            argv.append("--include-archived")
+        ok, out, summary = run(argv)
+        if not ok:
+            return None, summary
+        payload = load_json(out)
+        if not isinstance(payload, dict):
+            return None, "cleanup did not return an object"
+        # With nothing to purge the CLI answers in a different shape --
+        # {"count": 0, "removed": [], "skipped": 0, "success": true} and no
+        # candidates key at all -- so an absent list means an empty one,
+        # not a malformed reply.
+        candidates = payload.get("candidates")
+        if candidates is None and (payload.get("success") or payload.get("count") == 0):
+            candidates = []
+        if not isinstance(candidates, list):
+            return None, "candidate list was not a list"
+        return candidates, "ok"
+
+    def retention_for(self, row):
+        """Days a row must have been idle before it may be purged.
+
+        A stopped row is one an agent finished with: the conductor fleet
+        creates these by the dozen for a single piece of work and they are
+        never returned to, so they age out faster than a row that merely went
+        quiet. An archived row is already invisible, which is why nothing ever
+        reclaimed one; it gets the longest window rather than none at all.
+        """
+        if row.get("archived"):
+            return self.args.archived_retention_days
+        if row.get("status") == "stopped" and self.args.stopped_retention_days:
+            return self.args.stopped_retention_days
+        return self.args.session_retention_days
+
     def sweep_sessions(self):
         """Delegate to `session cleanup`, which already encodes the hard rules.
 
         It purges only sessions with no live tmux pane that have also been
-        inactive for the retention window, skips archived, retains pinned, and
-        keeps worktrees and transcripts. --prune-worktree is deliberately never
-        passed: uncommitted work is not this tool's to destroy.
+        inactive for the retention window, retains pinned, and keeps worktrees
+        and transcripts. --prune-worktree is deliberately never passed:
+        uncommitted work is not this tool's to destroy.
+
+        Windows differ by what a row is, so the CLI is asked for the widest
+        candidate set -- the shortest window, archived included -- and each row
+        is then held to its own. Asking per window instead would race: a row
+        can change status between two listings.
         """
         detail = {}
         worst = "OK"
+        windows = [self.args.session_retention_days]
+        if self.args.stopped_retention_days:
+            windows.append(self.args.stopped_retention_days)
+        if self.args.archived_retention_days:
+            windows.append(self.args.archived_retention_days)
+        widest = min(windows)
         for profile in self.profiles():
-            # The CLI decides what is dead and idle; we only decide what is
-            # exempt. Its own --force is the single flag for "ignore pins", and
-            # pins have no CLI setter, so protection by title is done here by
-            # taking its candidate list and removing the exempt rows one by one.
-            ok, out, summary = run([self.args.agent_deck, "-p", profile, "session",
-                                    "cleanup", "--days",
-                                    str(self.args.session_retention_days),
-                                    "--dry-run", "--json"])
-            if not ok:
+            # Its own --force is the single flag for "ignore pins", and pins
+            # have no CLI setter, so protection by title is done here by taking
+            # its candidate list and removing the exempt rows one by one.
+            candidates, summary = self.cleanup_candidates(
+                profile, widest, bool(self.args.archived_retention_days))
+            if candidates is None:
                 detail[profile] = {"ok": False, "summary": summary}
                 worst = "DEGRADED"
                 continue
-            payload = load_json(out)
-            if not isinstance(payload, dict):
-                detail[profile] = {"ok": False, "summary": "cleanup did not return an object"}
-                worst = "DEGRADED"
-                continue
-            # With nothing to purge the CLI answers in a different shape --
-            # {"count": 0, "removed": [], "skipped": 0, "success": true} and no
-            # candidates key at all -- so an absent list means an empty one,
-            # not a malformed reply.
-            candidates = payload.get("candidates")
-            if candidates is None and (payload.get("success") or payload.get("count") == 0):
-                candidates = []
-            if not isinstance(candidates, list):
-                detail[profile] = {"ok": False, "summary": "candidate list was not a list"}
-                worst = "DEGRADED"
-                continue
 
-            purge, exempt = [], []
+            purge, exempt, young = [], [], 0
             for row in candidates:
                 if not isinstance(row, dict) or not isinstance(row.get("id"), str):
                     continue
                 if row.get("title") in self.args.protect_session_title:
                     exempt.append({"id": row["id"], "title": row.get("title")})
+                    continue
+                window = self.retention_for(row)
+                if not window:
+                    # Archived rows are listed only when a window exists for
+                    # them, so this is the "never purge archived" setting.
+                    continue
+                idle = row.get("idle_days")
+                if isinstance(idle, (int, float)) and idle < window:
+                    young += 1
                     continue
                 purge.append(row)
 
@@ -240,8 +282,10 @@ class Janitor:
                     failed.append({"id": row["id"], "summary": summary})
                     worst = "DEGRADED"
             detail[profile] = {"ok": True, "removed": removed, "exempt": exempt,
-                               "revived": revived, "failed": failed}
+                               "revived": revived, "failed": failed, "young": young}
         self.record("sessions", worst, retention_days=self.args.session_retention_days,
+                    stopped_retention_days=self.args.stopped_retention_days,
+                    archived_retention_days=self.args.archived_retention_days,
                     applied=self.apply, profiles=detail)
 
     # -- groups -------------------------------------------------------------
@@ -898,6 +942,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--report-root")
     parser.add_argument("--profile", action="append", default=[])
     parser.add_argument("--session-retention-days", type=int, default=30)
+    parser.add_argument("--stopped-retention-days", type=int, default=0,
+                        help="shorter window for rows an agent already finished with; 0 uses --session-retention-days")
+    parser.add_argument("--archived-retention-days", type=int, default=0,
+                        help="window for archived rows, which the CLI never offers by itself; 0 never purges them")
     parser.add_argument("--empty-groups", action="store_true")
     parser.add_argument("--protect-session-title", action="append", default=[])
     parser.add_argument("--protect-group", action="append", default=[])
@@ -933,6 +981,13 @@ def main(argv=None) -> int:
             raise Rejected("--session-retention-days must be positive")
         if args.tmux_idle_days < 1:
             raise Rejected("--tmux-idle-days must be positive")
+        if args.stopped_retention_days < 0 or args.archived_retention_days < 0:
+            raise Rejected("retention windows cannot be negative")
+        if args.stopped_retention_days > args.session_retention_days:
+            # A stopped row is a subset of an idle one; a longer window for it
+            # would be silently ignored, because the CLI never lists it later
+            # than the general window does.
+            raise Rejected("--stopped-retention-days cannot exceed --session-retention-days")
         args.tmux_socket_root = [check_root(root) for root in args.tmux_socket_root]
         args.artifact = [parse_artifact_rule(rule) for rule in args.artifact]
         args.expiring = [parse_expiring_rule(rule) for rule in args.expiring]

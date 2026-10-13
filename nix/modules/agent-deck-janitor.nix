@@ -57,6 +57,10 @@ let
       "%S/agent-deck-janitor-reports/${cfg.stateNamespace}"
       "--session-retention-days"
       (toString cfg.sessionRetentionDays)
+      "--stopped-retention-days"
+      (toString cfg.stoppedRetentionDays)
+      "--archived-retention-days"
+      (toString cfg.archivedRetentionDays)
     ]
     ++ lib.optional cfg.emptyGroupSweep "--empty-groups"
     ++ lib.optionals cfg.apply [ "--apply" ]
@@ -136,6 +140,30 @@ in
         Days a dead session must have been inactive before it is purged. Only
         sessions with no live pane are eligible; archived are skipped and
         pinned are retained.
+      '';
+    };
+
+    stoppedRetentionDays = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 0;
+      description = ''
+        Shorter window for rows an agent already finished with. A conductor
+        fleet creates stopped rows by the dozen for a single piece of work and
+        never returns to them, so they need not wait as long as a row that
+        merely went quiet. Zero uses sessionRetentionDays, and a value above it
+        is rejected: a stopped row is a subset of an idle one, so a longer
+        window would silently never apply.
+      '';
+    };
+
+    archivedRetentionDays = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 0;
+      description = ''
+        Window for archived rows. `session cleanup` never offers one unless
+        asked, so nothing has ever reclaimed them: they are invisible in the
+        TUI and permanent in the registry. Zero keeps that behaviour; a value
+        bounds it.
       '';
     };
 

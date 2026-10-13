@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -660,3 +661,274 @@ sys.stdout.write(json.dumps([{{"headRefName": {branch!r}, "headRefOid": {head!r}
         self.assertEqual(task["status"], "DEGRADED")
         self.assertTrue(path.exists(),
                         "unknown occupancy must never be treated as empty")
+
+
+class TmuxSweepCase(unittest.TestCase):
+    """The tmux reaper, against real socket files and a scripted tmux."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        self.state = self.tmp / "state"
+        self.root = self.tmp / "tmux-1000"
+        self.root.mkdir()
+        self.servers = self.tmp / "servers.json"
+        self.servers.write_text("{}")
+        self.rows: list[dict] = []
+        self.write_agent_deck()
+        self.write_tmux()
+
+    # -- fakes --------------------------------------------------------------
+
+    def write_agent_deck(self, exit_code: int = 0) -> None:
+        payload = json.dumps(self.rows)
+        write_executable(self.bin / "agent-deck", f"""#!/usr/bin/env python3
+import sys
+argv = sys.argv[1:]
+if argv[2:] == ["list", "--json"]:
+    if {exit_code}:
+        sys.exit({exit_code})
+    sys.stdout.write({payload!r}); sys.exit(0)
+if argv[2:4] == ["session", "cleanup"]:
+    sys.stdout.write('{{"candidates": []}}'); sys.exit(0)
+sys.exit(0)
+""")
+
+    def write_tmux(self, kill_exit: int = 0) -> None:
+        """A tmux whose servers live in a JSON file keyed by socket path."""
+        write_executable(self.bin / "tmux", f"""#!/usr/bin/env python3
+import json, pathlib, sys
+state = pathlib.Path({str(self.servers)!r})
+argv = sys.argv[1:]
+servers = json.loads(state.read_text())
+socket = argv[1] if argv[0] == "-S" else ""
+rest = argv[2:]
+sessions = servers.get(socket)
+if sessions is None:
+    sys.stderr.write("no server running on " + socket + chr(10)); sys.exit(1)
+if rest[0] == "list-sessions":
+    for name, attached, activity in sessions:
+        sys.stdout.write("%s\\t%s\\t%s" % (name, attached, activity) + chr(10))
+    sys.exit(0)
+if rest[0] == "kill-session":
+    if {kill_exit}:
+        sys.stderr.write("kill failed" + chr(10)); sys.exit({kill_exit})
+    target = rest[2]
+    kept = [s for s in sessions if s[0] != target]
+    if kept:
+        servers[socket] = kept
+    else:
+        # A tmux server exits with its last session.
+        servers.pop(socket)
+    state.write_text(json.dumps(servers))
+    sys.exit(0)
+sys.exit(2)
+""")
+
+    # -- fixtures -----------------------------------------------------------
+
+    def add_socket(self, name: str, sessions=None) -> Path:
+        path = self.root / name
+        handle = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(handle.close)
+        handle.bind(str(path))
+        if sessions is not None:
+            servers = json.loads(self.servers.read_text())
+            servers[str(path)] = sessions
+            self.servers.write_text(json.dumps(servers))
+        return path
+
+    @staticmethod
+    def idle(days: float) -> int:
+        return int(time.time() - days * 86400)
+
+    def run_janitor(self, *extra, apply=False):
+        argv = [sys.executable, str(JANITOR),
+                "--agent-deck", str(self.bin / "agent-deck"),
+                "--git", "git",
+                "--state-dir", str(self.state),
+                "--profile", "default",
+                "--tmux", str(self.bin / "tmux"),
+                "--tmux-socket-root", str(self.root),
+                *extra]
+        if apply:
+            argv.append("--apply")
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=120,
+                              check=False)
+        report = json.loads(done.stdout) if done.stdout.strip() else None
+        task = report["tasks"]["tmux"] if report else None
+        return done, task
+
+    def entry(self, task):
+        return task["roots"][str(self.root)]
+
+    # -- tests --------------------------------------------------------------
+
+    def test_without_a_root_the_task_is_skipped(self) -> None:
+        argv = [sys.executable, str(JANITOR),
+                "--agent-deck", str(self.bin / "agent-deck"),
+                "--state-dir", str(self.state), "--profile", "default"]
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=120,
+                              check=False)
+        self.assertEqual(json.loads(done.stdout)["tasks"]["tmux"]["status"], "SKIPPED")
+
+    def test_a_dead_server_socket_is_deleted(self) -> None:
+        path = self.add_socket("native-1789306680015920948")
+        _, task = self.run_janitor(apply=True)
+        self.assertEqual(task["status"], "OK")
+        self.assertEqual(self.entry(task)["sockets_removed"],
+                         ["native-1789306680015920948"])
+        self.assertFalse(path.exists())
+
+    def test_a_preview_deletes_nothing(self) -> None:
+        path = self.add_socket("native-1789306680015920948")
+        live = self.add_socket("parity-1789487772393964951",
+                               [["agentdeck_test-svcok-04c15a74_6511100d", 0,
+                                 self.idle(30)]])
+        _, task = self.run_janitor()
+        entry = self.entry(task)
+        # A preview kills nothing, so the second server is still answering and
+        # its socket is not yet a candidate. Only the already-dead one is.
+        self.assertEqual(entry["sockets_removed"], ["native-1789306680015920948"])
+        self.assertEqual([k["session"] for k in entry["killed"]],
+                         ["agentdeck_test-svcok-04c15a74_6511100d"])
+        self.assertTrue(path.exists())
+        self.assertTrue(live.exists())
+
+    def test_an_abandoned_session_is_killed_and_its_socket_removed(self) -> None:
+        path = self.add_socket("agent-deck-tests",
+                               [["agentdeck_test-svcok-04c15a74_6511100d", 0,
+                                 self.idle(30)]])
+        _, task = self.run_janitor(apply=True)
+        entry = self.entry(task)
+        self.assertEqual([k["session"] for k in entry["killed"]],
+                         ["agentdeck_test-svcok-04c15a74_6511100d"])
+        self.assertEqual(entry["sockets_removed"], ["agent-deck-tests"])
+        self.assertFalse(path.exists())
+
+    def test_a_session_an_agent_deck_row_claims_is_never_killed(self) -> None:
+        self.rows = [{"id": "row-1", "tmux_session": "agentdeck_conductor-semgrep_cae48990"}]
+        self.write_agent_deck()
+        path = self.add_socket("agent-deck",
+                               [["agentdeck_conductor-semgrep_cae48990", 0,
+                                 self.idle(400)]])
+        _, task = self.run_janitor(apply=True)
+        entry = self.entry(task)
+        self.assertEqual(entry["killed"], [])
+        self.assertEqual(entry["retained"], 1)
+        self.assertEqual(entry["sockets_removed"], [])
+        self.assertTrue(path.exists(), "a claimed pane must survive any idle time")
+
+    def test_an_attached_session_is_never_killed(self) -> None:
+        self.add_socket("watched", [["agentdeck_old_1", 1, self.idle(400)]])
+        _, task = self.run_janitor(apply=True)
+        self.assertEqual(self.entry(task)["killed"], [])
+        self.assertEqual(self.entry(task)["retained"], 1)
+
+    def test_a_recently_active_session_is_never_killed(self) -> None:
+        self.add_socket("recent", [["agentdeck_old_1", 0, self.idle(2)]])
+        _, task = self.run_janitor("--tmux-idle-days", "7", apply=True)
+        self.assertEqual(self.entry(task)["killed"], [])
+        self.assertEqual(self.entry(task)["retained"], 1)
+
+    def test_a_protected_socket_is_never_probed_or_removed(self) -> None:
+        path = self.add_socket("agent-deck")
+        _, task = self.run_janitor("--protect-tmux-socket", "agent-deck", apply=True)
+        entry = self.entry(task)
+        self.assertEqual(entry["protected"], 1)
+        self.assertEqual(entry["sockets_removed"], [])
+        self.assertTrue(path.exists(),
+                        "the conductor's socket must survive a dead-server probe")
+
+    def test_only_one_session_of_a_server_is_killed_and_the_socket_stays(self) -> None:
+        path = self.add_socket("mixed", [["agentdeck_old_1", 0, self.idle(30)],
+                                         ["agentdeck_live_2", 1, self.idle(30)]])
+        _, task = self.run_janitor(apply=True)
+        entry = self.entry(task)
+        self.assertEqual([k["session"] for k in entry["killed"]], ["agentdeck_old_1"])
+        self.assertEqual(entry["sockets_removed"], [],
+                         "a server with sessions left must keep its socket")
+        self.assertTrue(path.exists())
+
+    def test_a_plain_file_in_the_root_is_ignored(self) -> None:
+        plain = self.root / "notes.txt"
+        plain.write_text("x")
+        _, task = self.run_janitor(apply=True)
+        self.assertEqual(self.entry(task)["sockets_removed"], [])
+        self.assertTrue(plain.exists())
+
+    def test_unreadable_rows_reap_nothing(self) -> None:
+        self.write_agent_deck(exit_code=7)
+        path = self.add_socket("native-1", [["agentdeck_old_1", 0, self.idle(99)]])
+        _, task = self.run_janitor(apply=True)
+        self.assertEqual(task["status"], "DEGRADED")
+        self.assertNotIn("roots", task)
+        self.assertTrue(path.exists(),
+                        "an unknown claim set must never kill a pane")
+
+    def test_a_failing_kill_degrades_and_keeps_the_socket(self) -> None:
+        self.write_tmux(kill_exit=1)
+        path = self.add_socket("stubborn", [["agentdeck_old_1", 0, self.idle(30)]])
+        _, task = self.run_janitor(apply=True)
+        self.assertEqual(task["status"], "DEGRADED")
+        entry = self.entry(task)
+        self.assertEqual(entry["killed"], [])
+        self.assertEqual(len(entry["failed"]), 1)
+        self.assertEqual(entry["sockets_removed"], [])
+        self.assertTrue(path.exists())
+
+    def test_a_system_root_is_rejected_before_anything_runs(self) -> None:
+        argv = [sys.executable, str(JANITOR),
+                "--agent-deck", str(self.bin / "agent-deck"),
+                "--state-dir", str(self.state),
+                "--tmux-socket-root", "/run"]
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=120,
+                              check=False)
+        self.assertEqual(done.returncode, 2)
+        self.assertEqual(json.loads(done.stderr)["status"], "REJECTED")
+
+
+class RemovalEdgeCase(JanitorCase):
+    """Two failures seen on the first armed run of a live box."""
+
+    def test_a_read_only_directory_is_still_removed(self) -> None:
+        root = self.tmp / "scratch"
+        root.mkdir()
+        tree = root / "fixture"
+        (tree / "inner").mkdir(parents=True)
+        (tree / "inner" / "file").write_text("x")
+        os.chmod(tree / "inner", 0o500)
+        os.chmod(tree, 0o500)
+        age(tree / "inner", 40)
+        age(tree, 40)
+        _, report = self.run_janitor("--artifact", f"{root}:30", apply=True)
+        entry = report["tasks"]["artifacts"]["roots"][str(root)]
+        self.assertEqual(entry["failed"], [])
+        self.assertEqual(entry["removed"], [str(tree)])
+        self.assertFalse(tree.exists())
+
+    def test_a_row_that_woke_up_is_not_a_failure(self) -> None:
+        write_executable(self.bin / "agent-deck", """#!/usr/bin/env python3
+import json, sys
+argv = sys.argv[1:]
+if argv[2:4] == ["session", "cleanup"]:
+    json.dump({"candidates": [{"id": "woke-0001", "title": "busy",
+                               "idle_days": 40, "status": "stopped",
+                               "archived": False}]}, sys.stdout)
+    sys.exit(0)
+if argv[2:4] == ["session", "remove"]:
+    sys.stderr.write("Error: session 'busy' is in state 'waiting'; "
+                     "only stopped/error sessions may be removed without --force")
+    sys.exit(1)
+sys.exit(0)
+""")
+        _, report = self.run_janitor(apply=True)
+        task = report["tasks"]["sessions"]
+        profile = task["profiles"]["default"]
+        self.assertEqual(task["status"], "OK",
+                         "a row coming back to life is the rail working")
+        self.assertEqual(profile["failed"], [])
+        self.assertEqual([r["id"] for r in profile["revived"]], ["woke-0001"])
+        self.assertEqual(profile["removed"], [])

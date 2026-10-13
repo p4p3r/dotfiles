@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -27,6 +28,13 @@ import time
 VERSION = 1
 NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 GROUP_PATH = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._/-]{0,255}\Z")
+# tmux socket names are chosen by whatever started the server, so they are
+# longer and freer than a row name, but still one bounded path segment.
+SOCKET_NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+# `session cleanup --dry-run` lists what is dead now; a row can be alive again
+# by the time the removal runs, and the CLI then refuses it. Only stopped and
+# errored rows may be removed without --force, which this tool never passes.
+LIVE_AGAIN = re.compile(r"only stopped/error sessions may be removed")
 # A depth heuristic was the first attempt and it was wrong in both directions:
 # it refused /tmp, which is the single largest thing worth sweeping, while
 # happily accepting /home/someone. An explicit denylist says what is actually
@@ -83,6 +91,20 @@ def load_json(text):
         return json.loads(text)
     except ValueError:
         return None
+
+
+def check_root(path: str) -> str:
+    """An absolute, normalized directory that is not a system or home root."""
+    if not path.startswith("/"):
+        raise Rejected(f"root {path!r} must be absolute")
+    normalized = os.path.normpath(path)
+    if normalized != path.rstrip("/") and normalized != path:
+        raise Rejected(f"root {path!r} must already be normalized")
+    if normalized in FORBIDDEN_ROOTS:
+        raise Rejected(f"root {path!r} is never safe to sweep")
+    if normalized == os.path.expanduser("~").rstrip("/"):
+        raise Rejected("the home directory is never swept")
+    return normalized
 
 
 def parse_artifact_rule(value: str) -> tuple[str, int]:
@@ -198,7 +220,7 @@ class Janitor:
                     continue
                 purge.append(row)
 
-            removed, failed = [], []
+            removed, failed, revived = [], [], []
             for row in purge:
                 if not self.apply:
                     removed.append({"id": row["id"], "title": row.get("title"),
@@ -209,11 +231,16 @@ class Janitor:
                 if ok:
                     removed.append({"id": row["id"], "title": row.get("title"),
                                     "idle_days": row.get("idle_days")})
+                elif LIVE_AGAIN.search(summary):
+                    # The row woke up between the listing and the removal, and
+                    # the CLI refused it for exactly the right reason. That is
+                    # the safety rail working, not a fault to report.
+                    revived.append({"id": row["id"], "title": row.get("title")})
                 else:
                     failed.append({"id": row["id"], "summary": summary})
                     worst = "DEGRADED"
             detail[profile] = {"ok": True, "removed": removed, "exempt": exempt,
-                               "failed": failed}
+                               "revived": revived, "failed": failed}
         self.record("sessions", worst, retention_days=self.args.session_retention_days,
                     applied=self.apply, profiles=detail)
 
@@ -383,10 +410,7 @@ class Janitor:
                     entry["removed"].append(path)
                     continue
                 try:
-                    if os.path.islink(path) or not os.path.isdir(path):
-                        os.unlink(path)
-                    else:
-                        shutil.rmtree(path)
+                    self.remove_entry(path)
                     entry["removed"].append(path)
                 except OSError as exc:
                     entry["failed"].append({"path": path,
@@ -394,6 +418,35 @@ class Janitor:
                     worst = "DEGRADED"
             detail[root] = entry
         self.record("artifacts", worst, applied=self.apply, roots=detail)
+
+    @staticmethod
+    def remove_entry(path) -> None:
+        """Delete one entry, restoring write permission on our own trees.
+
+        Test fixtures and extracted archives leave directories without the
+        write bit, and rmtree then fails on contents the owner can perfectly
+        well delete: 27 of them survived box 2's first armed run. The retry
+        changes modes only under a path already chosen for deletion, and only
+        where we are the owner, so nothing outside that tree is touched.
+        """
+        if os.path.islink(path) or not os.path.isdir(path):
+            os.unlink(path)
+            return
+        try:
+            shutil.rmtree(path)
+            return
+        except PermissionError:
+            pass
+        uid = os.getuid()
+        for current, dirs, _ in os.walk(path, topdown=True, followlinks=False):
+            for name in [current] + [os.path.join(current, d) for d in dirs]:
+                try:
+                    if os.lstat(name).st_uid != uid:
+                        continue
+                    os.chmod(name, os.lstat(name).st_mode | 0o700)
+                except OSError:
+                    continue
+        shutil.rmtree(path)
 
     @staticmethod
     def effective_mtime(path) -> float:
@@ -664,6 +717,150 @@ class Janitor:
             }
         self.record("drift", "OK", repositories=detail)
 
+    # -- tmux ---------------------------------------------------------------
+
+    def claimed_tmux_sessions(self):
+        """tmux session names an Agent Deck row still claims.
+
+        A row claims its pane whatever its status says: a stopped or errored
+        row is still the thing an operator comes back to. Returns None when any
+        profile cannot be listed, because an unknown claim set is not an empty
+        one, and the caller must then reap nothing.
+        """
+        claimed = set()
+        for profile in self.profiles():
+            ok, out, _ = run([self.args.agent_deck, "-p", profile, "list", "--json"],
+                             timeout=120)
+            if not ok:
+                return None
+            rows = load_json(out)
+            if not isinstance(rows, list):
+                return None
+            for row in rows:
+                if isinstance(row, dict) and isinstance(row.get("tmux_session"), str):
+                    claimed.add(row["tmux_session"])
+        return claimed
+
+    def tmux_sessions(self, socket):
+        """(server_alive, [(name, attached, activity)]) for one tmux socket.
+
+        A dead server is not an error here: its leftover socket file is exactly
+        what this task exists to find, so the caller reads a false first value
+        as "no server", not as a fault.
+        """
+        ok, out, _ = run([self.args.tmux, "-S", socket, "list-sessions", "-F",
+                          "#{session_name}\t#{session_attached}\t#{session_activity}"],
+                         timeout=self.args.tmux_timeout)
+        if not ok:
+            return False, []
+        found = []
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) != 3:
+                continue
+            try:
+                found.append((parts[0], int(parts[1]), int(parts[2])))
+            except ValueError:
+                continue
+        return True, found
+
+    def sweep_tmux(self):
+        """Kill abandoned tmux sessions and delete the sockets left behind.
+
+        Test harnesses and crashed runs leave both: sessions whose row was
+        deleted long ago, and socket files whose server is gone. Neither is
+        reachable from the TUI, so nothing removes them, and a box accumulates
+        hundreds.
+
+        Three conditions must all hold before a session is killed, and any one
+        of them alone keeps it: no Agent Deck row claims the name, no client is
+        attached, and the session has been idle past the window. A socket file
+        is deleted only when its server does not answer at all.
+        """
+        if not self.args.tmux_socket_root:
+            self.record("tmux", "SKIPPED")
+            return
+        claimed = self.claimed_tmux_sessions()
+        if claimed is None:
+            # Reaping against an unknown claim set would kill live work.
+            self.record("tmux", "DEGRADED", applied=self.apply,
+                        summary="agent-deck rows could not be listed")
+            return
+        cutoff = time.time() - self.args.tmux_idle_days * 86400
+        protected = frozenset(self.args.protect_tmux_socket)
+        detail = {}
+        worst = "OK"
+        for root in self.args.tmux_socket_root:
+            entry = {"idle_days": self.args.tmux_idle_days, "killed": [],
+                     "retained": 0, "sockets_removed": [], "protected": 0,
+                     "foreign": 0, "failed": [], "truncated": False}
+            if os.path.islink(root) or not os.path.isdir(root):
+                entry["skipped"] = "root is missing or not a directory"
+                detail[root] = entry
+                continue
+            try:
+                names = sorted(os.listdir(root))
+            except OSError as exc:
+                entry["skipped"] = exc.__class__.__name__
+                worst = "DEGRADED"
+                detail[root] = entry
+                continue
+            if len(names) > MAX_ENTRIES_PER_ROOT:
+                names = names[:MAX_ENTRIES_PER_ROOT]
+                entry["truncated"] = True
+            for name in names:
+                path = os.path.join(root, name)
+                if not SOCKET_NAME.match(name):
+                    continue
+                try:
+                    info = os.lstat(path)
+                except OSError:
+                    continue
+                if not stat.S_ISSOCK(info.st_mode):
+                    continue
+                # Another user's socket on a shared root is not ours to touch.
+                if info.st_uid != os.getuid():
+                    entry["foreign"] += 1
+                    continue
+                if name in protected:
+                    entry["protected"] += 1
+                    continue
+                alive, sessions = self.tmux_sessions(path)
+                if alive:
+                    for session, attached, activity in sessions:
+                        if session in claimed or attached > 0 or activity >= cutoff:
+                            entry["retained"] += 1
+                            continue
+                        if not self.apply:
+                            entry["killed"].append({"socket": name, "session": session})
+                            continue
+                        ok, _, summary = run([self.args.tmux, "-S", path,
+                                              "kill-session", "-t", session],
+                                             timeout=self.args.tmux_timeout)
+                        if ok:
+                            entry["killed"].append({"socket": name, "session": session})
+                        else:
+                            entry["failed"].append({"socket": name, "session": session,
+                                                    "error": summary})
+                            worst = "DEGRADED"
+                    # A server exits with its last session, so ask again rather
+                    # than assume either outcome.
+                    alive, _ = self.tmux_sessions(path)
+                if alive:
+                    continue
+                if not self.apply:
+                    entry["sockets_removed"].append(name)
+                    continue
+                try:
+                    os.unlink(path)
+                    entry["sockets_removed"].append(name)
+                except OSError as exc:
+                    entry["failed"].append({"socket": name,
+                                            "error": exc.__class__.__name__})
+                    worst = "DEGRADED"
+            detail[root] = entry
+        self.record("tmux", worst, applied=self.apply, roots=detail)
+
     # -- driver -------------------------------------------------------------
 
     def run_all(self):
@@ -674,6 +871,7 @@ class Janitor:
         self.sweep_artifacts()
         self.sweep_expiring_paths()
         self.reclaim_merged_worktrees()
+        self.sweep_tmux()
         self.report_drift()
         degraded = [t for t, r in self.results.items() if r["status"] == "DEGRADED"]
         return {
@@ -712,6 +910,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gh-attempts", type=int, default=3)
     parser.add_argument("--nix-generations-days", type=int, default=None)
     parser.add_argument("--nix-timeout", type=int, default=1800)
+    parser.add_argument("--tmux", default="tmux")
+    parser.add_argument("--tmux-socket-root", action="append", default=[],
+                        metavar="DIR")
+    parser.add_argument("--tmux-idle-days", type=int, default=7)
+    parser.add_argument("--tmux-timeout", type=int, default=30)
+    parser.add_argument("--protect-tmux-socket", action="append", default=[])
     parser.add_argument("--apply", action="store_true",
                         help="perform deletions; without it every task is a preview")
     return parser
@@ -722,6 +926,9 @@ def main(argv=None) -> int:
     try:
         if args.session_retention_days < 1:
             raise Rejected("--session-retention-days must be positive")
+        if args.tmux_idle_days < 1:
+            raise Rejected("--tmux-idle-days must be positive")
+        args.tmux_socket_root = [check_root(root) for root in args.tmux_socket_root]
         args.artifact = [parse_artifact_rule(rule) for rule in args.artifact]
         args.expiring = [parse_expiring_rule(rule) for rule in args.expiring]
         for pattern in args.keep_pattern:

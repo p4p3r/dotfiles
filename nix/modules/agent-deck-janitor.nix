@@ -95,7 +95,19 @@ let
     ++ lib.concatMap (path: [
       "--reclaim-repo"
       (systemdLiteral path)
-    ]) cfg.reclaimRepositoryRoots;
+    ]) cfg.reclaimRepositoryRoots
+    ++ lib.optionals (cfg.tmuxSocketRoots != [ ]) [
+      "--tmux"
+      "${pkgs.tmux}/bin/tmux"
+      "--tmux-idle-days"
+      (toString cfg.tmuxIdleDays)
+    ]
+    ++ lib.concatMap (path: [
+      "--tmux-socket-root"
+      (systemdLiteral path)
+    ]) cfg.tmuxSocketRoots
+    # A socket name may begin with "-", for the same reason a keep pattern may.
+    ++ map (name: "--protect-tmux-socket=${name}") cfg.protectedTmuxSockets;
 in
 {
   options.programs.agent-deck-janitor = {
@@ -248,6 +260,34 @@ in
       type = lib.types.nullOr lib.types.ints.positive;
       default = null;
       description = "Delete Nix generations older than this. Null skips the task.";
+    };
+
+    tmuxSocketRoots = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = ''
+        Directories holding tmux socket files, typically /tmp/tmux-<uid>. A
+        session there is killed only when no Agent Deck row claims it, no
+        client is attached and it has been idle past tmuxIdleDays; a socket
+        file is deleted only when its server does not answer. Empty skips the
+        task.
+      '';
+    };
+
+    tmuxIdleDays = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 7;
+      description = "Idle window before an unclaimed tmux session may be killed.";
+    };
+
+    protectedTmuxSockets = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = ''
+        Socket names that are never probed, killed or deleted. The socket the
+        conductor's panes live on belongs here, so a transient probe failure
+        can never unlink it.
+      '';
     };
 
     apply = lib.mkOption {

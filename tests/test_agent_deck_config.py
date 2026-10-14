@@ -559,6 +559,48 @@ exit "$result"
                 opted_config["conductors"]["example-conductor"]["slack_v2"]["segment_mode"],
             )
 
+    @unittest.skipUnless(CHEZMOI, "chezmoi is required for the render contract")
+    def test_attention_interval_defaults_to_zero_and_opts_in_by_env(self) -> None:
+        # Same shape as the segment mode: the public template carries the key,
+        # the private configuration carries the decision. A non-numeric value
+        # must fail the render rather than produce invalid TOML.
+        with tempfile.TemporaryDirectory(prefix="agent-deck-attention.") as temp:
+            root = Path(temp)
+            default, default_config = self._render_agent_deck_template(
+                root, "default", conductor_name="example-conductor", backend="slack-v2"
+            )
+            self.assertEqual(0, default.returncode, default.stdout + default.stderr)
+            self.assertEqual(
+                0,
+                default_config["conductors"]["example-conductor"]["slack_v2"][
+                    "attention_interval_minutes"
+                ],
+            )
+
+            opted, opted_config = self._render_agent_deck_template(
+                root,
+                "opted",
+                conductor_name="example-conductor",
+                backend="slack-v2",
+                extra_env={"AGENTDECK_SLACK_ATTENTION_INTERVAL_MINUTES": "15"},
+            )
+            self.assertEqual(0, opted.returncode, opted.stdout + opted.stderr)
+            self.assertEqual(
+                15,
+                opted_config["conductors"]["example-conductor"]["slack_v2"][
+                    "attention_interval_minutes"
+                ],
+            )
+
+            invalid, _ = self._render_agent_deck_template(
+                root,
+                "invalid",
+                conductor_name="example-conductor",
+                backend="slack-v2",
+                extra_env={"AGENTDECK_SLACK_ATTENTION_INTERVAL_MINUTES": "15m"},
+            )
+            self.assertNotEqual(0, invalid.returncode)
+
     def test_pinned_custom_policy_skips_agent_deck_but_keeps_other_updates(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent-deck-update-pinned.") as temp:
             root = Path(temp)

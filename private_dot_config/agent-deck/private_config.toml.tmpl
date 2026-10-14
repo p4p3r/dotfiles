@@ -220,6 +220,10 @@ mcp_default_scope = ""
 {{ if and (ne $namedConductor "") (not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" $namedConductor)) }}
 {{ fail "AGENTDECK_CONDUCTOR_NAME is invalid" }}
 {{ end }}
+{{ $attentionInterval := env "AGENTDECK_SLACK_ATTENTION_INTERVAL_MINUTES" | default "0" }}
+{{ if not (regexMatch "^(0|[1-9][0-9]{0,3})$" $attentionInterval) }}
+{{ fail "AGENTDECK_SLACK_ATTENTION_INTERVAL_MINUTES must be a whole number of minutes" }}
+{{ end }}
 {{ if eq $namedBackend "slack-v2" }}
 [conductors.{{ $namedConductor | quote }}]
   backend = "slack-v2"
@@ -241,6 +245,11 @@ mcp_default_scope = ""
     # configuration; this repository is public and holds neither that decision
     # nor the identity of the host making it.
     segment_mode = "{{ env "AGENTDECK_SLACK_SEGMENT_MODE" | default "channel_stream" }}"
+    # Minutes between heartbeat ticks the gateway runs itself, from inside the
+    # conversation; 0 disables them, which is the default. A host that wants
+    # them exports AGENTDECK_SLACK_ATTENTION_INTERVAL_MINUTES from its own
+    # private configuration.
+    attention_interval_minutes = {{ $attentionInterval }}
     codex_executable = {{ printf "%s/.npm-global/bin/codex" .chezmoi.homeDir | quote }}
 {{ end }}
 

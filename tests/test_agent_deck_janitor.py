@@ -906,6 +906,118 @@ sys.exit(2)
         self.assertEqual(json.loads(done.stderr)["status"], "REJECTED")
 
 
+class IdleStopCase(JanitorCase):
+    """Rows parked at a prompt never die, so nothing ever reclaimed them."""
+
+    def write_rows(self, rows) -> None:
+        payload = json.dumps(rows)
+        write_executable(self.bin / "agent-deck", f"""#!/usr/bin/env python3
+import json, os, pathlib, sys
+argv = sys.argv[1:]
+(pathlib.Path(os.environ["CALLS"]) / "agent-deck").open("a").write(" ".join(argv) + chr(10))
+if argv[2:] == ["list", "--json"]:
+    sys.stdout.write({payload!r}); sys.exit(0)
+if argv[2:4] == ["session", "stop"]:
+    sys.exit(0)
+if argv[2:4] == ["session", "cleanup"]:
+    sys.stdout.write('{{"candidates": []}}'); sys.exit(0)
+sys.exit(0)
+""")
+
+    @staticmethod
+    def stamp(days_ago):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                             time.gmtime(time.time() - days_ago * 86400))
+
+    def stopped_ids(self, report):
+        return [r["id"] for r in report["tasks"]["idle_sessions"]["profiles"]["default"]["stopped"]]
+
+    def test_only_long_parked_unwatched_rows_are_stopped(self) -> None:
+        self.write_rows([
+            {"id": "parked-old", "title": "orchestrator", "status": "waiting",
+             "last_activity_at": self.stamp(34), "viewers": []},
+            {"id": "idle-old", "title": "reviewer", "status": "idle",
+             "last_activity_at": self.stamp(20), "viewers": []},
+            {"id": "parked-young", "title": "impl", "status": "waiting",
+             "last_activity_at": self.stamp(3), "viewers": []},
+            {"id": "running", "title": "worker", "status": "running",
+             "last_activity_at": self.stamp(40), "viewers": []},
+            {"id": "watched", "title": "paired", "status": "waiting",
+             "last_activity_at": self.stamp(40), "viewers": ["tty1"]},
+            {"id": "already-stopped", "title": "done", "status": "stopped",
+             "last_activity_at": self.stamp(40), "viewers": []},
+        ])
+        _, report = self.run_janitor("--stop-idle-days", "14", apply=True)
+        self.assertEqual(["parked-old", "idle-old"], self.stopped_ids(report))
+        stops = [c for c in self.agent_deck_calls() if "session stop" in c]
+        self.assertEqual(["-p default session stop parked-old",
+                          "-p default session stop idle-old"], stops)
+        kept = report["tasks"]["idle_sessions"]["profiles"]["default"]["kept"]
+        self.assertEqual(1, kept["running"])
+        self.assertEqual(1, kept["watched"], "a pane someone is watching is never stopped")
+        self.assertEqual(1, kept["young"])
+
+    def test_a_protected_title_is_never_stopped(self) -> None:
+        self.write_rows([{"id": "conductor", "title": "conductor-semgrep", "status": "waiting",
+                          "last_activity_at": self.stamp(99), "viewers": []}])
+        _, report = self.run_janitor("--stop-idle-days", "14",
+                                     "--protect-session-title", "conductor-semgrep", apply=True)
+        self.assertEqual([], self.stopped_ids(report))
+        self.assertEqual([], [c for c in self.agent_deck_calls() if "session stop" in c])
+
+    def test_an_unreadable_age_is_not_an_old_one(self) -> None:
+        self.write_rows([
+            {"id": "no-stamp", "title": "mystery", "status": "waiting", "viewers": []},
+            {"id": "bad-stamp", "title": "mystery", "status": "waiting",
+             "last_activity_at": "not-a-date", "viewers": []},
+        ])
+        _, report = self.run_janitor("--stop-idle-days", "14", apply=True)
+        self.assertEqual([], self.stopped_ids(report))
+
+    def test_a_preview_stops_nothing(self) -> None:
+        self.write_rows([{"id": "parked-old", "title": "orchestrator", "status": "waiting",
+                          "last_activity_at": self.stamp(34), "viewers": []}])
+        _, report = self.run_janitor("--stop-idle-days", "14")
+        self.assertEqual(["parked-old"], self.stopped_ids(report))
+        self.assertEqual([], [c for c in self.agent_deck_calls() if "session stop" in c])
+
+    def test_stopping_runs_before_the_sweep_so_nothing_is_stopped_and_purged_at_once(self) -> None:
+        # A row stopped today is reclaimed by a later run, which leaves a few
+        # days to notice that stopping it was wrong.
+        self.write_rows([{"id": "parked-old", "title": "orchestrator", "status": "waiting",
+                          "last_activity_at": self.stamp(34), "viewers": []}])
+        self.run_janitor("--stop-idle-days", "14", "--session-retention-days", "7", apply=True)
+        calls = self.agent_deck_calls()
+        stop_at = next(i for i, c in enumerate(calls) if "session stop" in c)
+        cleanup_at = next(i for i, c in enumerate(calls) if "session cleanup" in c)
+        self.assertLess(stop_at, cleanup_at)
+        self.assertEqual([], [c for c in calls if "session remove" in c])
+
+    def test_a_failed_stop_degrades_without_stopping_the_rest(self) -> None:
+        self.write_rows([{"id": "a", "title": "x", "status": "waiting",
+                          "last_activity_at": self.stamp(30), "viewers": []}])
+        write_executable(self.bin / "agent-deck", """#!/usr/bin/env python3
+import json, os, pathlib, sys
+argv = sys.argv[1:]
+(pathlib.Path(os.environ["CALLS"]) / "agent-deck").open("a").write(" ".join(argv) + chr(10))
+if argv[2:] == ["list", "--json"]:
+    json.dump([{"id": "a", "title": "x", "status": "waiting",
+                "last_activity_at": "2020-01-01T00:00:00Z", "viewers": []}], sys.stdout)
+    sys.exit(0)
+if argv[2:4] == ["session", "stop"]:
+    sys.stderr.write("tmux refused"); sys.exit(1)
+if argv[2:4] == ["session", "cleanup"]:
+    sys.stdout.write('{"candidates": []}'); sys.exit(0)
+sys.exit(0)
+""")
+        _, report = self.run_janitor("--stop-idle-days", "14", apply=True)
+        task = report["tasks"]["idle_sessions"]
+        self.assertEqual("DEGRADED", task["status"])
+        self.assertEqual(1, len(task["profiles"]["default"]["failed"]))
+        self.assertEqual("OK", report["tasks"]["sessions"]["status"],
+                         "one failing task never suppresses another")
+
+
 class RetentionWindowCase(JanitorCase):
     """Different kinds of row age out at different rates."""
 

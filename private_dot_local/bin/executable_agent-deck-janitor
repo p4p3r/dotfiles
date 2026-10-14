@@ -58,6 +58,23 @@ def utc() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def parse_timestamp(value):
+    """Epoch seconds for an RFC 3339 stamp, or None when it cannot be read.
+
+    An unreadable age must never be treated as an old one: every rule here
+    acts on things that are too old, so the failure has to fall the safe way.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return None
+
+
 def run(argv, timeout=DEFAULT_COMMAND_TIMEOUT, cwd=None):
     """Run one argv with no shell. Returns (ok, stdout, summary)."""
     try:
@@ -287,6 +304,74 @@ class Janitor:
                     stopped_retention_days=self.args.stopped_retention_days,
                     archived_retention_days=self.args.archived_retention_days,
                     applied=self.apply, profiles=detail)
+
+    def stop_idle_sessions(self):
+        """Stop rows whose agent has been parked at a prompt for too long.
+
+        `session cleanup` purges only rows with no live pane, and a waiting row
+        has one: an agent sitting at a prompt never dies, so no retention window
+        can ever reach it. Box 2 carried 62 such rows aged 7 to 34 days, each
+        holding a live process. Stopping them makes them ordinary dead rows,
+        which the stopped window then reclaims a few days later -- nothing is
+        both stopped and removed on the same run.
+
+        Stopping destroys in-memory context and anything unsent in the
+        composer, which is why this window is the longest one here and why a
+        row someone is watching, or one still running, is never touched.
+        """
+        if not self.args.stop_idle_days:
+            self.record("idle_sessions", "SKIPPED")
+            return
+        cutoff = self.now() - self.args.stop_idle_days * 86400
+        detail = {}
+        worst = "OK"
+        for profile in self.profiles():
+            ok, out, summary = run([self.args.agent_deck, "-p", profile, "list", "--json"],
+                                   timeout=120)
+            rows = load_json(out) if ok else None
+            if not ok or not isinstance(rows, list):
+                detail[profile] = {"ok": False, "summary": summary if not ok else "list did not return an array"}
+                worst = "DEGRADED"
+                continue
+            stopped, failed = [], []
+            kept = {"running": 0, "watched": 0, "protected": 0, "young": 0, "other": 0}
+            for row in rows:
+                if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+                    continue
+                status = row.get("status")
+                if status not in ("waiting", "idle"):
+                    # A running row is doing work; a stopped or errored one is
+                    # already the cleanup task's business.
+                    kept["running" if status == "running" else "other"] += 1
+                    continue
+                if row.get("title") in self.args.protect_session_title:
+                    kept["protected"] += 1
+                    continue
+                # Someone is looking at this pane right now.
+                if row.get("viewers"):
+                    kept["watched"] += 1
+                    continue
+                seen = parse_timestamp(row.get("last_activity_at"))
+                if seen is None or seen >= cutoff:
+                    # An unknown age is not an old one.
+                    kept["young"] += 1
+                    continue
+                entry = {"id": row["id"], "title": row.get("title"),
+                         "group": row.get("group"),
+                         "idle_days": int((self.now() - seen) // 86400)}
+                if not self.apply:
+                    stopped.append(entry)
+                    continue
+                ok, _, summary = run([self.args.agent_deck, "-p", profile,
+                                      "session", "stop", row["id"]])
+                if ok:
+                    stopped.append(entry)
+                else:
+                    failed.append({"id": row["id"], "summary": summary})
+                    worst = "DEGRADED"
+            detail[profile] = {"ok": True, "stopped": stopped, "failed": failed, "kept": kept}
+        self.record("idle_sessions", worst, applied=self.apply,
+                    stop_idle_days=self.args.stop_idle_days, profiles=detail)
 
     # -- groups -------------------------------------------------------------
 
@@ -912,7 +997,14 @@ class Janitor:
 
     # -- driver -------------------------------------------------------------
 
+    def now(self):
+        return time.time()
+
     def run_all(self):
+        # Stopping runs before the sweep so a row stopped today is reclaimed by
+        # a later run, never by this one: two separate windows, two separate
+        # days, and a chance to notice in between.
+        self.stop_idle_sessions()
         self.sweep_sessions()
         self.sweep_groups()
         self.prune_worktrees()
@@ -942,6 +1034,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--report-root")
     parser.add_argument("--profile", action="append", default=[])
     parser.add_argument("--session-retention-days", type=int, default=30)
+    parser.add_argument("--stop-idle-days", type=int, default=0,
+                        help="stop a waiting session parked this long; 0 never stops one")
     parser.add_argument("--stopped-retention-days", type=int, default=0,
                         help="shorter window for rows an agent already finished with; 0 uses --session-retention-days")
     parser.add_argument("--archived-retention-days", type=int, default=0,
@@ -981,6 +1075,8 @@ def main(argv=None) -> int:
             raise Rejected("--session-retention-days must be positive")
         if args.tmux_idle_days < 1:
             raise Rejected("--tmux-idle-days must be positive")
+        if args.stop_idle_days < 0:
+            raise Rejected("--stop-idle-days cannot be negative")
         if args.stopped_retention_days < 0 or args.archived_retention_days < 0:
             raise Rejected("retention windows cannot be negative")
         if args.stopped_retention_days > args.session_retention_days:

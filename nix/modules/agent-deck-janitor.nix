@@ -57,6 +57,8 @@ let
       "%S/agent-deck-janitor-reports/${cfg.stateNamespace}"
       "--session-retention-days"
       (toString cfg.sessionRetentionDays)
+      "--stop-idle-days"
+      (toString cfg.stopIdleDays)
       "--stopped-retention-days"
       (toString cfg.stoppedRetentionDays)
       "--archived-retention-days"
@@ -140,6 +142,24 @@ in
         Days a dead session must have been inactive before it is purged. Only
         sessions with no live pane are eligible; archived are skipped and
         pinned are retained.
+      '';
+    };
+
+    stopIdleDays = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 0;
+      description = ''
+        Stop a session whose agent has sat at a prompt this long. `session
+        cleanup` purges only rows with no live pane, and a waiting row has one,
+        so without this no retention window can ever reach it: box 2 carried 62
+        such rows aged 7 to 34 days, each holding a live process.
+
+        Stopping keeps the row, its transcript and its worktree, and makes it
+        an ordinary dead row that stoppedRetentionDays then reclaims on a later
+        run. It does destroy in-memory context and anything unsent in the
+        composer, which is why this window should be the longest one here, and
+        why a running session, a protected title and a pane someone is watching
+        are all left alone. Zero never stops anything.
       '';
     };
 

@@ -1024,10 +1024,15 @@ class Janitor:
             # Detached: nothing upstream to ask about, and the three checks
             # above already proved every commit here is on a remote.
             return ""
-        ok, remote, _ = run([self.args.git, "-C", path, "ls-remote", "--heads",
-                             "origin", branch], timeout=120)
-        if not ok:
-            return "origin could not be read"
+        # The remote-tracking ref, not ls-remote: the janitor runs as a systemd
+        # user unit whose PATH carries no ssh, so every network query failed and
+        # nine worktrees on box 4 were retained for "origin could not be read".
+        # A tracking ref needs no network and is kept current by the agents' own
+        # fetches. Staleness is safe in both directions here: a ref that still
+        # exists keeps the worktree, and a ref that is gone was already proved
+        # harmless by the check above, which showed every commit is on a remote.
+        ok, remote, _ = run([self.args.git, "-C", path, "rev-parse", "--verify",
+                             "--quiet", "refs/remotes/origin/" + branch], timeout=60)
         if not remote.strip():
             # The sweep deletes a branch when it merges it, so an absent branch
             # is the commonest shape of finished work here.

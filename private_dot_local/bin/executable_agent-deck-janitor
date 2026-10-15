@@ -544,12 +544,42 @@ class Janitor:
                 try:
                     self.remove_entry(path)
                     entry["removed"].append(path)
+                except PermissionError as exc:
+                    # A scratch tree can hold files written by another uid --
+                    # a container, a bazel sandbox. The chmod retry refuses to
+                    # touch those by design, so rmtree cannot finish. That is
+                    # the rule working, not a fault: count it where the other
+                    # foreign entries are counted and leave the tree alone.
+                    if self.holds_foreign_entries(path):
+                        entry["foreign"] = entry.get("foreign", 0) + 1
+                        continue
+                    entry["failed"].append({"path": path,
+                                            "error": exc.__class__.__name__})
+                    worst = "DEGRADED"
                 except OSError as exc:
                     entry["failed"].append({"path": path,
                                             "error": exc.__class__.__name__})
                     worst = "DEGRADED"
             detail[root] = entry
         self.record("artifacts", worst, applied=self.apply, roots=detail)
+
+    @staticmethod
+    def holds_foreign_entries(path) -> bool:
+        """True when any entry under path belongs to another user.
+
+        Only asked after a deletion was refused, so the walk costs nothing on
+        the ordinary path. A tree someone else wrote into is not ours to
+        remove, however old it is.
+        """
+        uid = os.getuid()
+        for current, dirs, files in os.walk(path, topdown=True, followlinks=False):
+            for name in [current] + [os.path.join(current, n) for n in dirs + files]:
+                try:
+                    if os.lstat(name).st_uid != uid:
+                        return True
+                except OSError:
+                    continue
+        return False
 
     @staticmethod
     def remove_entry(path) -> None:

@@ -1360,3 +1360,45 @@ sys.exit(0)
         task = report["tasks"]["stale_agents"]
         self.assertEqual(task["status"], "SKIPPED")
         self.assertIn("not readable", task["summary"])
+
+
+class ForeignScratchCase(unittest.TestCase):
+    """A scratch tree another uid wrote into is not ours to delete.
+
+    Box 3 carried one on 2026-10-15: a Claude scratchpad holding files a
+    container had written, which the chmod retry refuses to touch by design,
+    so rmtree could not finish and the run reported DEGRADED every night.
+    """
+
+    @staticmethod
+    def janitor_module():
+        import importlib.util
+        spec = importlib.util.spec_from_loader(
+            "agent_deck_janitor",
+            importlib.machinery.SourceFileLoader("agent_deck_janitor", str(JANITOR)),
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.module = self.janitor_module()
+
+    def test_our_own_tree_is_not_foreign(self) -> None:
+        tree = self.tmp / "ours"
+        (tree / "inner").mkdir(parents=True)
+        (tree / "inner" / "file").write_text("x")
+        self.assertFalse(self.module.Janitor.holds_foreign_entries(str(tree)))
+
+    def test_a_tree_owned_by_someone_else_is_foreign(self) -> None:
+        tree = self.tmp / "theirs"
+        (tree / "inner").mkdir(parents=True)
+        (tree / "inner" / "file").write_text("x")
+        # Creating a file as another uid needs root, so the comparison moves
+        # instead: every entry here belongs to someone who is not us.
+        original = self.module.os.getuid
+        self.module.os.getuid = lambda: original() + 1
+        self.addCleanup(setattr, self.module.os, "getuid", original)
+        self.assertTrue(self.module.Janitor.holds_foreign_entries(str(tree)))

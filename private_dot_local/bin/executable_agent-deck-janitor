@@ -855,6 +855,252 @@ class Janitor:
                 return "inside the grace window"
         return ""
 
+    # -- build output -------------------------------------------------------
+
+    def all_worktrees(self, repo):
+        """Every worktree of one repository, detached ones included.
+
+        self.worktrees() drops a detached worktree, because a merged pull
+        request is identified by its branch. Build output does not care, and
+        the largest idle tree on box 4 (16.9 GiB) was detached.
+        """
+        ok, out, summary = run([self.args.git, "-C", repo, "worktree", "list",
+                                "--porcelain"], timeout=120)
+        if not ok:
+            return None, summary
+        trees, current = [], None
+        for line in out.splitlines():
+            if line.startswith("worktree "):
+                if current:
+                    trees.append(current)
+                current = {"path": line.split(" ", 1)[1], "branch": ""}
+            elif line.startswith("branch ") and current is not None:
+                ref = line.split(" ", 1)[1]
+                prefix = "refs/heads/"
+                current["branch"] = ref[len(prefix):] if ref.startswith(prefix) else ref
+            elif line == "detached" and current is not None:
+                current["branch"] = ""
+        if current:
+            trees.append(current)
+        return trees, "ok"
+
+    def busy_session_paths(self):
+        """Paths held by a session that is actually working.
+
+        Build output is regenerable, so an idle row sitting in a worktree is no
+        reason to keep 26 GiB of it. A row that is RUNNING may be mid-build,
+        and deleting its target directory under it is not a reclaim, it is a
+        broken build. Unknown occupancy returns None and the caller does
+        nothing, exactly as live_session_paths does.
+        """
+        busy = set()
+        for profile in self.profiles():
+            ok, out, _ = run([self.args.agent_deck, "-p", profile, "list", "--json"],
+                             timeout=120)
+            if not ok:
+                return None
+            rows = load_json(out)
+            if not isinstance(rows, list):
+                return None
+            for row in rows:
+                if isinstance(row, dict) and row.get("status") == "running" \
+                        and isinstance(row.get("path"), str):
+                    busy.add(real(row["path"]))
+        return busy
+
+    def source_touched(self, path, skip):
+        """Newest mtime of the worktree's own source, newest first wins.
+
+        Build directories and .git are skipped, so a tree whose only recent
+        writes are compiler output still counts as untouched -- that is the
+        whole point: 87% of box 4's 549 GiB of worktrees was build output.
+        """
+        newest = 0.0
+        seen = 0
+        for base, dirs, files in os.walk(path, topdown=True):
+            dirs[:] = [d for d in dirs if d not in skip and d != ".git"]
+            for name in files:
+                try:
+                    newest = max(newest, os.lstat(os.path.join(base, name)).st_mtime)
+                except OSError:
+                    continue
+                seen += 1
+                if seen >= MAX_ENTRIES_PER_ROOT:
+                    return newest
+        return newest
+
+    def prune_build_output(self):
+        """Delete regenerable build directories inside idle worktrees.
+
+        Nothing tracked is lost and nothing is unlinked that git would miss;
+        the cost is a rebuild, and these boxes share one sccache. On box 4 on
+        2026-10-15, 479 of 549 GiB of worktrees was build output and five
+        worktrees untouched for a week held 65.9 GiB of it.
+        """
+        if not self.args.build_output_repo:
+            self.record("build_output", "SKIPPED")
+            return
+        busy = self.busy_session_paths()
+        if busy is None:
+            self.record("build_output", "DEGRADED",
+                        summary="session occupancy could not be established")
+            return
+        skip = set(self.args.build_output_name)
+        cutoff = self.now() - self.args.build_output_idle_days * 86400
+        detail = {}
+        worst = "OK"
+        for repo in self.args.build_output_repo:
+            entry = {"removed": [], "failed": [], "retained": 0, "bytes": 0}
+            trees, summary = self.all_worktrees(repo)
+            if trees is None:
+                entry["error"] = summary
+                worst = "DEGRADED"
+                detail[repo] = entry
+                continue
+            for tree in trees:
+                path = real(tree["path"])
+                if not os.path.isdir(path):
+                    continue
+                if any(held == path or held.startswith(path + os.sep) for held in busy):
+                    entry["retained"] += 1
+                    continue
+                if self.source_touched(path, skip) >= cutoff:
+                    entry["retained"] += 1
+                    continue
+                for name in sorted(skip):
+                    target = os.path.join(path, name)
+                    if os.path.islink(target) or not os.path.isdir(target):
+                        continue
+                    size = self.size_of(target)
+                    if not self.apply:
+                        entry["removed"].append({"path": target, "bytes": size})
+                        entry["bytes"] += size
+                        continue
+                    try:
+                        self.remove_entry(target)
+                        entry["removed"].append({"path": target, "bytes": size})
+                        entry["bytes"] += size
+                    except OSError as exc:
+                        entry["failed"].append({"path": target,
+                                                "error": exc.__class__.__name__})
+                        worst = "DEGRADED"
+            detail[repo] = entry
+        self.record("build_output", worst, applied=self.apply,
+                    idle_days=self.args.build_output_idle_days,
+                    names=sorted(skip), repositories=detail)
+
+    # -- dead worktrees -----------------------------------------------------
+
+    def dead_worktree_reason(self, root, tree, held, prs, cutoff, skip):
+        """Why this worktree is kept, or "" when nothing would be lost.
+
+        Four facts decide it, and any one of them keeps the tree: a session is
+        in it, it has uncommitted changes, it holds commits that are on no
+        remote, or its work is still open upstream. The unpushed check is the
+        one that makes the rest safe -- a branch that exists only on this box
+        is never dead, whatever GitHub says about a branch of the same name.
+        """
+        path = real(tree["path"])
+        if path == root:
+            return "primary worktree"
+        if any(h == path or h.startswith(path + os.sep) for h in held):
+            return "a session is using it"
+        ok, status, _ = run([self.args.git, "-C", path, "status", "--porcelain"],
+                            timeout=120)
+        if not ok:
+            return "status could not be read"
+        if status.strip():
+            return "uncommitted changes"
+        ok, unpushed, _ = run([self.args.git, "-C", path, "log", "--oneline",
+                               "HEAD", "--not", "--remotes"], timeout=120)
+        if not ok:
+            return "unpushed commits could not be read"
+        if unpushed.strip():
+            return "commits on no remote"
+        if self.source_touched(path, skip) >= cutoff:
+            return "touched inside the idle window"
+        branch = tree.get("branch", "")
+        if not branch:
+            # Detached: nothing upstream to ask about, and the three checks
+            # above already proved every commit here is on a remote.
+            return ""
+        ok, remote, _ = run([self.args.git, "-C", path, "ls-remote", "--heads",
+                             "origin", branch], timeout=120)
+        if not ok:
+            return "origin could not be read"
+        if not remote.strip():
+            # The sweep deletes a branch when it merges it, so an absent branch
+            # is the commonest shape of finished work here.
+            return ""
+        pr = (prs or {}).get(branch)
+        if pr and pr.get("state") in ("MERGED", "CLOSED"):
+            return ""
+        return "still open upstream"
+
+    def remove_dead_worktrees(self):
+        """Remove worktrees whose work is finished and fully pushed.
+
+        Preview and apply are separated from the global --apply on purpose:
+        this is the one task that can destroy something a person still wants,
+        so it is armed only by --dead-worktree-apply after its preview has been
+        read on a live box.
+        """
+        if not self.args.dead_worktree_repo:
+            self.record("dead_worktrees", "SKIPPED")
+            return
+        held = self.live_session_paths()
+        if held is None:
+            self.record("dead_worktrees", "DEGRADED",
+                        summary="session occupancy could not be established")
+            return
+        apply = self.apply and self.args.dead_worktree_apply
+        skip = set(self.args.build_output_name)
+        cutoff = self.now() - self.args.dead_worktree_idle_days * 86400
+        detail = {}
+        worst = "OK"
+        for repo in self.args.dead_worktree_repo:
+            entry = {"removed": [], "retained": [], "failed": [], "bytes": 0}
+            trees, summary = self.all_worktrees(repo)
+            if trees is None:
+                entry["error"] = summary
+                worst = "DEGRADED"
+                detail[repo] = entry
+                continue
+            prs, _ = self.pull_requests(repo) if self.args.gh else (None, "")
+            root = real(repo)
+            for tree in trees:
+                path = real(tree["path"])
+                if not os.path.isdir(path):
+                    continue
+                reason = self.dead_worktree_reason(root, tree, held, prs, cutoff, skip)
+                if reason:
+                    entry["retained"].append({"path": path, "reason": reason})
+                    continue
+                size = self.size_of(path)
+                if not apply:
+                    entry["removed"].append({"path": path, "branch": tree.get("branch", ""),
+                                             "bytes": size, "preview": True})
+                    entry["bytes"] += size
+                    continue
+                ok, _, summary = run([self.args.git, "-C", root, "worktree",
+                                      "remove", path], timeout=600)
+                if not ok:
+                    # Tracked cleanliness was established above, so the only
+                    # objection left is ignored build output.
+                    ok, _, summary = run([self.args.git, "-C", root, "worktree",
+                                          "remove", "--force", path], timeout=600)
+                if ok:
+                    entry["removed"].append({"path": path, "branch": tree.get("branch", ""),
+                                             "bytes": size})
+                    entry["bytes"] += size
+                else:
+                    entry["failed"].append({"path": path, "summary": summary})
+                    worst = "DEGRADED"
+            detail[repo] = entry
+        self.record("dead_worktrees", worst, applied=apply,
+                    idle_days=self.args.dead_worktree_idle_days,
+                    repositories=detail)
+
     # -- drift --------------------------------------------------------------
 
     def report_drift(self):
@@ -1216,6 +1462,8 @@ class Janitor:
         self.sweep_artifacts()
         self.sweep_expiring_paths()
         self.reclaim_merged_worktrees()
+        self.prune_build_output()
+        self.remove_dead_worktrees()
         self.sweep_tmux()
         self.report_drift()
         degraded = [t for t, r in self.results.items() if r["status"] == "DEGRADED"]
@@ -1261,6 +1509,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gh-attempts", type=int, default=3)
     parser.add_argument("--nix-generations-days", type=int, default=None)
     parser.add_argument("--nix-timeout", type=int, default=1800)
+    parser.add_argument("--build-output-repo", action="append", default=[],
+                        help="repository whose worktrees may have build output pruned")
+    parser.add_argument("--build-output-name", action="append", default=[],
+                        help="directory name treated as regenerable build output")
+    parser.add_argument("--build-output-idle-days", type=int, default=7)
+    parser.add_argument("--dead-worktree-repo", action="append", default=[],
+                        help="repository whose finished worktrees may be removed")
+    parser.add_argument("--dead-worktree-idle-days", type=int, default=7)
+    parser.add_argument("--dead-worktree-apply", action="store_true",
+                        help="actually remove dead worktrees (previews without it)")
     parser.add_argument("--tmux", default="tmux")
     parser.add_argument("--tmux-socket-root", action="append", default=[],
                         metavar="DIR")
@@ -1298,6 +1556,15 @@ def main(argv=None) -> int:
             raise Rejected("--restart-timeout must be positive")
         if not args.stale_agent_tool:
             args.stale_agent_tool = ["codex", "claude"]
+        if args.build_output_idle_days < 1:
+            raise Rejected("--build-output-idle-days must be positive")
+        if args.dead_worktree_idle_days < 1:
+            raise Rejected("--dead-worktree-idle-days must be positive")
+        if not args.build_output_name:
+            args.build_output_name = ["target", "_build", "node_modules", ".venv", "dist"]
+        for name in args.build_output_name:
+            if not name or "/" in name or name in (".", ".."):
+                raise Rejected("--build-output-name must be a single directory name")
         args.tmux_socket_root = [check_root(root) for root in args.tmux_socket_root]
         args.artifact = [parse_artifact_rule(rule) for rule in args.artifact]
         args.expiring = [parse_expiring_rule(rule) for rule in args.expiring]

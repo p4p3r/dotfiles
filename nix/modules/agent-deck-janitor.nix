@@ -114,6 +114,31 @@ let
     ]) cfg.tmuxSocketRoots
     # A socket name may begin with "-", for the same reason a keep pattern may.
     ++ map (name: "--protect-tmux-socket=${name}") cfg.protectedTmuxSockets
+    ++ lib.optionals (cfg.buildOutputRepositories != [ ]) (
+      [
+        "--build-output-idle-days"
+        (toString cfg.buildOutputIdleDays)
+      ]
+      ++ lib.concatMap (path: [
+        "--build-output-repo"
+        (systemdLiteral path)
+      ]) cfg.buildOutputRepositories
+      ++ lib.concatMap (name: [
+        "--build-output-name"
+        name
+      ]) cfg.buildOutputNames
+    )
+    ++ lib.optionals (cfg.deadWorktreeRepositories != [ ]) (
+      [
+        "--dead-worktree-idle-days"
+        (toString cfg.deadWorktreeIdleDays)
+      ]
+      ++ lib.optional cfg.deadWorktreeApply "--dead-worktree-apply"
+      ++ lib.concatMap (path: [
+        "--dead-worktree-repo"
+        (systemdLiteral path)
+      ]) cfg.deadWorktreeRepositories
+    )
     ++ lib.optionals cfg.recycleStaleAgents (
       [ "--recycle-stale-agents" ]
       # The tmux reaper already passes this when it runs; the pane lookup needs
@@ -350,6 +375,75 @@ in
         probe failure can never unlink it. Sessions on a protected socket are
         still judged by the ordinary rules: that socket is also where test
         harnesses leave their litter.
+      '';
+    };
+
+    buildOutputRepositories = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = ''
+        Repositories whose worktrees may have their build directories pruned.
+        A worktree qualifies when its own SOURCE has not been written for
+        buildOutputIdleDays; compiler output churning inside it does not count,
+        which is the whole point. On box 4 on 2026-10-15, 479 of 549 GiB held
+        in worktrees was build output and the box had filled its disk. Nothing
+        tracked is removed and git never notices: the cost is a rebuild, and
+        these boxes share one sccache. A worktree whose session is RUNNING is
+        skipped, because a build may be writing into it right now.
+      '';
+    };
+
+    buildOutputNames = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [
+        "target"
+        "_build"
+        "node_modules"
+        ".venv"
+        "dist"
+      ];
+      description = "Directory names treated as regenerable build output.";
+    };
+
+    buildOutputIdleDays = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 7;
+      description = "Days without a source write before build output is pruned.";
+    };
+
+    deadWorktreeRepositories = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = ''
+        Repositories whose finished worktrees may be removed. A worktree is
+        finished only when all four hold: no session is in it, it has no
+        uncommitted changes, it holds no commits that are on no remote, and
+        its branch is either gone from origin or its pull request is merged or
+        closed. The unpushed check is what makes the rest safe -- a branch
+        that exists only on this box is never finished, whatever GitHub says
+        about a branch of the same name.
+
+        reclaimMergedWorktrees covers only merged pull requests, and matched
+        nothing on box 4: the sweep deletes a branch when it merges it, so
+        finished work shows up as a branch that is gone rather than a merged
+        one.
+      '';
+    };
+
+    deadWorktreeIdleDays = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 7;
+      description = "Days without a source write before a finished worktree is removed.";
+    };
+
+    deadWorktreeApply = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Actually remove finished worktrees. Separate from the janitor's own
+        apply on purpose: this is the one task that can destroy something a
+        person still wants, so it previews -- reporting exactly what it would
+        remove -- until this is set deliberately.
       '';
     };
 

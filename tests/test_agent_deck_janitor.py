@@ -1402,3 +1402,196 @@ class ForeignScratchCase(unittest.TestCase):
         self.module.os.getuid = lambda: original() + 1
         self.addCleanup(setattr, self.module.os, "getuid", original)
         self.assertTrue(self.module.Janitor.holds_foreign_entries(str(tree)))
+
+
+class WorktreeSpaceCase(ReclaimCase):
+    """Build output inside idle worktrees, and worktrees whose work is done.
+
+    Inherits the real-git fixture: a repository, real worktrees, a fake gh and
+    a fake agent-deck whose session list this case drives.
+    """
+
+    def run_space(self, *extra, apply=False, task="build_output"):
+        self.write_agent_deck()
+        argv = [sys.executable, str(JANITOR),
+                "--agent-deck", str(self.bin / "agent-deck"),
+                "--gh", str(self.bin / "gh"),
+                "--git", "git",
+                "--state-dir", str(self.state),
+                "--profile", "default",
+                *extra]
+        if apply:
+            argv.append("--apply")
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=180,
+                              check=False)
+        self.assertTrue(done.stdout.strip(), done.stderr)
+        return done, json.loads(done.stdout)["tasks"][task]
+
+
+    @staticmethod
+    def age_source(path: Path, days: float, skip=("target",)) -> None:
+        """Age every source file in a worktree, leaving build output alone."""
+        for base, dirs, files in os.walk(path):
+            dirs[:] = [d for d in dirs if d not in skip]
+            for name in files:
+                age(Path(base) / name, days)
+            age(Path(base), days)
+
+    def push_everything(self):
+        """Give the repository an origin and push, so nothing is unpushed."""
+        origin = self.tmp / "origin.git"
+        self.git("init", "-q", "--bare", str(origin), cwd=self.tmp)
+        self.git("remote", "add", "origin", str(origin))
+        self.git("push", "-q", "origin", "--all")
+        return origin
+
+    # -- build output -------------------------------------------------------
+
+    def test_build_output_in_an_idle_worktree_is_removed_and_the_source_is_not(self):
+        path, _, _ = self.add_worktree("idle", ignored_bytes=4000)
+        self.age_source(path, 30)
+        _, task = self.run_space("--build-output-repo", str(self.repo),
+                                 "--build-output-idle-days", "7", apply=True)
+        entry = task["repositories"][str(self.repo)]
+        self.assertEqual([os.path.basename(r["path"]) for r in entry["removed"]], ["target"])
+        self.assertFalse((path / "target").exists())
+        self.assertTrue((path / "file").exists(), "source must survive")
+        self.assertTrue(path.exists(), "the worktree itself is not this task's business")
+
+    def test_recent_build_output_does_not_make_a_worktree_look_busy(self):
+        # The point of the rule: compiler output churns constantly, so only the
+        # source decides whether anyone is still working here.
+        path, _, _ = self.add_worktree("stale-source", ignored_bytes=4000)
+        self.age_source(path, 30)
+        os.utime(path / "target" / "big", None)
+        _, task = self.run_space("--build-output-repo", str(self.repo),
+                                 "--build-output-idle-days", "7", apply=True)
+        entry = task["repositories"][str(self.repo)]
+        self.assertEqual(len(entry["removed"]), 1)
+        self.assertFalse((path / "target").exists())
+
+    def test_a_touched_worktree_keeps_its_build_output(self):
+        path, _, _ = self.add_worktree("fresh", ignored_bytes=4000)
+        _, task = self.run_space("--build-output-repo", str(self.repo),
+                                 "--build-output-idle-days", "7", apply=True)
+        entry = task["repositories"][str(self.repo)]
+        self.assertEqual(entry["removed"], [])
+        self.assertEqual(entry["retained"], 2, "the worktree and the primary checkout")
+        self.assertTrue((path / "target").exists())
+
+    def test_a_running_session_keeps_its_build_output(self):
+        path, _, _ = self.add_worktree("building", ignored_bytes=4000)
+        self.age_source(path, 30)
+        self.sessions = [{"id": "s-1", "title": "impl", "status": "running",
+                          "path": str(path)}]
+        _, task = self.run_space("--build-output-repo", str(self.repo),
+                                 "--build-output-idle-days", "7", apply=True)
+        entry = task["repositories"][str(self.repo)]
+        self.assertEqual(entry["removed"], [])
+        self.assertTrue((path / "target").exists(),
+                        "a build may be running inside it right now")
+
+    def test_an_idle_session_does_not_keep_build_output(self):
+        path, _, _ = self.add_worktree("parked", ignored_bytes=4000)
+        self.age_source(path, 30)
+        self.sessions = [{"id": "s-1", "title": "impl", "status": "waiting",
+                          "path": str(path)}]
+        _, task = self.run_space("--build-output-repo", str(self.repo),
+                                 "--build-output-idle-days", "7", apply=True)
+        entry = task["repositories"][str(self.repo)]
+        self.assertEqual(len(entry["removed"]), 1)
+
+    # -- dead worktrees -----------------------------------------------------
+
+    def test_a_pushed_finished_worktree_previews_but_is_not_removed(self):
+        self.push_everything()
+        path, branch, _ = self.add_worktree("done")
+        self.git("push", "-q", "origin", branch)
+        self.git("push", "-q", "origin", "--delete", branch)
+        self.age_source(path, 30)
+        self.write_gh([])
+        _, task = self.run_space("--dead-worktree-repo", str(self.repo),
+                                 "--dead-worktree-idle-days", "7",
+                                 apply=True, task="dead_worktrees")
+        entry = task["repositories"][str(self.repo)]
+        self.assertEqual([r["branch"] for r in entry["removed"]], [branch])
+        self.assertTrue(all(r.get("preview") for r in entry["removed"]))
+        self.assertFalse(task["applied"])
+        self.assertTrue(path.exists(), "preview must remove nothing")
+
+    def test_the_same_worktree_is_removed_once_the_task_is_armed(self):
+        self.push_everything()
+        path, branch, _ = self.add_worktree("done")
+        self.git("push", "-q", "origin", branch)
+        self.git("push", "-q", "origin", "--delete", branch)
+        self.age_source(path, 30)
+        self.write_gh([])
+        _, task = self.run_space("--dead-worktree-repo", str(self.repo),
+                                 "--dead-worktree-idle-days", "7",
+                                 "--dead-worktree-apply",
+                                 apply=True, task="dead_worktrees")
+        self.assertTrue(task["applied"])
+        self.assertFalse(path.exists())
+
+    def test_a_worktree_holding_commits_on_no_remote_is_never_dead(self):
+        self.push_everything()
+        path, branch, _ = self.add_worktree("local-only", extra_commit=True)
+        self.age_source(path, 30)
+        self.write_gh([])
+        _, task = self.run_space("--dead-worktree-repo", str(self.repo),
+                                 "--dead-worktree-idle-days", "7",
+                                 "--dead-worktree-apply",
+                                 apply=True, task="dead_worktrees")
+        entry = task["repositories"][str(self.repo)]
+        self.assertEqual(entry["removed"], [])
+        self.assertIn("commits on no remote",
+                      [r["reason"] for r in entry["retained"]])
+        self.assertTrue(path.exists())
+
+    def test_an_open_branch_is_kept_even_when_everything_is_pushed(self):
+        self.push_everything()
+        path, branch, _ = self.add_worktree("open")
+        self.git("push", "-q", "origin", branch)
+        self.age_source(path, 30)
+        self.write_gh([])
+        _, task = self.run_space("--dead-worktree-repo", str(self.repo),
+                                 "--dead-worktree-idle-days", "7",
+                                 "--dead-worktree-apply",
+                                 apply=True, task="dead_worktrees")
+        entry = task["repositories"][str(self.repo)]
+        self.assertEqual(entry["removed"], [])
+        self.assertIn("still open upstream",
+                      [r["reason"] for r in entry["retained"]])
+
+    def test_a_closed_pull_request_ends_a_worktree_whose_branch_still_exists(self):
+        self.push_everything()
+        path, branch, head = self.add_worktree("closed")
+        self.git("push", "-q", "origin", branch)
+        self.age_source(path, 30)
+        self.write_gh([{"headRefName": branch, "headRefOid": head, "state": "CLOSED",
+                        "number": 7, "mergedAt": None}])
+        _, task = self.run_space("--dead-worktree-repo", str(self.repo),
+                                 "--dead-worktree-idle-days", "7",
+                                 "--dead-worktree-apply",
+                                 apply=True, task="dead_worktrees")
+        entry = task["repositories"][str(self.repo)]
+        self.assertEqual([r["branch"] for r in entry["removed"]], [branch])
+        self.assertFalse(path.exists())
+
+    def test_a_session_in_a_finished_worktree_keeps_it(self):
+        self.push_everything()
+        path, branch, _ = self.add_worktree("occupied")
+        self.git("push", "-q", "origin", branch)
+        self.git("push", "-q", "origin", "--delete", branch)
+        self.age_source(path, 30)
+        self.sessions = [{"id": "s-1", "title": "impl", "status": "waiting",
+                          "path": str(path)}]
+        self.write_gh([])
+        _, task = self.run_space("--dead-worktree-repo", str(self.repo),
+                                 "--dead-worktree-idle-days", "7",
+                                 "--dead-worktree-apply",
+                                 apply=True, task="dead_worktrees")
+        entry = task["repositories"][str(self.repo)]
+        self.assertEqual(entry["removed"], [])
+        self.assertIn("a session is using it",
+                      [r["reason"] for r in entry["retained"]])

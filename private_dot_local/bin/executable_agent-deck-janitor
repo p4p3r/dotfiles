@@ -47,6 +47,9 @@ FORBIDDEN_ROOTS = frozenset({
 # live box exceeded immediately: the sweep stopped at an alphabetical prefix
 # and the rest of the root was never reached on any run, however often it ran.
 MAX_ENTRIES_PER_ROOT = 65536
+# A process tree deep enough to need more hops than this is a cycle or a fork
+# bomb, not an agent in a tmux pane.
+MAX_PROCESS_DEPTH = 32
 DEFAULT_COMMAND_TIMEOUT = 300
 
 
@@ -893,6 +896,176 @@ class Janitor:
                 continue
         return True, found
 
+    # -- stale agent binaries ------------------------------------------------
+
+    def stale_agent_pids(self):
+        """Agent processes whose own binary has been deleted under them.
+
+        The hourly CLI updater replaces ~/.npm-global's codex and claude in
+        place. A process already running keeps the old inode, so /proc/<pid>/exe
+        reads "<path> (deleted)" and the agent goes on speaking a protocol the
+        server may no longer accept for it. On 2026-10-14 box 4 held 63 such
+        codex processes, all started from 0.145.0, and every turn they took
+        came back as:
+
+            The 'gpt-6-luna' model is not supported when using Codex with a
+            ChatGPT account.
+
+        which reads as a withdrawn model and is really a withdrawn client.
+        """
+        root = self.args.proc_root
+        wanted = frozenset(self.args.stale_agent_tool)
+        found = {}
+        try:
+            entries = sorted(os.listdir(root))
+        except OSError:
+            return None
+        for name in entries:
+            if not name.isdigit():
+                continue
+            try:
+                with open(os.path.join(root, name, "comm"), "r") as fh:
+                    comm = fh.read().strip()
+            except OSError:
+                continue
+            if comm not in wanted:
+                continue
+            try:
+                target = os.readlink(os.path.join(root, name, "exe"))
+            except OSError:
+                # A process that exits mid-scan is not a finding.
+                continue
+            if target.endswith(" (deleted)"):
+                found[int(name)] = comm
+        return found
+
+    def process_ancestry(self, pid):
+        """pid and its ancestors, nearest first, bounded against a cycle."""
+        chain = []
+        current = pid
+        for _ in range(MAX_PROCESS_DEPTH):
+            chain.append(current)
+            try:
+                with open(os.path.join(self.args.proc_root, str(current), "stat"), "r") as fh:
+                    stat_line = fh.read()
+            except OSError:
+                break
+            # The second field is the executable name in parentheses and may
+            # itself contain spaces or parentheses, so split after the last one.
+            tail = stat_line.rpartition(")")[2].split()
+            if len(tail) < 2 or not tail[1].isdigit():
+                break
+            parent = int(tail[1])
+            if parent <= 1 or parent in chain:
+                break
+            current = parent
+        return chain
+
+    def tmux_pane_owners(self):
+        """{pane pid: tmux session name} across the sockets we protect.
+
+        Those are the sockets Agent Deck itself runs rows on; a socket nobody
+        protects is test litter, and sweep_tmux already owns it.
+        """
+        owners = {}
+        sockets = list(self.args.protect_tmux_socket) or ["default"]
+        for socket in sockets:
+            ok, out, _ = run([self.args.tmux, "-L", socket, "list-panes", "-a", "-F",
+                              "#{session_name}\t#{pane_pid}"],
+                             timeout=self.args.tmux_timeout)
+            if not ok:
+                continue
+            for line in out.splitlines():
+                name, _, pane = line.partition("\t")
+                if name and pane.strip().isdigit():
+                    owners[int(pane.strip())] = name
+        return owners
+
+    def recycle_stale_agents(self):
+        """Restart rows whose agent is running a binary that no longer exists.
+
+        A restart is the whole fix: the row keeps its id, its title and its
+        transcript, and comes back on the binary that is on disk now. It is
+        still destructive to anything in flight, so a running row is left for
+        the next run, and a row someone is watching or one that is protected is
+        never touched -- the same three guards stop_idle_sessions uses.
+        """
+        if not self.args.recycle_stale_agents:
+            self.record("stale_agents", "SKIPPED")
+            return
+        if not os.path.isdir(self.args.proc_root):
+            # Not Linux, or a sandbox without /proc: report it rather than
+            # claiming a clean box.
+            self.record("stale_agents", "SKIPPED",
+                        summary=f"{self.args.proc_root} is not readable")
+            return
+        stale = self.stale_agent_pids()
+        if stale is None:
+            self.record("stale_agents", "DEGRADED", applied=self.apply,
+                        summary=f"{self.args.proc_root} could not be listed")
+            return
+        owners = self.tmux_pane_owners()
+        panes = {}
+        for pid, comm in stale.items():
+            for ancestor in self.process_ancestry(pid):
+                session = owners.get(ancestor)
+                if session:
+                    panes.setdefault(session, []).append({"pid": pid, "tool": comm})
+                    break
+        detail = {}
+        worst = "OK"
+        for profile in self.profiles():
+            ok, out, summary = run([self.args.agent_deck, "-p", profile, "list", "--json"],
+                                   timeout=120)
+            rows = load_json(out) if ok else None
+            if not ok or not isinstance(rows, list):
+                detail[profile] = {"ok": False,
+                                   "summary": summary if not ok else "list did not return an array"}
+                worst = "DEGRADED"
+                continue
+            restarted, failed = [], []
+            kept = {"running": 0, "watched": 0, "protected": 0, "other": 0}
+            for row in rows:
+                if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+                    continue
+                processes = panes.get(row.get("tmux_session"))
+                if not processes:
+                    continue
+                status = row.get("status")
+                if status == "running":
+                    # Work in flight. The deleted binary only bites on the next
+                    # request, so this row is tomorrow's.
+                    kept["running"] += 1
+                    continue
+                if status not in ("waiting", "idle"):
+                    kept["other"] += 1
+                    continue
+                if row.get("title") in self.args.protect_session_title:
+                    kept["protected"] += 1
+                    continue
+                if row.get("viewers"):
+                    kept["watched"] += 1
+                    continue
+                entry = {"id": row["id"], "title": row.get("title"),
+                         "tools": sorted({p["tool"] for p in processes}),
+                         "processes": len(processes)}
+                if not self.apply:
+                    restarted.append(entry)
+                    continue
+                ok, _, summary = run([self.args.agent_deck, "-p", profile,
+                                      "session", "restart", row["id"], "--force"],
+                                     timeout=self.args.restart_timeout)
+                if ok:
+                    restarted.append(entry)
+                else:
+                    failed.append({"id": row["id"], "summary": summary})
+                    worst = "DEGRADED"
+            detail[profile] = {"ok": True, "restarted": restarted, "failed": failed,
+                               "kept": kept}
+        self.record("stale_agents", worst, applied=self.apply,
+                    stale_processes=len(stale), stale_panes=len(panes),
+                    profiles=detail)
+
     def sweep_tmux(self):
         """Kill abandoned tmux sessions and delete the sockets left behind.
 
@@ -1004,6 +1177,7 @@ class Janitor:
         # Stopping runs before the sweep so a row stopped today is reclaimed by
         # a later run, never by this one: two separate windows, two separate
         # days, and a chance to notice in between.
+        self.recycle_stale_agents()
         self.stop_idle_sessions()
         self.sweep_sessions()
         self.sweep_groups()
@@ -1063,6 +1237,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tmux-idle-days", type=int, default=7)
     parser.add_argument("--tmux-timeout", type=int, default=30)
     parser.add_argument("--protect-tmux-socket", action="append", default=[])
+    parser.add_argument("--recycle-stale-agents", action="store_true",
+                        help="restart rows whose agent binary was replaced under it")
+    parser.add_argument("--stale-agent-tool", action="append", default=[],
+                        help="process name to treat as an agent (default: codex, claude)")
+    parser.add_argument("--proc-root", default="/proc")
+    parser.add_argument("--restart-timeout", type=int, default=180)
     parser.add_argument("--apply", action="store_true",
                         help="perform deletions; without it every task is a preview")
     return parser
@@ -1084,6 +1264,10 @@ def main(argv=None) -> int:
             # would be silently ignored, because the CLI never lists it later
             # than the general window does.
             raise Rejected("--stopped-retention-days cannot exceed --session-retention-days")
+        if args.restart_timeout < 1:
+            raise Rejected("--restart-timeout must be positive")
+        if not args.stale_agent_tool:
+            args.stale_agent_tool = ["codex", "claude"]
         args.tmux_socket_root = [check_root(root) for root in args.tmux_socket_root]
         args.artifact = [parse_artifact_rule(rule) for rule in args.artifact]
         args.expiring = [parse_expiring_rule(rule) for rule in args.expiring]

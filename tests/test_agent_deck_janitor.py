@@ -1147,3 +1147,216 @@ sys.exit(0)
         self.assertEqual(profile["failed"], [])
         self.assertEqual([r["id"] for r in profile["revived"]], ["woke-0001"])
         self.assertEqual(profile["removed"], [])
+
+
+class StaleAgentCase(unittest.TestCase):
+    """Recycling rows whose agent binary was replaced under them.
+
+    The fixture builds a /proc of its own: a directory per pid holding `comm`,
+    `stat` and an `exe` symlink. A deleted binary is modelled the way Linux
+    reports it, with the " (deleted)" suffix on the link target.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        self.state = self.tmp / "state"
+        self.proc = self.tmp / "proc"
+        self.proc.mkdir()
+        self.calls = self.tmp / "calls"
+        self.calls.mkdir()
+        self.panes: list[tuple[str, int]] = []
+        self.rows: list[dict] = []
+        self.write_tmux()
+
+    # -- fakes --------------------------------------------------------------
+
+    def write_agent_deck(self, restart_exit: int = 0) -> None:
+        payload = json.dumps(self.rows)
+        write_executable(self.bin / "agent-deck", f"""#!/usr/bin/env python3
+import os, pathlib, sys
+argv = sys.argv[1:]
+calls = pathlib.Path(os.environ["CALLS"]) / "agent-deck"
+with calls.open("a") as fh:
+    fh.write(" ".join(argv) + chr(10))
+if argv[2:] == ["list", "--json"]:
+    sys.stdout.write({payload!r}); sys.exit(0)
+if argv[2:4] == ["session", "restart"]:
+    if {restart_exit}:
+        sys.stderr.write("restart failed" + chr(10)); sys.exit({restart_exit})
+    sys.exit(0)
+if argv[2:4] == ["session", "cleanup"]:
+    sys.stdout.write('{{"candidates": []}}'); sys.exit(0)
+sys.exit(0)
+""")
+
+    def write_tmux(self) -> None:
+        panes = json.dumps(self.panes)
+        write_executable(self.bin / "tmux", f"""#!/usr/bin/env python3
+import json, sys
+argv = sys.argv[1:]
+if argv[0] == "-L" and argv[2:3] == ["list-panes"]:
+    for name, pid in json.loads({panes!r}):
+        sys.stdout.write("%s\\t%s" % (name, pid) + chr(10))
+    sys.exit(0)
+sys.exit(0)
+""")
+
+    # -- fixtures -----------------------------------------------------------
+
+    def add_process(self, pid: int, comm: str, ppid: int = 1,
+                    deleted: bool = False) -> None:
+        entry = self.proc / str(pid)
+        entry.mkdir()
+        (entry / "comm").write_text(comm + "\n")
+        # Field two is the name in parentheses; a real one can contain spaces.
+        (entry / "stat").write_text(f"{pid} ({comm}) S {ppid} 0 0\n")
+        target = self.tmp / f"{comm}-binary"
+        if not target.exists():
+            target.write_text("#!/bin/sh\n")
+        link = str(target) + (" (deleted)" if deleted else "")
+        os.symlink(link, entry / "exe")
+
+    def add_pane(self, session: str, pid: int) -> None:
+        self.panes.append((session, pid))
+        self.write_tmux()
+
+    def add_row(self, **row) -> None:
+        self.rows.append(row)
+        self.write_agent_deck()
+
+    def run_janitor(self, *extra, apply=False):
+        argv = [sys.executable, str(JANITOR),
+                "--agent-deck", str(self.bin / "agent-deck"),
+                "--git", "git",
+                "--state-dir", str(self.state),
+                "--profile", "default",
+                "--tmux", str(self.bin / "tmux"),
+                "--proc-root", str(self.proc),
+                "--protect-tmux-socket", "agent-deck",
+                *extra]
+        if apply:
+            argv.append("--apply")
+        env = dict(os.environ, CALLS=str(self.calls))
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=120,
+                              check=False, env=env)
+        report = json.loads(done.stdout) if done.stdout.strip() else None
+        return done, report
+
+    def agent_deck_calls(self):
+        path = self.calls / "agent-deck"
+        return path.read_text().splitlines() if path.exists() else []
+
+    def stale_task(self, *extra, apply=False):
+        done, report = self.run_janitor("--recycle-stale-agents", *extra, apply=apply)
+        self.assertEqual(done.returncode, 0 if report["status"] == "OK" else 1,
+                         done.stderr)
+        return report["tasks"]["stale_agents"]
+
+    # -- tests --------------------------------------------------------------
+
+    def test_the_task_is_skipped_unless_asked_for(self) -> None:
+        self.write_agent_deck()
+        _, report = self.run_janitor()
+        self.assertEqual(report["tasks"]["stale_agents"]["status"], "SKIPPED")
+
+    def test_a_deleted_binary_is_found_through_the_pane_that_owns_it(self) -> None:
+        self.add_process(4100, "bash", ppid=1)
+        self.add_process(4200, "codex", ppid=4100, deleted=True)
+        self.add_pane("agentdeck_fixround_abc", 4100)
+        self.add_row(id="row-0001", title="fixround", status="waiting",
+                     tmux_session="agentdeck_fixround_abc")
+        task = self.stale_task()
+        profile = task["profiles"]["default"]
+        self.assertEqual(task["stale_processes"], 1)
+        self.assertEqual([r["id"] for r in profile["restarted"]], ["row-0001"])
+        self.assertEqual([r["tools"] for r in profile["restarted"]], [["codex"]])
+
+    def test_a_preview_restarts_nothing(self) -> None:
+        self.add_process(4100, "bash", ppid=1)
+        self.add_process(4200, "codex", ppid=4100, deleted=True)
+        self.add_pane("agentdeck_fixround_abc", 4100)
+        self.add_row(id="row-0001", title="fixround", status="waiting",
+                     tmux_session="agentdeck_fixround_abc")
+        self.stale_task()
+        self.assertEqual([c for c in self.agent_deck_calls() if "session restart" in c],
+                         [])
+
+    def test_applying_restarts_the_row(self) -> None:
+        self.add_process(4100, "bash", ppid=1)
+        self.add_process(4200, "claude", ppid=4100, deleted=True)
+        self.add_pane("agentdeck_review_abc", 4100)
+        self.add_row(id="row-0002", title="review", status="idle",
+                     tmux_session="agentdeck_review_abc")
+        self.stale_task(apply=True)
+        line = [c for c in self.agent_deck_calls() if "session restart" in c][0]
+        self.assertIn("row-0002", line)
+        self.assertIn("--force", line)
+
+    def test_a_current_binary_is_left_alone(self) -> None:
+        self.add_process(4100, "bash", ppid=1)
+        self.add_process(4200, "codex", ppid=4100, deleted=False)
+        self.add_pane("agentdeck_fresh_abc", 4100)
+        self.add_row(id="row-0003", title="fresh", status="waiting",
+                     tmux_session="agentdeck_fresh_abc")
+        task = self.stale_task(apply=True)
+        self.assertEqual(task["stale_processes"], 0)
+        self.assertEqual(task["profiles"]["default"]["restarted"], [])
+        self.assertEqual([c for c in self.agent_deck_calls() if "session restart" in c],
+                         [])
+
+    def test_running_watched_and_protected_rows_are_kept(self) -> None:
+        for pid, session, row in ((4200, "agentdeck_busy_a", "row-run"),
+                                  (4300, "agentdeck_seen_b", "row-watch"),
+                                  (4400, "agentdeck_keep_c", "row-protect")):
+            self.add_process(pid, "codex", ppid=1, deleted=True)
+            self.add_pane(session, pid)
+        self.add_row(id="row-run", title="busy", status="running",
+                     tmux_session="agentdeck_busy_a")
+        self.add_row(id="row-watch", title="seen", status="waiting",
+                     tmux_session="agentdeck_seen_b", viewers=["tty1"])
+        self.add_row(id="row-protect", title="conductor-semgrep", status="waiting",
+                     tmux_session="agentdeck_keep_c")
+        task = self.stale_task("--protect-session-title", "conductor-semgrep",
+                               apply=True)
+        profile = task["profiles"]["default"]
+        self.assertEqual(profile["restarted"], [])
+        self.assertEqual(profile["kept"], {"running": 1, "watched": 1,
+                                           "protected": 1, "other": 0})
+        self.assertEqual([c for c in self.agent_deck_calls() if "session restart" in c],
+                         [])
+
+    def test_a_failed_restart_degrades_without_stopping_the_rest(self) -> None:
+        self.add_process(4200, "codex", ppid=1, deleted=True)
+        self.add_process(4300, "codex", ppid=1, deleted=True)
+        self.add_pane("agentdeck_one_a", 4200)
+        self.add_pane("agentdeck_two_b", 4300)
+        self.rows = [{"id": "row-a", "title": "one", "status": "waiting",
+                      "tmux_session": "agentdeck_one_a"},
+                     {"id": "row-b", "title": "two", "status": "waiting",
+                      "tmux_session": "agentdeck_two_b"}]
+        self.write_agent_deck(restart_exit=1)
+        done, report = self.run_janitor("--recycle-stale-agents", apply=True)
+        self.assertEqual(done.returncode, 1)
+        task = report["tasks"]["stale_agents"]
+        self.assertEqual(task["status"], "DEGRADED")
+        self.assertEqual([f["id"] for f in task["profiles"]["default"]["failed"]],
+                         ["row-a", "row-b"])
+
+    def test_a_pane_with_no_row_is_not_restarted(self) -> None:
+        self.add_process(4200, "codex", ppid=1, deleted=True)
+        self.add_pane("agentdeck_orphan_a", 4200)
+        self.write_agent_deck()
+        task = self.stale_task(apply=True)
+        self.assertEqual(task["stale_panes"], 1)
+        self.assertEqual(task["profiles"]["default"]["restarted"], [])
+
+    def test_an_unreadable_proc_root_is_reported_not_assumed_clean(self) -> None:
+        self.write_agent_deck()
+        _, report = self.run_janitor("--recycle-stale-agents",
+                                     "--proc-root", str(self.tmp / "absent"))
+        task = report["tasks"]["stale_agents"]
+        self.assertEqual(task["status"], "SKIPPED")
+        self.assertIn("not readable", task["summary"])

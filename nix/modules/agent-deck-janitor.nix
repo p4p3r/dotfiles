@@ -113,7 +113,20 @@ let
       (systemdLiteral path)
     ]) cfg.tmuxSocketRoots
     # A socket name may begin with "-", for the same reason a keep pattern may.
-    ++ map (name: "--protect-tmux-socket=${name}") cfg.protectedTmuxSockets;
+    ++ map (name: "--protect-tmux-socket=${name}") cfg.protectedTmuxSockets
+    ++ lib.optionals cfg.recycleStaleAgents (
+      [ "--recycle-stale-agents" ]
+      # The tmux reaper already passes this when it runs; the pane lookup needs
+      # it whether or not that task is enabled.
+      ++ lib.optionals (cfg.tmuxSocketRoots == [ ]) [
+        "--tmux"
+        "${pkgs.tmux}/bin/tmux"
+      ]
+      ++ lib.concatMap (name: [
+        "--stale-agent-tool"
+        name
+      ]) cfg.staleAgentTools
+    );
 in
 {
   options.programs.agent-deck-janitor = {
@@ -337,6 +350,33 @@ in
         probe failure can never unlink it. Sessions on a protected socket are
         still judged by the ordinary rules: that socket is also where test
         harnesses leave their litter.
+      '';
+    };
+
+    recycleStaleAgents = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Restart rows whose agent process is running a binary that no longer
+        exists on disk. The hourly CLI updater replaces codex and claude in
+        place, so a long-lived pane keeps the old inode and goes on speaking a
+        protocol the server may already refuse for it: on 2026-10-14 box 4 held
+        63 such codex processes, every one of them answering a new turn with
+        "The 'gpt-6-luna' model is not supported when using Codex with a
+        ChatGPT account". A restart keeps the row, its title and its
+        transcript. A running row, a watched one and a protected title are
+        never restarted.
+      '';
+    };
+
+    staleAgentTools = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [
+        "codex"
+        "claude"
+      ];
+      description = ''
+        Process names treated as agents when looking for a deleted binary.
       '';
     };
 

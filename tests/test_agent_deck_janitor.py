@@ -1760,3 +1760,90 @@ class StaleAgentMissingPathCase(StaleAgentCase):
         task = self.stale_task(apply=True)
         self.assertEqual([r["id"] for r in task["profiles"]["default"]["restarted"]],
                          ["row-live"])
+
+
+class OccupancyCase(WorktreeSpaceCase):
+    """Which rows actually keep a worktree.
+
+    Box 4 held 218 GiB behind "a session is using it" on 2026-10-16, while 19
+    of those rows were stopped and 9 errored -- four of them holding 149 GiB
+    with no live pane. A row that cannot come back is not using anything.
+    """
+
+    def finished_worktree(self, name):
+        self.push_everything()
+        path, branch, _ = self.add_worktree(name)
+        self.git("push", "-q", "origin", branch)
+        self.git("push", "-q", "origin", "--delete", branch)
+        self.age_source(path, 30)
+        self.write_gh([])
+        return path, branch
+
+    def test_a_waiting_row_keeps_its_worktree(self) -> None:
+        path, _ = self.finished_worktree("parked")
+        self.sessions = [{"id": "s-1", "title": "review", "status": "waiting",
+                          "path": str(path)}]
+        _, task = self.run_space("--dead-worktree-repo", str(self.repo),
+                                 "--dead-worktree-idle-days", "7",
+                                 "--dead-worktree-apply",
+                                 apply=True, task="dead_worktrees")
+        entry = task["repositories"][str(self.repo)]
+        self.assertEqual(entry["removed"], [])
+        self.assertIn("a session is using it", [r["reason"] for r in entry["retained"]])
+        self.assertTrue(path.exists())
+
+    def test_a_stopped_row_does_not_keep_its_worktree(self) -> None:
+        path, branch = self.finished_worktree("abandoned-stopped")
+        self.sessions = [{"id": "s-1", "title": "impl", "status": "stopped",
+                          "path": str(path)}]
+        _, task = self.run_space("--dead-worktree-repo", str(self.repo),
+                                 "--dead-worktree-idle-days", "7",
+                                 "--dead-worktree-apply",
+                                 apply=True, task="dead_worktrees")
+        entry = task["repositories"][str(self.repo)]
+        self.assertEqual([r["branch"] for r in entry["removed"]], [branch])
+        self.assertFalse(path.exists())
+
+    def test_an_errored_row_does_not_keep_its_worktree(self) -> None:
+        path, branch = self.finished_worktree("abandoned-error")
+        self.sessions = [{"id": "s-1", "title": "impl", "status": "error",
+                          "path": str(path)}]
+        _, task = self.run_space("--dead-worktree-repo", str(self.repo),
+                                 "--dead-worktree-idle-days", "7",
+                                 "--dead-worktree-apply",
+                                 apply=True, task="dead_worktrees")
+        entry = task["repositories"][str(self.repo)]
+        self.assertEqual([r["branch"] for r in entry["removed"]], [branch])
+
+    def test_a_stopped_row_with_uncommitted_work_is_still_kept(self) -> None:
+        # Narrowing occupancy must not narrow the guard that matters.
+        self.push_everything()
+        path, branch, _ = self.add_worktree("stopped-dirty")
+        self.git("push", "-q", "origin", branch)
+        self.git("push", "-q", "origin", "--delete", branch)
+        (path / "file").write_text("half-finished work")
+        self.age_source(path, 30)
+        self.write_gh([])
+        self.sessions = [{"id": "s-1", "title": "impl", "status": "stopped",
+                          "path": str(path)}]
+        _, task = self.run_space("--dead-worktree-repo", str(self.repo),
+                                 "--dead-worktree-idle-days", "7",
+                                 "--dead-worktree-apply",
+                                 apply=True, task="dead_worktrees")
+        entry = task["repositories"][str(self.repo)]
+        self.assertEqual(entry["removed"], [])
+        self.assertIn("uncommitted changes", [r["reason"] for r in entry["retained"]])
+        self.assertTrue(path.exists())
+
+    def test_the_merged_worktree_reclaimer_still_honours_every_row(self) -> None:
+        # reclaim_merged_worktrees keeps its own, wider notion of occupancy:
+        # this change is scoped to the dead-worktree rule.
+        path, branch, head = self.add_worktree("merged-stopped", ignored_bytes=1000)
+        self.write_gh([{"headRefName": branch, "headRefOid": head, "state": "MERGED",
+                        "number": 21, "mergedAt": "2026-01-01T00:00:00Z"}])
+        self.sessions = [{"id": "s-1", "title": "impl", "status": "stopped",
+                          "path": str(path)}]
+        _, task = self.run_janitor(apply=True)
+        _, retained, _ = self.outcome(task)
+        self.assertEqual(retained.get(branch), "a session is using it")
+        self.assertTrue(path.exists())

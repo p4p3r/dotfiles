@@ -908,6 +908,35 @@ class Janitor:
                     busy.add(real(row["path"]))
         return busy
 
+    def occupied_session_paths(self):
+        """Paths a session could still come back to.
+
+        live_session_paths() counts every row whatever its status, which is
+        right for the tmux reaper -- a stopped row still claims its pane, and
+        an operator returns to it. It is wrong for removing a worktree: box 4
+        held 218 GiB behind this guard on 2026-10-16 while 19 of those rows
+        were stopped and 9 were errored, four of them holding 149 GiB between
+        them with no live pane at all. A stopped or errored row is not using
+        its worktree, and the other three guards -- uncommitted changes,
+        commits on no remote, open upstream -- are what actually protect the
+        work in it. Unknown occupancy still returns None and reclaims nothing.
+        """
+        occupied = set()
+        for profile in self.profiles():
+            ok, out, _ = run([self.args.agent_deck, "-p", profile, "list", "--json"],
+                             timeout=120)
+            if not ok:
+                return None
+            rows = load_json(out)
+            if not isinstance(rows, list):
+                return None
+            for row in rows:
+                if not isinstance(row, dict) or not isinstance(row.get("path"), str):
+                    continue
+                if row.get("status") in ("running", "waiting", "idle", "starting"):
+                    occupied.add(real(row["path"]))
+        return occupied
+
     def source_touched(self, path, skip):
         """Newest mtime of the worktree's own source, newest first wins.
 
@@ -1094,7 +1123,7 @@ class Janitor:
         if not self.args.dead_worktree_repo:
             self.record("dead_worktrees", "SKIPPED")
             return
-        held = self.live_session_paths()
+        held = self.occupied_session_paths()
         if held is None:
             self.record("dead_worktrees", "DEGRADED",
                         summary="session occupancy could not be established")

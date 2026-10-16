@@ -133,6 +133,10 @@ let
         "--dead-worktree-idle-days"
         (toString cfg.deadWorktreeIdleDays)
       ]
+      ++ lib.concatMap (name: [
+        "--dirty-ignore-untracked"
+        name
+      ]) cfg.dirtyIgnoreUntracked
       ++ lib.optional cfg.deadWorktreeApply "--dead-worktree-apply"
       ++ lib.concatMap (path: [
         "--dead-worktree-repo"
@@ -434,6 +438,20 @@ in
       type = lib.types.ints.positive;
       default = 7;
       description = "Days without a source write before a finished worktree is removed.";
+    };
+
+    dirtyIgnoreUntracked = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = ''
+        Untracked top-level names that do not count as uncommitted work when
+        deciding whether a worktree is finished. An agent entering a worktree
+        leaves .direnv/ and .devenv/ behind immediately, so without this every
+        worktree looks dirty forever: 18 of box 4's 35 retained trees on
+        2026-10-15 held nothing else, and 11 of those belonged to pull requests
+        that had already merged. A TRACKED modification always counts, whatever
+        it is named.
+      '';
     };
 
     deadWorktreeApply = lib.mkOption {

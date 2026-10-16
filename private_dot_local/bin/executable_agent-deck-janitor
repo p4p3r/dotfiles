@@ -991,6 +991,47 @@ class Janitor:
 
     # -- dead worktrees -----------------------------------------------------
 
+    def dirty_entries(self, status):
+        """Working-tree changes that count, ignoring tooling state.
+
+        Every worktree here carries .direnv/ and .devenv/ the moment an agent
+        enters it, so `status --porcelain` is never empty and a worktree is
+        never judged clean: 18 of box 4's 35 "uncommitted" trees had nothing
+        else, and 11 of them belonged to pull requests that had already merged.
+        A TRACKED modification always counts, however it is named.
+        """
+        ignored = set(self.args.dirty_ignore_untracked)
+        entries = []
+        for line in status.splitlines():
+            if not line.strip():
+                continue
+            name = line[3:].strip().strip('"')
+            if line.startswith("??"):
+                head = name.split("/", 1)[0]
+                if head in ignored:
+                    continue
+            entries.append(name)
+        return entries
+
+    def commits_shipped(self, path, branch, prs):
+        """True when HEAD is the head a merged pull request actually merged.
+
+        A squash merge rewrites the branch into one commit on main and the
+        branch ref is then deleted, so `log HEAD --not --remotes` reports every
+        original commit as unpushed long after the content shipped. Comparing
+        HEAD with the pull request's headRefOid is what reclaim_merged_worktrees
+        already relies on; without it no merged worktree is ever reclaimable.
+        A branch whose HEAD has moved PAST the merged head is not shipped --
+        box 4's MANDO-559 tree was exactly that.
+        """
+        pr = (prs or {}).get(branch)
+        if not pr or pr.get("state") != "MERGED":
+            return False
+        ok, head, _ = run([self.args.git, "-C", path, "rev-parse", "HEAD"], timeout=60)
+        if not ok:
+            return False
+        return head.strip() == pr.get("headRefOid")
+
     def dead_worktree_reason(self, root, tree, held, prs, cutoff, skip):
         """Why this worktree is kept, or "" when nothing would be lost.
 
@@ -1009,13 +1050,13 @@ class Janitor:
                             timeout=120)
         if not ok:
             return "status could not be read"
-        if status.strip():
+        if self.dirty_entries(status):
             return "uncommitted changes"
         ok, unpushed, _ = run([self.args.git, "-C", path, "log", "--oneline",
                                "HEAD", "--not", "--remotes"], timeout=120)
         if not ok:
             return "unpushed commits could not be read"
-        if unpushed.strip():
+        if unpushed.strip() and not self.commits_shipped(path, tree.get("branch", ""), prs):
             return "commits on no remote"
         if self.source_touched(path, skip) >= cutoff:
             return "touched inside the idle window"
@@ -1522,6 +1563,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dead-worktree-repo", action="append", default=[],
                         help="repository whose finished worktrees may be removed")
     parser.add_argument("--dead-worktree-idle-days", type=int, default=7)
+    parser.add_argument("--dirty-ignore-untracked", action="append", default=[],
+                        help="untracked top-level name that does not count as a change")
     parser.add_argument("--dead-worktree-apply", action="store_true",
                         help="actually remove dead worktrees (previews without it)")
     parser.add_argument("--tmux", default="tmux")
@@ -1567,6 +1610,9 @@ def main(argv=None) -> int:
             raise Rejected("--dead-worktree-idle-days must be positive")
         if not args.build_output_name:
             args.build_output_name = ["target", "_build", "node_modules", ".venv", "dist"]
+        for name in args.dirty_ignore_untracked:
+            if not name or "/" in name or name in (".", ".."):
+                raise Rejected("--dirty-ignore-untracked must be a single name")
         for name in args.build_output_name:
             if not name or "/" in name or name in (".", ".."):
                 raise Rejected("--build-output-name must be a single directory name")

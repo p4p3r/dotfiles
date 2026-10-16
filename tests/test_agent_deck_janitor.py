@@ -1595,3 +1595,126 @@ class WorktreeSpaceCase(ReclaimCase):
         self.assertEqual(entry["removed"], [])
         self.assertIn("a session is using it",
                       [r["reason"] for r in entry["retained"]])
+
+
+class DirtyRefinementCase(WorktreeSpaceCase):
+    """What counts as uncommitted, and what counts as pushed.
+
+    Box 4's census on 2026-10-15: 18 of 35 worktrees retained as
+    "uncommitted changes" had nothing but .direnv/ and .devenv/ in them, and
+    11 of those belonged to pull requests that had already merged, where the
+    squash had made every original commit look local-only.
+    """
+
+    def test_ignored_untracked_state_does_not_count_as_a_change(self) -> None:
+        self.push_everything()
+        path, branch, _ = self.add_worktree("tooling")
+        self.git("push", "-q", "origin", branch)
+        self.git("push", "-q", "origin", "--delete", branch)
+        (path / ".direnv").mkdir()
+        (path / ".direnv" / "flake-profile").write_text("x")
+        (path / ".devenv").mkdir()
+        (path / ".devenv" / "state").write_text("x")
+        self.age_source(path, 30, skip=("target",))
+        self.write_gh([])
+        _, task = self.run_space("--dead-worktree-repo", str(self.repo),
+                                 "--dead-worktree-idle-days", "7",
+                                 "--dirty-ignore-untracked", ".direnv",
+                                 "--dirty-ignore-untracked", ".devenv",
+                                 "--dead-worktree-apply",
+                                 apply=True, task="dead_worktrees")
+        entry = task["repositories"][str(self.repo)]
+        self.assertEqual([r["branch"] for r in entry["removed"]], [branch])
+        self.assertFalse(path.exists())
+
+    def test_an_untracked_file_outside_the_list_still_counts(self) -> None:
+        self.push_everything()
+        path, branch, _ = self.add_worktree("real-untracked")
+        self.git("push", "-q", "origin", branch)
+        self.git("push", "-q", "origin", "--delete", branch)
+        (path / "notes.md").write_text("something someone wrote")
+        self.age_source(path, 30)
+        self.write_gh([])
+        _, task = self.run_space("--dead-worktree-repo", str(self.repo),
+                                 "--dead-worktree-idle-days", "7",
+                                 "--dirty-ignore-untracked", ".direnv",
+                                 "--dead-worktree-apply",
+                                 apply=True, task="dead_worktrees")
+        entry = task["repositories"][str(self.repo)]
+        self.assertEqual(entry["removed"], [])
+        self.assertIn("uncommitted changes", [r["reason"] for r in entry["retained"]])
+        self.assertTrue(path.exists())
+
+    def test_a_tracked_modification_counts_even_when_its_name_is_ignored(self) -> None:
+        self.push_everything()
+        path, branch, _ = self.add_worktree("tracked-dirty")
+        self.git("push", "-q", "origin", branch)
+        self.git("push", "-q", "origin", "--delete", branch)
+        (path / "file").write_text("edited by a person")
+        self.age_source(path, 30)
+        self.write_gh([])
+        _, task = self.run_space("--dead-worktree-repo", str(self.repo),
+                                 "--dead-worktree-idle-days", "7",
+                                 "--dirty-ignore-untracked", "file",
+                                 "--dead-worktree-apply",
+                                 apply=True, task="dead_worktrees")
+        entry = task["repositories"][str(self.repo)]
+        self.assertEqual(entry["removed"], [])
+        self.assertIn("uncommitted changes", [r["reason"] for r in entry["retained"]])
+
+    def test_a_squash_merged_worktree_at_the_merged_head_is_finished(self) -> None:
+        # The branch is pushed, then deleted, and its commits never reach main
+        # as themselves: exactly what a squash merge leaves behind.
+        self.push_everything()
+        path, branch, head = self.add_worktree("squashed", extra_commit=True)
+        self.git("push", "-q", "origin", branch)
+        head = self.git("rev-parse", "HEAD", cwd=path).strip()
+        self.git("push", "-q", "origin", "--delete", branch)
+        self.age_source(path, 30)
+        self.write_gh([{"headRefName": branch, "headRefOid": head, "state": "MERGED",
+                        "number": 11, "mergedAt": "2026-01-01T00:00:00Z"}])
+        _, task = self.run_space("--dead-worktree-repo", str(self.repo),
+                                 "--dead-worktree-idle-days", "7",
+                                 "--dead-worktree-apply",
+                                 apply=True, task="dead_worktrees")
+        entry = task["repositories"][str(self.repo)]
+        self.assertEqual([r["branch"] for r in entry["removed"]], [branch])
+        self.assertFalse(path.exists())
+
+    def test_commits_past_the_merged_head_are_not_shipped(self) -> None:
+        self.push_everything()
+        path, branch, _ = self.add_worktree("moved-on", extra_commit=True)
+        self.git("push", "-q", "origin", branch)
+        merged_head = self.git("rev-parse", "HEAD", cwd=path).strip()
+        self.git("push", "-q", "origin", "--delete", branch)
+        (path / "file").write_text("work after the merge")
+        self.git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam",
+                 "after the merge", cwd=path)
+        self.age_source(path, 30)
+        self.write_gh([{"headRefName": branch, "headRefOid": merged_head, "state": "MERGED",
+                        "number": 12, "mergedAt": "2026-01-01T00:00:00Z"}])
+        _, task = self.run_space("--dead-worktree-repo", str(self.repo),
+                                 "--dead-worktree-idle-days", "7",
+                                 "--dead-worktree-apply",
+                                 apply=True, task="dead_worktrees")
+        entry = task["repositories"][str(self.repo)]
+        self.assertEqual(entry["removed"], [])
+        self.assertIn("commits on no remote", [r["reason"] for r in entry["retained"]])
+        self.assertTrue(path.exists(), "MANDO-559's tree looked exactly like this")
+
+    def test_a_closed_pull_request_does_not_ship_its_commits(self) -> None:
+        # Closed, not merged: the content never reached main, so local-only
+        # commits stay local-only however old the tree is.
+        self.push_everything()
+        path, branch, _ = self.add_worktree("abandoned", extra_commit=True)
+        head = self.git("rev-parse", "HEAD", cwd=path).strip()
+        self.age_source(path, 30)
+        self.write_gh([{"headRefName": branch, "headRefOid": head, "state": "CLOSED",
+                        "number": 13, "mergedAt": None}])
+        _, task = self.run_space("--dead-worktree-repo", str(self.repo),
+                                 "--dead-worktree-idle-days", "7",
+                                 "--dead-worktree-apply",
+                                 apply=True, task="dead_worktrees")
+        entry = task["repositories"][str(self.repo)]
+        self.assertEqual(entry["removed"], [])
+        self.assertIn("commits on no remote", [r["reason"] for r in entry["retained"]])

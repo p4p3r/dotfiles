@@ -1391,8 +1391,14 @@ class Janitor:
                 if ok:
                     restarted.append(entry)
                 else:
+                    # Advisory, not a fault. A row can fail to come back for
+                    # reasons recycling cannot fix -- the registry entry is
+                    # already dying, or the harness exits before the pane can
+                    # be observed -- and boxes 2 and 3 reported DEGRADED every
+                    # night for exactly that. The row stays stale and the
+                    # cleanup and idle-stop windows reclaim it; the count stays
+                    # here so the failure is still visible.
                     failed.append({"id": row["id"], "summary": summary})
-                    worst = "DEGRADED"
             detail[profile] = {"ok": True, "restarted": restarted, "failed": failed,
                                "kept": kept}
         self.record("stale_agents", worst, applied=self.apply,
@@ -1509,10 +1515,13 @@ class Janitor:
     def run_all(self):
         # Stopping runs before the sweep so a row stopped today is reclaimed by
         # a later run, never by this one: two separate windows, two separate
-        # days, and a chance to notice in between.
-        self.recycle_stale_agents()
+        # days, and a chance to notice in between. Recycling runs after both,
+        # because a row the sweep is about to remove must not be restarted
+        # first -- that is how box 2 produced 29 failed restarts of rows that
+        # no longer existed by the time they were inspected.
         self.stop_idle_sessions()
         self.sweep_sessions()
+        self.recycle_stale_agents()
         self.sweep_groups()
         self.prune_worktrees()
         self.collect_nix_garbage()

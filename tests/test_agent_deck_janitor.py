@@ -1329,7 +1329,7 @@ sys.exit(0)
         self.assertEqual([c for c in self.agent_deck_calls() if "session restart" in c],
                          [])
 
-    def test_a_failed_restart_degrades_without_stopping_the_rest(self) -> None:
+    def test_a_failed_restart_is_reported_without_degrading_the_run(self) -> None:
         self.add_process(4200, "codex", ppid=1, deleted=True)
         self.add_process(4300, "codex", ppid=1, deleted=True)
         self.add_pane("agentdeck_one_a", 4200)
@@ -1340,9 +1340,12 @@ sys.exit(0)
                       "tmux_session": "agentdeck_two_b"}]
         self.write_agent_deck(restart_exit=1)
         done, report = self.run_janitor("--recycle-stale-agents", apply=True)
-        self.assertEqual(done.returncode, 1)
+        # A row that cannot come back is not a janitor fault: the cleanup and
+        # idle-stop windows reclaim it, and degrading nightly on it hid the
+        # real failures on boxes 2 and 3.
+        self.assertEqual(done.returncode, 0)
         task = report["tasks"]["stale_agents"]
-        self.assertEqual(task["status"], "DEGRADED")
+        self.assertEqual(task["status"], "OK")
         self.assertEqual([f["id"] for f in task["profiles"]["default"]["failed"]],
                          ["row-a", "row-b"])
 

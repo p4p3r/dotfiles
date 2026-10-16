@@ -1324,7 +1324,8 @@ sys.exit(0)
         profile = task["profiles"]["default"]
         self.assertEqual(profile["restarted"], [])
         self.assertEqual(profile["kept"], {"running": 1, "watched": 1,
-                                           "protected": 1, "other": 0})
+                                           "protected": 1, "other": 0,
+                                           "missing_path": 0})
         self.assertEqual([c for c in self.agent_deck_calls() if "session restart" in c],
                          [])
 
@@ -1718,3 +1719,41 @@ class DirtyRefinementCase(WorktreeSpaceCase):
         entry = task["repositories"][str(self.repo)]
         self.assertEqual(entry["removed"], [])
         self.assertIn("commits on no remote", [r["reason"] for r in entry["retained"]])
+
+
+class StaleAgentMissingPathCase(StaleAgentCase):
+    """A row whose project directory is gone cannot be restarted.
+
+    The night after finished worktrees were removed, box 4 reported eleven
+    restart failures: "tmux session ... does not exist after spawn (the
+    process exited before it could be observed)". Recycling cannot fix a row
+    with nowhere to run, and reporting it as a fault hides the real ones.
+    """
+
+    def test_a_row_whose_project_is_gone_is_not_restarted(self) -> None:
+        self.add_process(4100, "bash", ppid=1)
+        self.add_process(4200, "codex", ppid=4100, deleted=True)
+        self.add_pane("agentdeck_orphaned_abc", 4100)
+        self.add_row(id="row-gone", title="orphaned", status="waiting",
+                     tmux_session="agentdeck_orphaned_abc",
+                     path=str(self.tmp / "worktree-that-was-removed"))
+        task = self.stale_task(apply=True)
+        profile = task["profiles"]["default"]
+        self.assertEqual(profile["restarted"], [])
+        self.assertEqual(profile["failed"], [])
+        self.assertEqual(profile["kept"]["missing_path"], 1)
+        self.assertEqual(task["status"], "OK")
+        self.assertEqual([c for c in self.agent_deck_calls() if "session restart" in c],
+                         [])
+
+    def test_a_row_whose_project_exists_is_still_restarted(self) -> None:
+        live = self.tmp / "live-worktree"
+        live.mkdir()
+        self.add_process(4100, "bash", ppid=1)
+        self.add_process(4200, "codex", ppid=4100, deleted=True)
+        self.add_pane("agentdeck_live_abc", 4100)
+        self.add_row(id="row-live", title="live", status="waiting",
+                     tmux_session="agentdeck_live_abc", path=str(live))
+        task = self.stale_task(apply=True)
+        self.assertEqual([r["id"] for r in task["profiles"]["default"]["restarted"]],
+                         ["row-live"])

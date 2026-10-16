@@ -1346,7 +1346,8 @@ class Janitor:
                 worst = "DEGRADED"
                 continue
             restarted, failed = [], []
-            kept = {"running": 0, "watched": 0, "protected": 0, "other": 0}
+            kept = {"running": 0, "watched": 0, "protected": 0, "other": 0,
+                    "missing_path": 0}
             for row in rows:
                 if not isinstance(row, dict) or not isinstance(row.get("id"), str):
                     continue
@@ -1367,6 +1368,16 @@ class Janitor:
                     continue
                 if row.get("viewers"):
                     kept["watched"] += 1
+                    continue
+                # A row whose project directory is gone cannot be restarted at
+                # all: the spawn exits before anything can observe it, and the
+                # CLI reports that as a failure. Box 4 produced eleven of those
+                # the night after finished worktrees were removed under rows
+                # that still referenced them. Recycling is not the remedy for a
+                # row with nowhere to run; the idle-stop window is.
+                project = os.path.expanduser(row.get("path") or "")
+                if project and not os.path.isdir(project):
+                    kept["missing_path"] += 1
                     continue
                 entry = {"id": row["id"], "title": row.get("title"),
                          "tools": sorted({p["tool"] for p in processes}),

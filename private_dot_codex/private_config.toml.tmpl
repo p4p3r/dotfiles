@@ -26,6 +26,14 @@ trust_level = "trusted"
 {{- $localTrust := joinPath .chezmoi.homeDir ".codex/trust.local.toml" }}
 {{ if stat $localTrust }}{{ include $localTrust }}{{ end }}
 
+# Goals put an overlay in the TUI that can stall ("Goal stalled (/goal resume)")
+# and then swallow every keystroke: on 2026-10-17 box 4's conductor pane echoed
+# nothing at all, agent-deck refused to type with "idle, clear, stable exact
+# target is unproven", and its Slack turn never completed. These panes are
+# unattended -- nobody is there to answer an overlay -- so the feature is off.
+[features]
+goals = false
+
 [notice]
 hide_gpt5_1_migration_prompt = true
 

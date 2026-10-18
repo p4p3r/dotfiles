@@ -77,6 +77,8 @@
       "aerospace"
       "audacity"
       "balenaetcher"
+      "blackhole-2ch"
+      "blackhole-16ch"
       "brave-browser"
       "aws-vpn-client"
       "vibe-notch"

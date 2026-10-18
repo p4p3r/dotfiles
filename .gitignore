@@ -6,3 +6,7 @@
 
 # agent-deck conductor config is machine-local.
 dot_agent-deck/
+
+# Python bytecode caches (tests and helper scripts).
+__pycache__/
+*.pyc

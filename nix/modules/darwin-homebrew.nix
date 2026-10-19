@@ -136,6 +136,8 @@
       "1Blocker" = 1365531024;
       "Save to Raindrop.io" = 1549370672;
       "Wireguard" = 1451685025;
+      # Last.fm scrobbler for Music.app (autopod listening history).
+      "Finale for Last.fm" = 1518365620;
       # Installed but previously undeclared, which meant `cleanup` would have
       # deleted them. Apple stock apps plus Amphetamine.
       "Amphetamine" = 937984704;

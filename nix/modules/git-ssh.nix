@@ -1,7 +1,12 @@
 { config, pkgs, lib, ... }:
 {
-  # Set SSH_AUTH_SOCK to use 1Password SSH agent
-  home.sessionVariables = lib.optionalAttrs pkgs.stdenv.isDarwin {
+  home.sessionVariables = {
+    # `coder config-ssh` rewrites ~/.ssh/config in place by default, replacing
+    # the home-manager symlink with a real file and failing every later
+    # activation. Point it at a drop-in the ssh includes already load.
+    CODER_SSH_CONFIG_FILE = "$HOME/.ssh/config.d/coder";
+  } // lib.optionalAttrs pkgs.stdenv.isDarwin {
+    # Set SSH_AUTH_SOCK to use 1Password SSH agent
     SSH_AUTH_SOCK = "~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock";
   };
 

@@ -11,15 +11,22 @@
   homebrew = {
     enable = true;
 
+    # Homebrew 6 refuses formulae and casks from a third-party tap until it is
+    # trusted. `trusted = true` makes brew bundle trust the tap during
+    # activation, and `cleanup = "zap"` then sets the trust store to exactly
+    # the trusted taps in the Brewfile, so this list is its single source.
+    # Trusting a tap trusts everything it ships, now and later: add one only
+    # after checking who publishes it.
     taps = [
       # QMK
-      "osx-cross/arm"
-      "osx-cross/avr"
-      "qmk/qmk"
+      { name = "osx-cross/arm"; trusted = true; }   # arm-gcc-bin@10
+      { name = "osx-cross/avr"; trusted = true; }   # avr-gcc@8, a qmk dependency
+      { name = "qmk/qmk"; trusted = true; }
 
       # Others
-      "nikitabobko/tap"
-      "FelixKratz/formulae"
+      { name = "nikitabobko/tap"; trusted = true; }       # aerospace
+      { name = "FelixKratz/formulae"; trusted = true; }   # sketchybar
+      { name = "mutagen-io/mutagen"; trusted = true; }
 
       # coder CLI, required by a work CLI installed outside Nix.
       "coder/coder"
